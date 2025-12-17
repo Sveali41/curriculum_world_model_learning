@@ -1,7 +1,7 @@
 from omegaconf import DictConfig
 import modelBased.Support as Support
 from generator.common.utils import load_gen
-from minigrid_custom_env import CustomMiniGridEnv
+from domain_wrapper.minigrid_custom_env import CustomMiniGridEnv
 from modelBased.common.utils import TRAINER_PATH, extract_unique_patches, generate_minitasks_until_covered
 from modelBased.world_model import AttentionWM_training
 from modelBased.data.data_collect import visualize_agent_coverage, visualize_saved_dataset

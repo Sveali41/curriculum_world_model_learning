@@ -8,7 +8,7 @@ sys.path.append(ROOTPATH)
 from modelBased.common.utils import GENERATOR_PATH, TRAINER_PATH
 from omegaconf import DictConfig
 from generator.common.utils import load_gen, generate_color_map, generate_obj_map, layout_to_string, combine_maps, clean_and_place_goal
-from minigrid_custom_env import *
+from domain_wrapper.minigrid_custom_env import *
 import textwrap
 from minigrid.wrappers import FullyObsWrapper, RGBImgObsWrapper
 import torch

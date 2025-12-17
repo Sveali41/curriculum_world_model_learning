@@ -1,6 +1,6 @@
 import sys
 from common.utils import PROJECT_ROOT
-from minigrid_custom_env import CustomMiniGridEnv
+from domain_wrapper.minigrid_custom_env import CustomMiniGridEnv
 from minigrid.wrappers import FullyObsWrapper
 import torch
 import numpy as np

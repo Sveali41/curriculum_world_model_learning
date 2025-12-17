@@ -8,9 +8,9 @@ from modelBased.common.utils import PROJECT_ROOT, normalize_obs, map_obs_to_near
 from modelBased.policy_training.PPO import PPO
 from omegaconf import DictConfig, OmegaConf
 from minigrid.wrappers import FullyObsWrapper
-from minigrid_custom_env import *
+from domain_wrapper.minigrid_custom_env import *
 from modelBased.common import utils
-from minigrid_custom_env import CustomMiniGridEnv
+from domain_wrapper.minigrid_custom_env import CustomMiniGridEnv
 
 # Set device to CPU or CUDA
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
