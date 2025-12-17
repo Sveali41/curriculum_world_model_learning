@@ -1,36 +1,12 @@
 import torch
 import sys  
 sys.path.append('/home/siyao/project/rlPractice/MiniGrid')
-from generator.gen import GAN
 import random
 import re
 
-def load_gen(cfg):
-    hparams = cfg
-    if hparams.training_generator.generator == "deconv":
-        import sys
-        sys.path.append('/home/siyao/project/rlPractice/MiniGrid/generator')
-        from generator.deconv_gen import Generator, Discriminator
-        model = GAN(generator=Generator(hparams.training_generator.z_shape, len(hparams.training_generator.map_element)), 
-            discriminator=Discriminator(input_channels = len(hparams.training_generator.map_element)), 
-            z_size=hparams.training_generator.z_shape, lr=hparams.training_generator.lr, wd=hparams.training_generator.wd)
-        
-    elif cfg.training_generator.model == "basic":
-        from generator.basic_gen import Generator, Discriminator
-        model = GAN(generator=Generator(hparams.basic.z_shape, hparams.basic.dropout), discriminator=Discriminator(hparams.basic.input_channels, hparams.basic.dropout), z_size=hparams.basic.z_shape, lr=0.0002, wd=0.0)
+from minigrid.core.constants import OBJECT_TO_IDX, COLOR_TO_IDX
 
-    checkpoint = torch.load(hparams.training_generator.validation_path)
-    
-    import io
-    state_dict = checkpoint['state_dict']
-    # make the state_dict a buffer
-    buffer = io.BytesIO()
-    torch.save(state_dict, buffer)
-    buffer.seek(0)
 
-    model.load_state_dict(torch.load(buffer))
-    model.eval()
-    return model
 
 def generate_obj_map(layout, map_dict):
     """

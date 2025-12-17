@@ -4,17 +4,17 @@ from minigrid_custom_env import CustomMiniGridEnv
 from minigrid.wrappers import FullyObsWrapper
 import torch
 import numpy as np
-from modelBased.PPO import PPO
+from modelBased.policy_training.PPO import PPO
 import hydra
 from datetime import datetime
 from modelBased.common import utils
 
 from omegaconf import DictConfig, OmegaConf 
-from modelBased import AttentionWM_support
-from modelBased import Embedding_support
-from modelBased import MLP_support
+from modelBased.world_model import AttentionWM_support
+from modelBased.world_model import Embedding_support
+from modelBased.world_model import MLP_support
 import wandb
-from modelBased.PPO import preprocess_observation 
+from modelBased.policy_training.PPO import preprocess_observation 
 import time
 
 

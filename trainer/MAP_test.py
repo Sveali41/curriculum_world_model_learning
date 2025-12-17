@@ -1,13 +1,13 @@
 import os
 from omegaconf import DictConfig
-import Support
+import modelBased.Support as Support
 from generator.common.utils import load_gen
 from modelBased.common.utils import TRAINER_PATH
 import hydra
-from learning_buffer import EnvLearningBuffer
+from modelBased.continue_learning.learning_buffer import EnvLearningBuffer
 import numpy as np
 import wandb
-from fisher_buffer import FisherReplayBuffer
+from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
 import os
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 

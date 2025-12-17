@@ -11,25 +11,64 @@ task_placer
 : A module for placing starting_pos and goals within the generated environments.
 - Ensures that the placement adheres to specified constraints.
 
-validator
-: A module for validating the solvability of generated environments.
-- Uses pathfinding algorithms to confirm solvability.
 
 '''
-
+from minigrid.core.constants import OBJECT_TO_IDX, COLOR_TO_IDX
 import numpy as np
 import random
 from collections import deque
 from typing import Optional, Tuple, Union
 
 
-MAPPING = {
-    'W': 2,   # Wall
-    'E': 1,   # Empty
-    'K': 5,
-    'D': 4,
-    'G': 8
+# 定义常量
+WALL  = OBJECT_TO_IDX['wall']
+FLOOR = OBJECT_TO_IDX['empty']
+DOOR  = OBJECT_TO_IDX['door']
+KEY   = OBJECT_TO_IDX['key']
+LAVA  = OBJECT_TO_IDX['lava']
+
+RED    = COLOR_TO_IDX['red']
+YELLOW = COLOR_TO_IDX['yellow']
+BLUE   = COLOR_TO_IDX['blue']
+GREY   = COLOR_TO_IDX['grey']
+
+# --- 核心映射表 ---
+# action map for generator agent output
+# 格式: Action_ID: (Type, Color)
+ACTION_MAP = {
+    # 0: Keep (特殊处理)
+    1: (WALL, GREY),
+    2: (FLOOR, 0),
+    3: (LAVA, RED),
+    
+    4: (DOOR, RED),
+    5: (DOOR, YELLOW),
+    6: (DOOR, BLUE),
+    
+    7: (KEY, RED),
+    8: (KEY, YELLOW),
+    9: (KEY, BLUE)
 }
+
+def map_editor(base_map_obj, base_map_col, action_grid):
+    """
+    base_map_obj: the base object map from PCGSeeder
+    base_map_col: the base color map from PCGSeeder
+    action_grid:  Generator agent output action grid
+    """
+    new_obj = base_map_obj.copy()
+    new_col = base_map_col.copy()
+    
+    # 遍历除了 0 (Keep) 以外的所有动作
+    for act_id, (type_val, color_val) in ACTION_MAP.items():
+        # 找到执行该动作的所有位置
+        mask = (action_grid == act_id)
+        
+        # 统一修改
+        new_obj[mask] = type_val
+        new_col[mask] = color_val
+        
+    return new_obj, new_col
 
 
 class PCGSeeder:
@@ -83,7 +122,7 @@ class PCGSeeder:
             else:
                 grid = self._sample_random_canvas()
 
-            empty_count = np.sum(grid == MAPPING['E'])
+            empty_count = np.sum(grid == FLOOR)
             if empty_count < min_empty:
                 continue
 
@@ -103,7 +142,7 @@ class PCGSeeder:
         if return_info:
             return fallback_grid, {
                 "tries": tries,
-                "empty_ratio": np.mean(fallback_grid == MAPPING['E']),
+                "empty_ratio": np.mean(fallback_grid == FLOOR),
                 "fallback": True,
                 "structure_mode": "fallback",
             }
@@ -117,33 +156,33 @@ class PCGSeeder:
         for i in range(self.H):
             for j in range(self.W):
                 if i == 0 or j == 0 or i == self.H - 1 or j == self.W - 1:
-                    grid[i, j] = MAPPING['W']
+                    grid[i, j] = WALL
                 else:
                     grid[i, j] = (
-                        MAPPING['W']
+                        WALL
                         if random.random() < random.random()
-                        else MAPPING['E']
+                        else FLOOR
                     )
         return grid
 
     def _sample_blob_canvas(self) -> np.ndarray:
-        grid = np.full((self.H, self.W), MAPPING['W'], dtype=int)
+        grid = np.full((self.H, self.W), WALL, dtype=int)
 
         y, x = self.H // 2, self.W // 2
-        grid[y, x] = MAPPING['E']
+        grid[y, x] = FLOOR
 
         steps = (self.H * self.W) // 2
         for _ in range(steps):
             dy, dx = random.choice([(-1, 0), (1, 0), (0, -1), (0, 1)])
             y = max(1, min(self.H - 2, y + dy))
             x = max(1, min(self.W - 2, x + dx))
-            grid[y, x] = MAPPING['E']
+            grid[y, x] = FLOOR
 
         return grid
 
 
     def _is_fully_connected(self, grid: np.ndarray) -> bool:
-        empties = np.argwhere(grid == MAPPING['E'])
+        empties = np.argwhere(grid == FLOOR)
         if len(empties) == 0:
             return False
 
@@ -158,7 +197,7 @@ class PCGSeeder:
                 if (
                     0 <= ny < self.H
                     and 0 <= nx < self.W
-                    and grid[ny, nx] == MAPPING['E']
+                    and grid[ny, nx] == FLOOR
                     and (ny, nx) not in visited
                 ):
                     visited.add((ny, nx))
@@ -189,14 +228,14 @@ class PCGSeeder:
         min_r, max_r = self.min_empty_range
         filtered = [
             g for g in raw_pool
-            if min_r <= np.mean(g == MAPPING['E']) <= max_r
+            if min_r <= np.mean(g == FLOOR) <= max_r
         ]
 
         # soft fallback: at least satisfy min_r
         if len(filtered) == 0:
             filtered = [
                 g for g in raw_pool
-                if np.mean(g == MAPPING['E']) >= min_r
+                if np.mean(g == FLOOR) >= min_r
             ]
 
         # last resort (should not happen)
@@ -206,9 +245,9 @@ class PCGSeeder:
         return filtered
 
     def _fallback_empty_room(self):
-        grid = np.full((self.H, self.W), MAPPING['E'], dtype=int)
-        grid[0, :] = grid[-1, :] = MAPPING['W']
-        grid[:, 0] = grid[:, -1] = MAPPING['W']
+        grid = np.full((self.H, self.W), FLOOR, dtype=int)
+        grid[0, :] = grid[-1, :] = WALL
+        grid[:, 0] = grid[:, -1] = WALL
         return grid
 
     def _fallback_room_with_pillars(self, pillar_ratio=0.1):
@@ -216,10 +255,10 @@ class PCGSeeder:
         Large open room with sparse wall pillars.
         Guarantees many valid placement positions.
         """
-        grid = np.full((self.H, self.W), MAPPING['E'], dtype=int)
+        grid = np.full((self.H, self.W), FLOOR, dtype=int)
 
-        grid[0, :] = grid[-1, :] = MAPPING['W']
-        grid[:, 0] = grid[:, -1] = MAPPING['W']
+        grid[0, :] = grid[-1, :] = WALL
+        grid[:, 0] = grid[:, -1] = WALL
 
         candidates = [
             (i, j)
@@ -231,7 +270,7 @@ class PCGSeeder:
         num_pillars = int(len(candidates) * pillar_ratio)
 
         for y, x in candidates[:num_pillars]:
-            grid[y, x] = MAPPING['W']
+            grid[y, x] = WALL
 
         return grid
 
@@ -241,7 +280,7 @@ if __name__ == "__main__":
     seeder = PCGSeeder(
         height=10,
         width=10,
-        min_empty_ratio=(0.2, 0.9),
+        min_empty_ratio=(0.3, 0.9),
         max_tries=3000,
         structure_mode="pure_random",
     )

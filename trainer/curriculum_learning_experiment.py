@@ -1,10 +1,10 @@
 from omegaconf import DictConfig
-import Support
+import modelBased.Support as Support
 from generator.common.utils import load_gen
 from minigrid_custom_env import CustomMiniGridEnv
 from modelBased.common.utils import TRAINER_PATH, extract_unique_patches, generate_minitasks_until_covered
-from modelBased import AttentionWM_training, PPO_world_training
-from modelBased.data_collect import visualize_agent_coverage, visualize_saved_dataset
+from modelBased.world_model import AttentionWM_training
+from modelBased.data.data_collect import visualize_agent_coverage, visualize_saved_dataset
 from datetime import datetime
 import hydra
 import os
@@ -15,6 +15,8 @@ import matplotlib.pyplot as plt
 import random
 import numpy as np
 from minigrid.wrappers import FullyObsWrapper
+
+from modelBased.policy_training import PPO_world_training
 
 
 '''
@@ -445,7 +447,7 @@ def extract_loss_map_over_validations(
     import numpy as np
     import gc
     import torch
-    from modelBased import AttentionWM_training
+    from modelBased.world_model import AttentionWM_training
 
     # Set WM to validation mode
     cfg.attention_model.freeze_weight = True
@@ -549,8 +551,8 @@ def test_1(cfg: DictConfig):
     """
     import csv
     import numpy as np
-    from fisher_buffer import FisherReplayBuffer
-    from modelBased.AttentionWM import AttentionWorldModel
+    from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
+    from modelBased.world_model.AttentionWM import AttentionWorldModel
     import torch
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -678,8 +680,8 @@ def  curriculum_learning_transitions(cfg: DictConfig):
     import gc
     import matplotlib.pyplot as plt
 
-    from fisher_buffer import FisherReplayBuffer
-    from modelBased.AttentionWM import AttentionWorldModel
+    from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
+    from modelBased.world_model.AttentionWM import AttentionWorldModel
 
     # --------------------------------------
     # Setup

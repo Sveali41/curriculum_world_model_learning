@@ -9,10 +9,10 @@ from omegaconf import DictConfig
 import hydra
 from datetime import datetime
 from common import utils
-import AttentionWM_support
-import Embedding_support
-import MLP_support
-from PPO_world_training import find_position, process_data, add_object_to_inventory
+import modelBased.world_model.AttentionWM_support as AttentionWM_support
+import modelBased.world_model.Embedding_support as Embedding_support
+import modelBased.world_model.MLP_support as MLP_support
+from modelBased.policy_training.PPO_world_training import find_position, process_data, add_object_to_inventory
 import wandb
 
 

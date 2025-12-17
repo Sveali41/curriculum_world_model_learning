@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from typing import List, Dict, Union
 from modelBased.common import utils
-from . import AttentionWM_support
+from .world_model import AttentionWM_support
 from . import Embedding_support
 from . import MLP_support
 import pandas as pd

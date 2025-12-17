@@ -1,12 +1,14 @@
 from omegaconf import DictConfig
-import Support
+import modelBased.Support as Support
 from generator.common.utils import load_gen
 from modelBased.common.utils import TRAINER_PATH
-from modelBased import AttentionWM_training, PPO_world_training
+from modelBased.world_model import AttentionWM_training
 from datetime import datetime
 import hydra
 import os
 import torch
+
+from modelBased.policy_training import PPO_world_training
 
 
 '''
@@ -66,8 +68,8 @@ def test_1(cfg: DictConfig):
     measuring the model's ability to retain knowledge over time.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    from fisher_buffer import FisherReplayBuffer
-    from modelBased.AttentionWM import AttentionWorldModel
+    from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
+    from modelBased.world_model.AttentionWM import AttentionWorldModel
     import numpy as np
 
     fisher_buffer = FisherReplayBuffer(max_size=500000)

@@ -5,7 +5,7 @@ import gym
 import hydra
 import imageio  # Import imageio to save GIFs
 from modelBased.common.utils import PROJECT_ROOT, normalize_obs, map_obs_to_nearest_value
-from modelBased.PPO import PPO
+from modelBased.policy_training.PPO import PPO
 from omegaconf import DictConfig, OmegaConf
 from minigrid.wrappers import FullyObsWrapper
 from minigrid_custom_env import *

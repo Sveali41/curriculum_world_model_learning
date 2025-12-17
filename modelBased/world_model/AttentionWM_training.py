@@ -5,7 +5,7 @@ ROOTPATH = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 import sys
 sys.path.append(ROOTPATH)
 
-from modelBased.AttentionWM import AttentionWorldModel
+from modelBased.world_model.AttentionWM import AttentionWorldModel
 from modelBased.data.datamodule import WMRLDataModule
 from modelBased.common.utils import PROJECT_ROOT, get_env
 import hydra
