@@ -4,7 +4,6 @@ from minigrid.core.mission import MissionSpace
 from minigrid.core.world_object import *
 from minigrid.manual_control import ManualControl
 from minigrid.minigrid_env import MiniGridEnv
-from path import *
 from PIL import Image, ImageDraw
 from minigrid.wrappers import FullyObsWrapper, RGBImgObsWrapper
 import numpy as np  # Ensure numpy is imported

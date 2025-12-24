@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from typing import List, Dict, Union
 from modelBased.common import utils
-from .world_model import AttentionWM_support
+from . import AttentionWM_support
 from . import Embedding_support
 from . import MLP_support
 import pandas as pd
@@ -638,6 +638,35 @@ class AttentionWorldModel(pl.LightningModule):
         # Example checkpoint customization: removing specific keys if needed
         t = checkpoint['state_dict']
         pass  # No specific filtering needed for a simple NN
+
+    def calc_loss(self, trajectory_data):
+        """
+        Compute loss for Learning Progress (LP) reward calculation.
+        Args:
+            trajectory_data: dict with 'obs', 'act', 'obs_next', 'info' keys, containing tensors.
+        Returns:
+            loss: scalar tensor
+        """
+        device = self.device
+        batch = {
+            'obs': trajectory_data['obs'].to(device),
+            'act': trajectory_data['act'].to(device),
+            'obs_next': trajectory_data['obs_next'].to(device),
+            'info': trajectory_data['info']
+        }
+        
+        if self.env_type != 'with_obj':
+             batch['info'] = None
+
+        obs_masked, act, obs_next_masked, info, elements_mask, _ = self.preprocess_batch(batch, training=False)
+        
+        obs_pred, _ = self(obs_masked, act, info)
+        
+        if obs_next_masked.dtype != obs_pred.dtype:
+            obs_next_masked = obs_next_masked.float()
+            
+        loss_dict = self.loss_function_weight(obs_pred, obs_next_masked, elements_mask)
+        return loss_dict['loss_obs']
 
    
 

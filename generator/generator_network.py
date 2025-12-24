@@ -4,71 +4,74 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 import numpy as np
 
+
 class ResBlock(nn.Module):
-    """(保持不变) 标准残差块"""
-    def __init__(self, channels):
+    """标准残差块"""
+    def __init__(self, channels: int):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(channels, channels, 3, padding=1)
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, padding=1),
         )
 
     def forward(self, x):
         return F.relu(x + self.conv(x))
 
+
 class MapEditorActorCritic(nn.Module):
-    def __init__(self, 
-                 num_actions=11, 
-                 hidden_dim=64,
-                 max_obj_id=15, 
-                 max_color_id=6, 
-                 max_state_id=3,
-                 context_dim=64): # <--- [修改点 1] 新增 context_dim 参数
+    def __init__(
+        self,
+        num_actions=11,
+        hidden_dim=64,
+        max_obj_id=15,
+        max_color_id=6,
+        max_state_id=3,
+        context_dim=64,
+    ):
         super().__init__()
 
-        # === 1. Embedding Layers (保持不变) ===
+        # === 1. Embedding Layers ===
         self.emb_dim_obj = 16
         self.emb_dim_color = 8
         self.emb_dim_state = 4
-        
+
         self.emb_obj = nn.Embedding(max_obj_id + 1, self.emb_dim_obj)
         self.emb_color = nn.Embedding(max_color_id + 1, self.emb_dim_color)
         self.emb_state = nn.Embedding(max_state_id + 1, self.emb_dim_state)
 
-        # === [修改点 2] 计算总输入通道数 ===
-        # 原来: Embeddings + Heatmap(1) + Coords(2)
-        # 现在: Embeddings + Context(64) + Coords(2)
-        # 我们去掉了 Heatmap，因为用 Context 代替了它
+        # === 2. 输入通道数 ===
+        # Embeddings + Context(context_dim) + Coords(2)
         total_in_channels = (self.emb_dim_obj + self.emb_dim_color + self.emb_dim_state) + context_dim + 2
-        
-        # === 3. Backbone (ResNet) (保持不变) ===
+
+        # === 3. Backbone (ResNet) ===
         self.stem = nn.Sequential(
             nn.Conv2d(total_in_channels, hidden_dim, 3, padding=1),
-            nn.ReLU()
+            nn.ReLU(inplace=True),
         )
         self.res_blocks = nn.Sequential(
             ResBlock(hidden_dim),
             ResBlock(hidden_dim),
-            ResBlock(hidden_dim)
+            ResBlock(hidden_dim),
         )
 
-        # === 4. Actor Head (保持不变) ===
+        # === 4. Actor Head ===
         self.actor = nn.Sequential(
             nn.Conv2d(hidden_dim, hidden_dim // 2, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(hidden_dim // 2, num_actions, 1) 
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim // 2, num_actions, 1),
         )
 
-        # === 5. Critic Head (保持不变) ===
+        # === 5. Critic Head (修复：不再硬编码 15*15) ===
         self.critic = nn.Sequential(
             nn.Conv2d(hidden_dim, 1, 1),
+            nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(15 * 15, 64),
+            nn.Linear(1, 64),
             nn.Tanh(),
-            nn.Linear(64, 1)
+            nn.Linear(64, 1),
         )
-        
+
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -77,94 +80,112 @@ class MapEditorActorCritic(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def get_coordinate_channels(self, batch_size, h, w, device):
-        """生成相对坐标通道"""
+    def get_coordinate_channels(self, batch_size: int, h: int, w: int, device):
+        """    
+        Create normalized x/y coordinate channels (CoordConv) in [-1, 1]
+        to provide explicit spatial position information to the network.
+        """
+        # shape: [B,1,H,W]
         xx = torch.arange(w, device=device).view(1, 1, 1, w).repeat(batch_size, 1, h, 1)
-        yy = torch.arange(h, device=device).view(1, 1, h, 1).repeat(batch, 1, 1, w)
-        xx = xx / (w - 1) * 2 - 1
-        yy = yy / (h - 1) * 2 - 1
+        yy = torch.arange(h, device=device).view(1, 1, h, 1).repeat(batch_size, 1, 1, w)
+
+        # 避免 w/h 为 1 时除零
+        w_denom = max(w - 1, 1)
+        h_denom = max(h - 1, 1)
+
+        xx = xx / w_denom * 2 - 1
+        yy = yy / h_denom * 2 - 1
         return xx, yy
 
-    def forward_features(self, map_vec, context_vec): # <--- [修改点 3] 输入变了
+    def forward_features(self, base_map_vec, context_vec):
         """
-        map_vec: [B, 3, H, W] (Base Map)
-        context_vec: [B, context_dim] (History Context, 1D Vector)
+  
+        Encode the base map and history-conditioned context into
+        a spatial feature map for per-cell editing decisions.
+
+        base_map_vec:     [B, 3, H, W] (Long)
+        context_vec: [B, context_dim] (Float)
         """
-        B, _, H, W = map_vec.shape
-        
-        # 1. 提取 Map Embeddings
-        feat_obj = self.emb_obj(map_vec[:, 0].long()).permute(0, 3, 1, 2)
-        feat_col = self.emb_color(map_vec[:, 1].long()).permute(0, 3, 1, 2)
-        feat_sta = self.emb_state(map_vec[:, 2].long()).permute(0, 3, 1, 2)
-        
-        # 2. 生成坐标
-        xx, yy = self.get_coordinate_channels(B, H, W, map_vec.device)
-        
-        # === [修改点 4] 处理 Context Vector (广播/Tiling) ===
-        # context_vec 是 [B, 64]
-        # 我们要把它变成 [B, 64, H, W]，即让每个像素点都拥有这个 context 信息
+        B, _, H, W = base_map_vec.shape
+
+        # 1) Map embeddings
+        feat_obj = self.emb_obj(base_map_vec[:, 0].long()).permute(0, 3, 1, 2)     # [B, 16, H, W]
+        feat_col = self.emb_color(base_map_vec[:, 1].long()).permute(0, 3, 1, 2)   # [B,  8, H, W]
+        feat_sta = self.emb_state(base_map_vec[:, 2].long()).permute(0, 3, 1, 2)   # [B,  4, H, W]
+
+        # 2) Coords
+        xx, yy = self.get_coordinate_channels(B, H, W, base_map_vec.device)
+
+        # 3) Context broadcast: [B, C] -> [B, C, H, W]
         context_tiled = context_vec.view(B, -1, 1, 1).expand(-1, -1, H, W)
-        
-        # 3. 拼接所有特征
-        # [Obj, Col, Sta, Context, X, Y]
+
+        # 4) Concat
         x = torch.cat([feat_obj, feat_col, feat_sta, context_tiled, xx, yy], dim=1)
-        
-        # 4. 通过骨干网络
+
+        # 5) Backbone
         x = self.stem(x)
         x = self.res_blocks(x)
         return x
 
-    def act(self, map_vec, context_vec, action_mask=None, max_edits=5): # <--- [修改点 5] 参数变了
+    @torch.no_grad()
+    def act(self, map_vec, context_vec, action_mask=None, max_edits=0.4):
         """
         采样动作
+        action_mask: [B, H, W] 的 bool mask，True 表示该位置不可编辑
         """
-        features = self.forward_features(map_vec, context_vec) # 传 context
-        logits = self.actor(features) 
-        
-        # --- Safety Masking & Top-K Logic (保持不变) ---
+        features = self.forward_features(map_vec, context_vec)
+        logits = self.actor(features)  # [B, A, H, W]
+
+        # --- Safety Masking ---
+        action_mask = action_mask.bool() # [B,1,H,W]
+        mask_hw = action_mask.squeeze(1)
         if action_mask is not None:
-            mask_expanded = action_mask.unsqueeze(1)
-            logits[:, 0, :, :].masked_fill_(mask_expanded.squeeze(1), 1e9)
-            logits[:, 1:, :, :].masked_fill_(mask_expanded, -1e9)
+            logits[:, 0, :, :].masked_fill_(mask_hw, 1e9)       # No-op 强制
+            logits[:, 1:, :, :].masked_fill_(action_mask, -1e9)   # 其他动作禁止
 
         probs = F.softmax(logits, dim=1)
-        prob_change = 1.0 - probs[:, 0, :, :]
-        
+        prob_change = 1.0 - probs[:, 0, :, :]  # [B,H,W]
+
+        # --- Top-K edits ---
         B, H, W = prob_change.shape
         flat_probs = prob_change.view(B, -1)
-        topk_values, _ = torch.topk(flat_probs, k=max_edits, dim=1)
+        num_cells = H * W
+        k = int(max(1, round(max_edits * num_cells)))
+        k = min(k, num_cells)
+        topk_values, _ = torch.topk(flat_probs, k=k, dim=1)
         threshold = topk_values[:, -1].view(B, 1, 1)
-        
-        topk_mask = prob_change >= threshold
-        
+
+        topk_mask = prob_change >= threshold  # [B,H,W]
+
+        # 对非 topk 的位置：禁止修改动作，强制 No-op
         logits[:, 1:, :, :].masked_fill_((~topk_mask).unsqueeze(1), -1e9)
-        logits[:, 0, :, :].masked_fill_((~topk_mask).unsqueeze(1), 1e9)
+        logits[:, 0, :, :].masked_fill_(~topk_mask, 1e9)  # 修复：不 unsqueeze
 
         # --- Sampling ---
-        logits = logits.permute(0, 2, 3, 1)
-        dist = Categorical(logits=logits)
-        
-        action = dist.sample()
-        action_logprob = dist.log_prob(action)
-        state_val = self.critic(features)
-        
+        logits_hw = logits.permute(0, 2, 3, 1)  # [B,H,W,A]
+        dist = Categorical(logits=logits_hw)
+
+        action = dist.sample()                 # [B,H,W]
+        action_logprob = dist.log_prob(action) # [B,H,W]
+        state_val = self.critic(features)      # [B,1]
+
         return action.detach(), action_logprob.detach(), state_val.detach()
 
-    def evaluate(self, map_vec, context_vec, action, action_mask=None): # <--- [修改点 6] 参数变了
-        """计算LogProb (用于 PPO Update)"""
-        features = self.forward_features(map_vec, context_vec) # 传 context
-        logits = self.actor(features)
+    def evaluate(self, map_vec, context_vec, action, action_mask=None):
+        """计算 LogProb / Value / Entropy (用于 PPO update)"""
+        features = self.forward_features(map_vec, context_vec)
+        logits = self.actor(features)  # [B,A,H,W]
 
         if action_mask is not None:
-            mask_expanded = action_mask.unsqueeze(1)
-            logits[:, 0, :, :].masked_fill_(mask_expanded.squeeze(1), 1e9)
+            mask_expanded = action_mask.unsqueeze(1)  # [B,1,H,W]
+            logits[:, 0, :, :].masked_fill_(action_mask, 1e9)
             logits[:, 1:, :, :].masked_fill_(mask_expanded, -1e9)
 
-        logits = logits.permute(0, 2, 3, 1)
-        dist = Categorical(logits=logits)
+        logits_hw = logits.permute(0, 2, 3, 1)  # [B,H,W,A]
+        dist = Categorical(logits=logits_hw)
 
-        action_logprobs = dist.log_prob(action)
-        dist_entropy = dist.entropy()
-        state_values = self.critic(features)
+        action_logprobs = dist.log_prob(action)  # [B,H,W]
+        dist_entropy = dist.entropy()            # [B,H,W]
+        state_values = self.critic(features)     # [B,1]
 
         return action_logprobs, state_values, dist_entropy

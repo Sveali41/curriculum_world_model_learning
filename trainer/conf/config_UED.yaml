@@ -15,18 +15,18 @@ training_generator:
   pth_path: ${oc.env:GENERATOR_PATH}/models/gan_model_classifer.ckpt #${oc.env:GENERATOR_PATH}/models/gan_model_classifier.ckpt
   validation_path: ${oc.env:GENERATOR_PATH}/models/gan_model_classifier.ckpt 
   map_element: {
-      "wall": "W",
-      "goal": "G",
-      "door": "D",
-      "key": "K",
-      "lava": "L",
-      "empty": "E",
-      "floor": "F",
-      "agent": "A",
-      "ball": "B",
-      "box": "X",
-      "unseen": "?"
-    }  
+        "wall": "W",
+        "goal": "G",
+        "door": "D",
+        "key": "K",
+        "lava": "L",
+        "empty": "E",
+        "floor": "F",
+        "agent": "S",
+        "ball": "B",
+        "box": "X",
+        "unseen": "?"
+    } 
   color_element: {
     'R': 'red', 
     'G': 'green', 
@@ -36,6 +36,7 @@ training_generator:
     'C': 'cyan'
     }
   dynamic_objects: [8, 4, 5]
+  # map_element: {'W': 0, 'E': 1, 'D': 2, 'G': 3, 'K':4 , 'Y': 5}
   env_path: ${oc.env:TRAINER_PATH}/level/level.txt
   use_wandb: False
   elites_path: ${oc.env:GENERATOR_PATH}/data/grid500_kd.pkl
@@ -118,61 +119,13 @@ attention_model:
   scale_factor: 1.0        # scale factor for fisher information matrix computation         
   drift_cooldown: 100
   
-
-  # 4. PPO model for final task
-PPO:
-  # add the params for regret computation
-  performance_eval_method: "average_reward"  # regret/accuracy of the model
-  compute_regret: False
-  regret_eval_freq: 8000  # how often to compute regret (in timesteps) 5000
-  regret_eval_episodes: 5  # how many episodes to average for evaluation
-  regret_threshold: 0.1  # threshold for regret
-  real_policy_folder: ${oc.env:MODEL_FPATH}
-  real_policy_path: None
-  # the params for final task path
-  final_task: ${oc.env:TRAINER_PATH}/level/final_task
-  env_path: ${oc.env:TRAINER_PATH}/level/final_task.txt
-
-  # PPO training
-  env_type: empty # empty means empty only wall in preprocess no info for keys, lava/door/key/wall/norm
-  has_continuous_action_space: False
-  max_ep_len: 30000  # max timesteps in one episode 8000
-  action_std: 0.1  # set same std for action distribution which was used while saving
-  i_episode: 0
-  K_epochs: 20  # update policy for K epochs
-  eps_clip: 0.2  # clip parameter for PPO
-  gamma: 0.99  # discount factor
-  lr_actor: 0.0003  # learning rate for actor
-  lr_critic: 0.001  # learning rate for critic
-  checkpoint_path: ${oc.env:MODEL_FPATH}/policy_final_task_wm.ckpt
-  time_step: 0
-  max_training_timesteps: 1e7 #1e6
-  # max_training_timesteps: 3e5
-  action_std_decay_freq: 3000
-  action_std_decay_rate: 0.95
-  min_action_std: 0.1
-  save_model_freq: 5e3 #2e4
-  ########################################
-  # test
-  total_test_episodes: 1000
-  render: True
-  visualize: false
-  save_gif: False
-  save_path_gif: ${oc.env:PROJECT_ROOT}/modelBased/visulization/PPO/PPO_gif
-  save_csv: False
-  save_path_csv: ${oc.env:PROJECT_ROOT}/modelBased/visulization/PPO/PPO_csv
-  use_wandb: True
-  wandb_run_name: None
-
-    # evaluation
-  episodes_eval: 20
-  reward_threshold: 0.8
-  
-  
-
-
-test_env:
-  visualize: False
-  time_limit: 256 #max number of steps for each rollout 600
-  env_name: MiniGrid-Empty-8x8-v0 #MiniGrid-Dynamic-Obstacles-8x8-v0 #MiniGrid-Empty-5x5-v0 #MiniGrid-Empty-8x8-v0 #MiniGrid-Empty-Random-6x6-v0 
-  n_rollouts: 1000
+generator_agent:
+  total_iterations: 50
+  wm_train_frequency: 1
+  batch_size: 16
+  map_height: 8
+  map_width: 8
+  context_dim: 64
+  max_edits: 0.3
+  his_emb_dim: 16
+  ratio: 0.25

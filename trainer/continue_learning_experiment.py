@@ -1,5 +1,5 @@
 from omegaconf import DictConfig
-import modelBased.Support as Support
+import modelBased.common.support as support
 from generator.common.utils import load_gen
 from modelBased.common.utils import TRAINER_PATH
 from modelBased.world_model import AttentionWM_training
@@ -26,7 +26,7 @@ Process
 
 @hydra.main(version_base=None, config_path=str(TRAINER_PATH / "conf"), config_name="config_test")
 def collect_data(cfg: DictConfig):
-    support = Support.Support(cfg)
+    support = support.Support(cfg)
     support.del_env_data_file()  # clear the data_save_path
     env_text_file_name = ['Grid_11_11_KD_level4.txt'] 
     file_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), 'level'))

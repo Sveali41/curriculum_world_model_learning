@@ -1,6 +1,6 @@
 import os
 from omegaconf import DictConfig
-import modelBased.Support as Support
+import modelBased.common.support as support
 from generator.common.utils import load_gen
 from modelBased.common.utils import TRAINER_PATH
 import hydra
@@ -18,7 +18,7 @@ def run(cfg: DictConfig):
     old_params, fisher = None, None
     fisher_buffer = FisherReplayBuffer(max_size=150000)
     learning_steps = cfg.training_generator.learning_steps
-    support = Support.Support(cfg)
+    support = support.Support(cfg)
     # load the map from MAP sample
     env_database, file_dir = support.loading_tasks(cfg)
     learning_buffer = EnvLearningBuffer(max_size=cfg.training_generator.learning_buffer_size)

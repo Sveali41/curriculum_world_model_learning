@@ -34,40 +34,32 @@ def compare_params(net, old_params):
             print(f"{name:40s} diff = {diff:.8f}")
 
 
-def run(cfg: DictConfig, old_params=None, fisher=None, layout=None, replay_data=None):
+def run(
+    cfg: DictConfig,
+    net: AttentionWorldModel,
+    old_params=None,
+    fisher=None,
+    layout=None,
+    replay_data=None
+):
     print(f'*************************Data set: {cfg.attention_model.data_dir}************************')
 
     use_wandb = cfg.attention_model.use_wandb
-    # 旧代码中的 ewc_decay 方式会几乎覆盖旧 Fisher，改为标准 EMA 系数（新 Fisher 的占比）
-    fisher_beta = float(getattr(cfg.attention_model, "fisher_beta", 0.5))  # 0.3~0.7 可试
+    fisher_beta = float(getattr(cfg.attention_model, "fisher_beta", 0.5))
 
-    # ===========
-    # 数据模块
-    # ===========
+    # datamodule
     if cfg.attention_model.continue_learning:
         datamodule = WMRLDataModule(hparams=cfg.attention_model, replay_data=replay_data)
     else:
         datamodule = WMRLDataModule(hparams=cfg.attention_model, replay_data=None)
 
-    # ===========
-    # 模型
-    # ===========
-    net = AttentionWorldModel(hparams=cfg.attention_model)
-
-    # ===========
-    # Logger
-    # ===========
+    # logger
     wandb_logger = None
     if use_wandb:
         wandb_logger = WandbLogger(project="Local_Attention_Training", log_model=True, reinit=True)
         wandb_logger.experiment.watch(net, log='all', log_freq=1000)
-        # 如果需要也可以记录关卡可视化：
-        # if layout is not None:
-        #     wandb.log({"env_heatmap": wandb.Image((255*(layout/8)).astype(np.uint8))})
 
-    # ===========
-    # 回调
-    # ===========
+    # callbacks
     metric_to_monitor = 'avg_val_loss_wm'
     early_stop_callback = EarlyStopping(
         monitor=metric_to_monitor,
@@ -85,51 +77,61 @@ def run(cfg: DictConfig, old_params=None, fisher=None, layout=None, replay_data=
         verbose=True
     )
 
-    # ===========
-    # Trainer（使用新写法 + 梯度裁剪）
-    # ===========
+    # trainer
     trainer = pl.Trainer(
         precision=32,
         logger=wandb_logger if use_wandb else None,
         max_epochs=cfg.attention_model.n_epochs,
         accelerator="gpu",
         devices=1,
-        gradient_clip_val=1.0,   # 防止新任务初期梯度尖刺
+        gradient_clip_val=1.0,
         callbacks=[early_stop_callback, checkpoint_callback],
         deterministic=False,
     )
 
-    # ===========
-    # 仅验证 or 训练
-    # ===========
-    # 用统一入口设置“旧参数 + Fisher”锚点（内部已转到 CPU/float32）
-    net.set_consolidation(old_params, fisher)
+    result = {
+        "mode": None,            
+        "net": net,              
+        "old_params": None,
+        "fisher": None,
+        "avg_val_loss": None,
+    }
+
+    # consolidation
+    net.set_consolidation(old_params, fisher, load_weights=False)
+
     if cfg.attention_model.freeze_weight:
+        # ===== validation =====
         avg_val_loss = trainer.validate(net, datamodule)
-        return avg_val_loss, net
+
+        result["mode"] = "val"
+        result["avg_val_loss"] = avg_val_loss
+        return result
+
     else:
-        # 训练
+        # ===== training =====
         trainer.fit(net, datamodule)
 
-        # 导出旧参数（作为下一个任务的锚点）
+        # 保存旧参数
         old_params = net.save_old_params()
 
-        # 计算新的 Fisher（样本量可配，默认 3000）
+        # 计算 Fisher
         fisher_samples = int(getattr(cfg.attention_model, "fisher_samples", 3000))
-        scale_factor = cfg.attention_model.scale_factor 
+        scale_factor = cfg.attention_model.scale_factor
         new_fisher = net.compute_fisher(
             datamodule.train_dataloader(),
             samples=fisher_samples,
-            scale_factor=scale_factor  # 仅为兼容旧签名，函数内部已不使用
+            scale_factor=scale_factor
         )
 
-        # 用标准 EMA 融合 Fisher：f_new = (1-β)*f_old + β*f_task
+        # EMA 合并 Fisher
         if fisher is not None:
-            fisher = {k: (1.0 - fisher_beta) * fisher[k] + fisher_beta * new_fisher[k] for k in new_fisher}
+            fisher = {
+                k: (1.0 - fisher_beta) * fisher[k] + fisher_beta * new_fisher[k]
+                for k in new_fisher
+            }
         else:
             fisher = new_fisher
-
-        print(type(net.model))
 
         # 保存 checkpoint
         model_pth = cfg.attention_model.model_save_path
@@ -138,12 +140,35 @@ def run(cfg: DictConfig, old_params=None, fisher=None, layout=None, replay_data=
             wandb.save(str(model_pth))
             wandb.save(model_pth)
 
-        return old_params, fisher
+        result["mode"] = "train"
+        result["old_params"] = old_params
+        result["fisher"] = fisher
+        return result
 
 
-def train_api(cfg: DictConfig, old_params=None, fisher=None, env_layout=None, replay_data=None):
-    old_params, fisher = run(cfg, old_params, fisher, env_layout, replay_data)
-    return old_params, fisher
+def train_api(
+    cfg: DictConfig,
+    net: AttentionWorldModel,
+    old_params=None,
+    fisher=None,
+    env_layout=None,
+    replay_data=None
+):
+    result = run(
+        cfg,
+        net,
+        old_params=old_params,
+        fisher=fisher,
+        layout=env_layout,
+        replay_data=replay_data
+    )
+
+    if result["mode"] == "train":
+        return result["old_params"], result["fisher"], result["net"]
+
+    else:
+        return result["avg_val_loss"], None, result["net"]
+
 
 
 if __name__ == "__main__":

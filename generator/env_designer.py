@@ -22,7 +22,7 @@ from typing import Optional, Tuple, Union
 
 # 定义常量
 WALL  = OBJECT_TO_IDX['wall']
-FLOOR = OBJECT_TO_IDX['empty']
+EMPTY = OBJECT_TO_IDX['empty']
 DOOR  = OBJECT_TO_IDX['door']
 KEY   = OBJECT_TO_IDX['key']
 LAVA  = OBJECT_TO_IDX['lava']
@@ -38,7 +38,7 @@ GREY   = COLOR_TO_IDX['grey']
 ACTION_MAP = {
     # 0: Keep (特殊处理)
     1: (WALL, GREY),
-    2: (FLOOR, 0),
+    2: (EMPTY, 0),
     3: (LAVA, RED),
     
     4: (DOOR, RED),
@@ -49,6 +49,96 @@ ACTION_MAP = {
     8: (KEY, YELLOW),
     9: (KEY, BLUE)
 }
+
+
+def task_placer(
+    grid,
+    min_dist_ratio=0.3,
+    max_dist_ratio=0.9,
+    max_tries=50
+):
+    """
+    grid: [H, W] object map (WALL / EMPTY)
+    Start is always placed on boundary (edge).
+    goal is placed the furthest from start within feasible steps
+    """
+
+    def _get_free_positions(grid):
+        return list(zip(*np.where(grid == EMPTY)))
+
+    def _bfs_distance_map(grid, start):
+        H, W = grid.shape
+        dist = np.full((H, W), -1, dtype=int)
+        q = deque([start])
+        dist[start] = 0
+
+        while q:
+            y, x = q.popleft()
+            for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
+                ny, nx = y+dy, x+dx
+                if (
+                    0 <= ny < H and 0 <= nx < W
+                    and grid[ny, nx] == EMPTY
+                    and dist[ny, nx] == -1
+                ):
+                    dist[ny, nx] = dist[y, x] + 1
+                    q.append((ny, nx))
+        return dist
+
+    def _is_edge(pos, H, W):
+        y, x = pos
+        return y == 1 or x == 1 or y == H - 2 or x == W - 2
+
+    free = _get_free_positions(grid)
+    if len(free) < 2:
+        raise ValueError("Not enough free space")
+
+    H, W = grid.shape
+    edge_free = [p for p in free if _is_edge(p, H, W)]
+
+    if not edge_free:
+        raise RuntimeError("No valid edge positions")
+
+    for _ in range(max_tries):
+        start = random.choice(edge_free)
+
+        dist_map = _bfs_distance_map(grid, start)
+
+        reachable = [
+            (y, x) for (y, x) in free
+            if dist_map[y, x] > 0
+        ]
+        if not reachable:
+            continue
+
+        max_dist = max(dist_map[y, x] for (y, x) in reachable)
+
+        min_d = int(min_dist_ratio * max_dist)
+        max_d = int(max_dist_ratio * max_dist)
+
+        candidates = [
+            (y, x) for (y, x) in reachable
+            if min_d <= dist_map[y, x] <= max_d
+        ]
+        if not candidates:
+            continue
+
+        goal = random.choice(candidates)
+
+        new_grid = grid.copy()
+        new_grid[start] = OBJECT_TO_IDX["agent"]
+        new_grid[goal] = OBJECT_TO_IDX["goal"]
+
+        return new_grid, {
+            "start": start,
+            "goal": goal,
+            "shortest_path": dist_map[goal],
+            "start_on_edge": True
+        }
+
+    raise RuntimeError("Failed to place start and goal")
+
+
 
 def map_editor(base_map_obj, base_map_col, action_grid):
     """
@@ -122,7 +212,7 @@ class PCGSeeder:
             else:
                 grid = self._sample_random_canvas()
 
-            empty_count = np.sum(grid == FLOOR)
+            empty_count = np.sum(grid == EMPTY)
             if empty_count < min_empty:
                 continue
 
@@ -142,7 +232,7 @@ class PCGSeeder:
         if return_info:
             return fallback_grid, {
                 "tries": tries,
-                "empty_ratio": np.mean(fallback_grid == FLOOR),
+                "empty_ratio": np.mean(fallback_grid == EMPTY),
                 "fallback": True,
                 "structure_mode": "fallback",
             }
@@ -161,7 +251,7 @@ class PCGSeeder:
                     grid[i, j] = (
                         WALL
                         if random.random() < random.random()
-                        else FLOOR
+                        else EMPTY
                     )
         return grid
 
@@ -169,20 +259,20 @@ class PCGSeeder:
         grid = np.full((self.H, self.W), WALL, dtype=int)
 
         y, x = self.H // 2, self.W // 2
-        grid[y, x] = FLOOR
+        grid[y, x] = EMPTY
 
         steps = (self.H * self.W) // 2
         for _ in range(steps):
             dy, dx = random.choice([(-1, 0), (1, 0), (0, -1), (0, 1)])
             y = max(1, min(self.H - 2, y + dy))
             x = max(1, min(self.W - 2, x + dx))
-            grid[y, x] = FLOOR
+            grid[y, x] = EMPTY
 
         return grid
 
 
     def _is_fully_connected(self, grid: np.ndarray) -> bool:
-        empties = np.argwhere(grid == FLOOR)
+        empties = np.argwhere(grid == EMPTY)
         if len(empties) == 0:
             return False
 
@@ -197,7 +287,7 @@ class PCGSeeder:
                 if (
                     0 <= ny < self.H
                     and 0 <= nx < self.W
-                    and grid[ny, nx] == FLOOR
+                    and grid[ny, nx] == EMPTY
                     and (ny, nx) not in visited
                 ):
                     visited.add((ny, nx))
@@ -228,14 +318,14 @@ class PCGSeeder:
         min_r, max_r = self.min_empty_range
         filtered = [
             g for g in raw_pool
-            if min_r <= np.mean(g == FLOOR) <= max_r
+            if min_r <= np.mean(g == EMPTY) <= max_r
         ]
 
         # soft fallback: at least satisfy min_r
         if len(filtered) == 0:
             filtered = [
                 g for g in raw_pool
-                if np.mean(g == FLOOR) >= min_r
+                if np.mean(g == EMPTY) >= min_r
             ]
 
         # last resort (should not happen)
@@ -245,7 +335,7 @@ class PCGSeeder:
         return filtered
 
     def _fallback_empty_room(self):
-        grid = np.full((self.H, self.W), FLOOR, dtype=int)
+        grid = np.full((self.H, self.W), EMPTY, dtype=int)
         grid[0, :] = grid[-1, :] = WALL
         grid[:, 0] = grid[:, -1] = WALL
         return grid
@@ -255,7 +345,7 @@ class PCGSeeder:
         Large open room with sparse wall pillars.
         Guarantees many valid placement positions.
         """
-        grid = np.full((self.H, self.W), FLOOR, dtype=int)
+        grid = np.full((self.H, self.W), EMPTY, dtype=int)
 
         grid[0, :] = grid[-1, :] = WALL
         grid[:, 0] = grid[:, -1] = WALL

@@ -1,17 +1,14 @@
 import sys
 sys.path.append('/home/siyao/project/rlPractice/MiniGrid/modelBased')
 from ..common.utils import normalize_obs, ColRowCanl_to_CanlRowCol, WORLD_MODEL_PATH, PROJECT_ROOT, Visualization
-from domain_wrapper.minigrid_custom_env import *
+from domain.minigrid_custom_env import *
 from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper
-from path import *
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import time
 from tqdm import tqdm
 import torch
 import wandb
-
-
 import os
 import hydra
 from omegaconf import DictConfig

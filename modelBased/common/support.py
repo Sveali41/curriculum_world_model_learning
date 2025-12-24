@@ -7,8 +7,8 @@ ROOTPATH = os.path.abspath(os.path.join(__file__, '..', '..'))
 sys.path.append(ROOTPATH)
 from modelBased.common.utils import GENERATOR_PATH, TRAINER_PATH
 from omegaconf import DictConfig
-from generator.common.utils import load_gen, generate_color_map, generate_obj_map, layout_to_string, combine_maps, clean_and_place_goal
-from domain_wrapper.minigrid_custom_env import *
+from generator.common.utils import generate_color_map, generate_obj_map, combine_maps, interpret_color_map
+from domain.minigrid_custom_env import *
 import textwrap
 from minigrid.wrappers import FullyObsWrapper, RGBImgObsWrapper
 import torch
@@ -22,6 +22,7 @@ from generator.data.env_dataset_support import generate_envs_dataset
 from generator.data.env_dataset_support import replace_vector_value, visualize_grid
 from generator.data.env_dataset_support import is_reachable
 from modelBased.world_model import AttentionWM_training
+from minigrid.core.constants import OBJECT_TO_IDX, COLOR_TO_IDX, IDX_TO_COLOR, IDX_TO_OBJECT
 
 
 class Support:
@@ -154,15 +155,13 @@ class Support:
 
         return final_task_dict
 
-    def load_gen_func(self):
-        model = load_gen(self.cfg)
-        return model
 
     def generate_env(self, model):
         z = torch.randn(1, self.cfg.training_generator.z_shape)
         env_layout = torch.argmax(model(z), dim=1)
         return env_layout
     
+
     def wrap_env(self, env):
         if self.cfg.env.visualize:
             render_mode = "human"
@@ -182,6 +181,19 @@ class Support:
         # manual_control = ManualControl(env)  # Allows manual control for testing and visualization
         # manual_control.start()  # Start the manual control interface
         return env
+    
+    def interpret_env(self, env, color_array=None):
+        layout_string = generate_obj_map(env, self.cfg.training_generator.map_element)
+        # layout_string = clean_and_place_goal(layout_string)
+        if color_array is None:
+            color_string = generate_color_map(layout_string)
+        else:
+            color_string = interpret_color_map(color_array, self.cfg.training_generator.color_element)
+        print("layout_string: ", layout_string)
+        # env.reset()
+        # manual_control = ManualControl(env)  # Allows manual control for testing and visualization
+        # manual_control.start()  # Start the manual control interface
+        return layout_string, color_string
     
     def wrap_env_from_text(self, file_path, max_steps):
         if self.cfg.env.visualize:
@@ -360,32 +372,7 @@ class Support:
             }
             wm_loss = self.validate_world_model(self.cfg, old_params, fisher, env_edited)
             self.add_into_learning_buffer(env_layout, wm_loss, samples, learning_buffer)
-            
-    # def assessing_performance_on_final_task(self, cfg, final_task_set, save_data=False, save_root=None):
-    #     """
-    #     Assess the performance of the trained model on the final task set.
-    #     Optionally save collected data for each environment.
-    #     """
-    #     print("++++++++++++++ Assessing performance on final task set... +++++++++++++++")
-    #     loss_set = []
-    #     data_paths = []
-
-    #     # 自动生成保存目录
-    #     save_root = os.path.join(cfg.env.collect.data_folder, "final_task_envs")
-    #     for i, final_task in enumerate(final_task_set):
-    #         env = self.wrap_env(torch.tensor(final_task_set[final_task]).unsqueeze(0))
-    #         save_path = os.path.join(save_root, f"env_{i}.npz")
-    #         if not os.path.exists(save_path):
-    #             cfg.env.collect.data_save_path = save_path
-    #             self.collect_data_from_env(env, validate=True)
-            
-    #         cfg.attention_model.data_dir = save_path
-    #         loss = self.validate_world_model(cfg, old_params=None, fisher=None, env_layout=final_task)
-    #         loss_set.append(loss[0]['avg_val_loss_wm'])
-    #     avg_loss = sum(loss_set) / len(loss_set)
-    #     print(f"Average loss on final task set: {avg_loss}")
-
-    #     return avg_loss
+        
 
     def assessing_performance_on_final_task(self, cfg, final_task_set, wandb_run, save_data=False, save_root=None):
         """

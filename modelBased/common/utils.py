@@ -6,7 +6,7 @@ import dotenv
 from matplotlib import pyplot as plt
 import numpy as np
 import torch
-from . import utilis_support
+from . import utils_support
 from typing import Dict
 from matplotlib.colors import LinearSegmentedColormap
 from generator.common.utils import generate_color_map, layout_to_string, combine_maps, add_outer_wall
@@ -88,14 +88,14 @@ def extract_masked_state(state, mask_size, agent_position_yx):
 
     #区分带batch 和不带batch的情况
     if len(state.shape) == 3:
-        state_masked = utilis_support.extract_masked_state_support(state, agent_position_yx , mask_size)
+        state_masked = utils_support.extract_masked_state_support(state, agent_position_yx , mask_size)
 
     if len(state.shape) == 4:
         B, channel, row, col = state.shape
         
         state_masked = np.zeros((B, channel, mask_size, mask_size), dtype=state.dtype) 
         for i in range(B):
-            state_masked[i, :, :, :] = utilis_support.extract_masked_state_support(state[i], agent_position_yx[i], mask_size)
+            state_masked[i, :, :, :] = utils_support.extract_masked_state_support(state[i], agent_position_yx[i], mask_size)
 
     if tensor_flag:
         state_masked = torch.from_numpy(state_masked).cuda()
@@ -244,9 +244,9 @@ def denormalize_obj(x, obs_norm_values):
     return x
     
 def map_obs_to_nearest_value(obs_denorm, obj_values, color_values, state_values):
-    obs_denorm[0, :, :] = utilis_support.map_to_nearest_value_support(obs_denorm[0, :, :], obj_values)
-    obs_denorm[1, :, :] = utilis_support.map_to_nearest_value_support(obs_denorm[1, :, :], color_values)
-    obs_denorm[2, :, :] = utilis_support.map_to_nearest_value_support(obs_denorm[2, :, :], state_values)
+    obs_denorm[0, :, :] = utils_support.map_to_nearest_value_support(obs_denorm[0, :, :], obj_values)
+    obs_denorm[1, :, :] = utils_support.map_to_nearest_value_support(obs_denorm[1, :, :], color_values)
+    obs_denorm[2, :, :] = utils_support.map_to_nearest_value_support(obs_denorm[2, :, :], state_values)
     return obs_denorm
 
 class Visualization:

@@ -4,29 +4,69 @@ sys.path.append('/home/siyao/project/rlPractice/MiniGrid')
 import random
 import re
 
-from minigrid.core.constants import OBJECT_TO_IDX, COLOR_TO_IDX
+from minigrid.core.constants import OBJECT_TO_IDX, COLOR_TO_IDX, IDX_TO_COLOR, IDX_TO_OBJECT
 
 
-
-def generate_obj_map(layout, map_dict):
+def generate_obj_map(layout, map_element: dict):
     """
-    Convert a 2D tensor layout into a string representation using a mapping dictionary.
-    
+    Convert MiniGrid object-index layout to ASCII map.
+
     Args:
-        layout (torch.Tensor): A 2D tensor representing the layout.
-        map_dict (dict): A dictionary mapping numbers to characters.
-            
+        layout: torch.Tensor or np.ndarray, shape (1, H, W)
+        map_element: dict, object_name -> char
+                     e.g. {"wall": "W", "goal": "G", ...}
+
     Returns:
-        str: A string representation of the layout.
+        str: ASCII map
     """
-    # Convert the layout tensor to a numpy array
-    reverse_map_dict = {v: k for k, v in map_dict.items()}
-    layout_strings = []
-    for i in range(layout.shape[1]): 
-        row = layout[0][i]  
-        layout_line = ''.join([reverse_map_dict.get(num.item()) for num in row])
-        layout_strings.append(layout_line)
-    return '\n'.join(layout_strings)
+    if hasattr(layout, "detach"):
+        layout = layout.detach().cpu()
+
+    h, w = layout.shape
+    lines = []
+
+    for i in range(h):
+        row = layout[i]
+        chars = []
+        for idx in row:
+            obj_name = IDX_TO_OBJECT[int(idx)]
+            chars.append(map_element.get(obj_name, "?"))
+        lines.append("".join(chars))
+
+    return "\n".join(lines)
+
+def interpret_color_map(color_layout, color_map):
+    """
+    Convert MiniGrid color-index layout to ASCII color map.
+
+    Args:
+        color_layout: torch.Tensor or np.ndarray, shape (1, H, W)
+        color_map: dict, char -> color_name
+                   e.g. {"R": "red", "G": "green", ...}
+
+    Returns:
+        str: ASCII color map
+    """
+    # torch -> cpu
+    if hasattr(color_layout, "detach"):
+        color_layout = color_layout.detach().cpu()
+
+    # reverse: color_name -> char
+    color_name_to_char = {v: k for k, v in color_map.items()}
+
+    h, w = color_layout.shape
+    lines = []
+    
+    for i in range(h):
+        row = color_layout[i]
+        chars = []
+        for idx in row:
+            color_name = IDX_TO_COLOR[int(idx)]
+            chars.append(color_name_to_char.get(color_name, "?"))
+        lines.append("".join(chars))
+
+    return "\n".join(lines)
+    
 
 def generate_color_map(layout_strings):
     '''
@@ -35,7 +75,7 @@ def generate_color_map(layout_strings):
     # define the mapping from object to color
     object_to_color_map = {
         'W': 'W',  # Wall → W
-        'E': 'E',  # Floor → E
+        'E': 'E',  # Empty → E
         'G': 'G',  # Goal → G
         'S': 'E',  # Start → E
         'K': 'Y',  # Key → Y

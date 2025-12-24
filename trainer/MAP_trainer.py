@@ -1,5 +1,5 @@
 from omegaconf import DictConfig
-import modelBased.Support as Support
+import modelBased.common.support as support
 from generator.common.utils import load_gen
 from modelBased.common.utils import TRAINER_PATH
 import hydra
@@ -46,7 +46,7 @@ def run(cfg: DictConfig):
         wandb.define_metric("curriculum_step")  
         wandb.define_metric("final_task_performance", step_metric="curriculum_step")
     old_params, fisher = None, None
-    support = Support.Support(cfg)
+    support = support.Support(cfg)
     fisher_buffer = FisherReplayBuffer(cfg.attention_model.fisher_buffer_size)
     learning_steps = cfg.training_generator.learning_steps
     # load the map from MAP sample

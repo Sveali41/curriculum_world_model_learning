@@ -17,43 +17,72 @@ device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 # ==========================================
 # 1. 连通性检查 (Validity - BFS)
 # ==========================================
-def check_solvability(grid_obj_np, start_pos=(1, 1), goal_id=8):
+from collections import deque
+import numpy as np
+from minigrid.core.constants import OBJECT_TO_IDX
+
+
+def check_solvability(grid_obj_np):
     """
-    使用 BFS 检查是否存在一条【安全】的路径到达终点
-    即：不穿墙，也不踩岩浆
+    Check whether there exists a safe path from start to goal using BFS.
+    A valid path:
+      - does NOT pass through walls
+      - does NOT step on lava
+      - doors and keys are treated as passable
+
+    grid_obj_np: np.ndarray of shape [H, W], containing object IDs
+    return: bool
     """
-    height, width = grid_obj_np.shape
-    
-    # 获取 ID 常量
-    WALL = OBJECT_TO_IDX['wall']
-    LAVA = OBJECT_TO_IDX['lava']  # <--- 新增：定义岩浆 ID
-    
+
+    H, W = grid_obj_np.shape
+
+    # Object IDs
+    WALL  = OBJECT_TO_IDX["wall"]
+    LAVA  = OBJECT_TO_IDX["lava"]
+    START = OBJECT_TO_IDX["agent"]
+    GOAL  = OBJECT_TO_IDX["goal"]
+
+    # ------------------------------------------------
+    # 1. Find start position automatically
+    # ------------------------------------------------
+    start_positions = np.argwhere(grid_obj_np == START)
+    if len(start_positions) == 0:
+        return False  # no start → invalid map
+
+    start_pos = tuple(start_positions[0])  # (row, col)
+
+    # ------------------------------------------------
+    # 2. BFS
+    # ------------------------------------------------
     queue = deque([start_pos])
     visited = set([start_pos])
-    
+
     while queue:
         r, c = queue.popleft()
-        
-        # 找到终点
-        if grid_obj_np[r, c] == goal_id:
+
+        # reached goal
+        if grid_obj_np[r, c] == GOAL:
             return True
-            
-        # 上下左右
-        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+
+        # 4-neighborhood
+        for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
             nr, nc = r + dr, c + dc
-            
-            if 0 <= nr < height and 0 <= nc < width:
-                if (nr, nc) not in visited:
-                    cell_type = grid_obj_np[nr, nc]
-                    
-                    # === 关键修改 ===
-                    # 只有当它既不是墙，也不是岩浆时，才允许通过
-                    # (门 Door 和 钥匙 Key 依然视为通路)
-                    if cell_type != WALL and cell_type != LAVA:
-                        visited.add((nr, nc))
-                        queue.append((nr, nc))
-                        
+
+            if 0 <= nr < H and 0 <= nc < W:
+                if (nr, nc) in visited:
+                    continue
+
+                cell = grid_obj_np[nr, nc]
+
+                # block walls & lava
+                if cell == WALL or cell == LAVA:
+                    continue
+
+                visited.add((nr, nc))
+                queue.append((nr, nc))
+
     return False
+
 
 # ==========================================
 # 2. 多样性打分 (Diversity - RND + Archive)
