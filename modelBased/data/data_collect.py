@@ -310,10 +310,15 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
 
     # Use tqdm for progress tracking
     visual_func = Visualization(cfg.attention_model)
-    with tqdm(total=cfg.env.collect.episodes, desc="Collecting Episodes") as pbar:
+    target_episodes = cfg.env.collect.episodes
+    mini_dataset_size = getattr(cfg.env.collect, "mini_dataset_size", 0)
+
+    with tqdm(total=target_episodes, desc="Collecting Episodes") as pbar:
         info_list.append([{'carrying_key': False}])  
 
-        while episodes < cfg.env.collect.episodes:
+        # Condition: Keep collecting if (episodes < target) OR (total_steps < mini_dataset_size)
+        # We check len(obs_list) for total steps.
+        while episodes < target_episodes or (mini_dataset_size > 0 and len(obs_list) < mini_dataset_size):
             step_in_episode += 1
 
             obs_list.append([obs['image']])
@@ -394,7 +399,7 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
             # Visualize if needed
             if cfg.env.visualize:
                 env.render()
-                time.sleep(0.1)
+                # time.sleep(0.1)
 
             # Reset environment on episode end
             if done or trunc:

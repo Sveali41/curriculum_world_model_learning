@@ -6,7 +6,7 @@ import sys
 sys.path.append(ROOTPATH)
 
 from modelBased.world_model.AttentionWM import AttentionWorldModel
-from modelBased.data.datamodule import WMRLDataModule
+from modelBased.data.datamodule import WMRLDataModule, WMRLDataset, WMRLDataset
 from modelBased.common.utils import PROJECT_ROOT, get_env
 import hydra
 from omegaconf import DictConfig
@@ -18,6 +18,37 @@ import wandb
 import numpy as np
 from modelBased.common.utils import TRAINER_PATH
 
+
+# === Define Custom Datamodule for Validation ===
+# This allows using 100% data for validation without modifying the original library code.
+class ValidationDataModule(WMRLDataModule):
+    def setup(self, stage=None):
+        if self.direct_data is not None:
+            loaded = self.direct_data
+        else:
+            loaded = np.load(self.data_dir, allow_pickle=True)
+        
+        # Create dataset
+        data = WMRLDataset(loaded, self.hparams, self.replay_data)
+        
+        # Use 100% data for test
+        # Create a Subset that covers the full range
+        self.data_test = torch.utils.data.Subset(data, range(0, len(data)))
+        # Train set is empty or just dummy
+        self.data_train = torch.utils.data.Subset(data, range(0, 0))
+        
+        print(f"[ValidationDataModule] Used 100% data ({len(self.data_test)} samples) for validation.")
+
+    def val_dataloader(self):
+        return torch.utils.data.DataLoader(
+            self.data_test, 
+            batch_size=self.hparams.batch_size, 
+            shuffle=False, 
+            drop_last=False, # Allow small batches
+            num_workers=self.hparams.n_cpu,
+            pin_memory=True,
+            persistent_workers=False
+        )
 
 @hydra.main(version_base=None, config_path=str(TRAINER_PATH / "conf"), config_name="config_test")
 def train(cfg: DictConfig):
@@ -48,7 +79,12 @@ def run(
     fisher_beta = float(getattr(cfg.attention_model, "fisher_beta", 0.5))
 
     # datamodule
-    if cfg.attention_model.continue_learning:
+    should_use_validation_mode = cfg.attention_model.freeze_weight
+    
+    if should_use_validation_mode:
+        # User requested "Validation Only" mode (100% data, no split check)
+        datamodule = ValidationDataModule(hparams=cfg.attention_model, replay_data=None)
+    elif cfg.attention_model.continue_learning:
         datamodule = WMRLDataModule(hparams=cfg.attention_model, replay_data=replay_data)
     else:
         datamodule = WMRLDataModule(hparams=cfg.attention_model, replay_data=None)
@@ -57,7 +93,11 @@ def run(
     wandb_logger = None
     if use_wandb:
         wandb_logger = WandbLogger(project="Local_Attention_Training", log_model=True, reinit=True)
-        wandb_logger.experiment.watch(net, log='all', log_freq=1000)
+        # Fix: Do NOT watch model during validation loop. 
+        # Watching adds hooks to the persistent 'net', which reference this temporary 'wandb_logger'.
+        # When 'wandb_logger' is GC'ed after this function returns, the hooks break.
+        if not cfg.attention_model.freeze_weight:
+            wandb_logger.experiment.watch(net, log='all', log_freq=1000)
 
     # callbacks
     metric_to_monitor = 'avg_val_loss_wm'
@@ -133,6 +173,7 @@ def run(
         else:
             fisher = new_fisher
 
+    # ... (in run)
         # 保存 checkpoint
         model_pth = cfg.attention_model.model_save_path
         trainer.save_checkpoint(model_pth)
@@ -143,6 +184,11 @@ def run(
         result["mode"] = "train"
         result["old_params"] = old_params
         result["fisher"] = fisher
+        
+        # Capture best validation loss
+        best_score = trainer.checkpoint_callback.best_model_score
+        result["best_loss"] = best_score.item() if best_score is not None else 0.0
+        
         return result
 
 
@@ -167,6 +213,7 @@ def train_api(
         return result["old_params"], result["fisher"], result["net"]
 
     else:
+        # For validation mode, return avg_val_loss as the loss metric
         return result["avg_val_loss"], None, result["net"]
 
 

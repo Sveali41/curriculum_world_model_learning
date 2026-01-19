@@ -195,27 +195,69 @@ class FisherReplayBuffer:
 
         return near_mask  # (B,)
 
-    def update_combined(
-        self,
-        samples: Dict[str, np.ndarray],
-        ratio: float,                 # 从当前 samples 中抽多少比例
-        elements_ratio: float    # 其中 key/door/lava 样本占比
-    ):
+    def update_combined(self, samples, current_sample_ratio=0.5, fisher_buffer_elements_ratio=0.5, target_shape=None):
         """
         综合插入策略（基于当前 sample 数量）：
         1) 从 samples 中抽取 ratio 百分比数据
         2) 其中 key/door 样本占 keydoor_ratio 比例
         """
+        # Calculate how many samples to add based on ratio of current buffer size
+        # But ensure we add at least some if buffer is empty
+        
         total_len = len(samples['obs'])
         if total_len == 0:
             return
 
-        total_quota = int(total_len * ratio)
+        total_quota = int(total_len * current_sample_ratio)
         if total_quota <= 0:
             return
 
         # === Part 1: key/door 样本 ===
         obs = samples['obs']
+        
+        # --- [Auto-Padding Logic] ---
+        # Ensure all maps are padded to target_shape to support diverse env sizes
+        if target_shape is not None:
+            MAX_H, MAX_W = target_shape
+        else:
+             # Default: No padding if target_shape is not specified
+             # Just use the shape of the input maps
+             if isinstance(obs, np.ndarray):
+                if obs.ndim == 4: # (B, C, H, W)
+                    MAX_H, MAX_W = obs.shape[2], obs.shape[3]
+                else: # (B, H, W, C)
+                    MAX_H, MAX_W = obs.shape[1], obs.shape[2]
+             else:
+                # Fallback purely for safety if type is weird, though unlikely code path
+                MAX_H, MAX_W = 8, 8
+        
+        def pad_maps(maps_array):
+            # maps_array shape: (B, C, H, W) or (B, H, W, C)
+            # Assuming (B, 3, H, W) based on codebase convention
+            if maps_array.shape[2] == MAX_H and maps_array.shape[3] == MAX_W:
+                return maps_array
+                
+            B, C, H, W = maps_array.shape
+            pad_h = MAX_H - H
+            pad_w = MAX_W - W
+            
+            if pad_h < 0 or pad_w < 0:
+                 # print(f"[Warning] Map size ({H}, {W}) larger than max ({MAX_H}, {MAX_W}). Cropping!")
+                 return maps_array[:, :, :MAX_H, :MAX_W]
+                 
+            # Pad H and W dimensions (last two)
+            # Tuple format for np.pad: ((before_1, after_1), ... (before_N, after_N))
+            # (0,0) for B, (0,0) for C, (0, pad_h) for H, (0, pad_w) for W
+            padded = np.pad(maps_array, ((0,0), (0,0), (0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
+            return padded
+
+        if isinstance(obs, np.ndarray):
+            obs = pad_maps(obs)
+            samples['obs'] = obs
+            
+        if isinstance(samples['obs_next'], np.ndarray):
+             samples['obs_next'] = pad_maps(samples['obs_next'])
+
         obs_tensor = torch.tensor(obs) if not isinstance(obs, torch.Tensor) else obs
         try:
             near_elements_mask = self.get_agent_near_elements_mask(obs_tensor)
@@ -224,7 +266,7 @@ class FisherReplayBuffer:
             print("Error computing near_elements_mask:", e)
             near_indices_all = np.array([], dtype=int)
 
-        elements_quota = int(total_quota * elements_ratio)
+        elements_quota = int(total_quota * fisher_buffer_elements_ratio)
         elements_selected = []
         if len(near_indices_all) > 0 and elements_quota > 0:
             pick_n = min(elements_quota, len(near_indices_all))

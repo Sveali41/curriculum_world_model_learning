@@ -11,6 +11,7 @@ import torch.nn as nn
 import numpy as np
 from collections import deque
 from minigrid.core.constants import OBJECT_TO_IDX
+from torch.nn import functional as F
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -54,15 +55,22 @@ def check_solvability(grid_obj_np):
     # ------------------------------------------------
     # 2. BFS
     # ------------------------------------------------
-    queue = deque([start_pos])
+    # ------------------------------------------------
+    # 2. BFS
+    # ------------------------------------------------
+    # Queue stores: (row, col, distance)
+    queue = deque([(start_pos[0], start_pos[1], 0)])
     visited = set([start_pos])
+    max_dist = 0
 
     while queue:
-        r, c = queue.popleft()
+        r, c, dist = queue.popleft()
+        max_dist = max(max_dist, dist)
 
         # reached goal
         if grid_obj_np[r, c] == GOAL:
-            return True
+            # Found shortest path to goal
+            return True, dist
 
         # 4-neighborhood
         for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
@@ -79,121 +87,186 @@ def check_solvability(grid_obj_np):
                     continue
 
                 visited.add((nr, nc))
-                queue.append((nr, nc))
+                queue.append((nr, nc, dist + 1))
 
-    return False
+    return False, 0
 
 
 # ==========================================
 # 2. 多样性打分 (Diversity - RND + Archive)
 # ==========================================
-class DiversityModule:
-    def __init__(self, archive_size=1000, k=10, input_channels=3):
-        # 1. 固定随机 CNN (Random Encoder)
-        self.encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 16, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Flatten(),
-            nn.Linear(16 * 7 * 7, 64) # 假设输入 15x15，池化后约 7x7
-        ).to(device).eval()
-        
-        # 冻结参数 (这是一把固定的尺子)
-        for p in self.encoder.parameters():
-            p.requires_grad = False
-            
-        self.archive = [] # 存 Embedding (numpy arrays)
-        self.max_size = archive_size
+class DiversityModule(nn.Module):
+    def __init__(self, input_h=15, input_w=15, k=10, max_archive_size=1000, device='cuda'):
+        super().__init__()
         self.k = k
+        self.max_size = max_archive_size
+        self.archive = [] 
+        self.device = device
+        
+        # === 1. 定义 One-Hot 的类别数 ===
+        # Minigrid 通常 Object ID 最大约 11-13，Color ID 最大约 6
+        # 根据你的 tensor 数据，至少要有 11 (因为看到了 ID 10)
+        self.num_obj_types = 11 
+        self.num_colors = 6
+        
+        # 输入通道数 = 物体类别数 + 颜色类别数
+        input_channels = self.num_obj_types + self.num_colors 
+        
+        # === 2. 定义编码器 CNN ===
+        self.encoder = nn.Sequential(
+            # 输入: [1, 17, H, W]
+            nn.Conv2d(input_channels, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            # 展平后维度: 32 * H * W
+            nn.Linear(32 * input_h * input_w, 64) 
+        ).to(device)
+
+    def _preprocess(self, map_tensor):
+        """
+        将 [2, H, W] 的 ID 地图转换为 [1, 17, H, W] 的 One-Hot 特征图
+        """
+        # 1. 增加 Batch 维度: [2, H, W] -> [1, 2, H, W]
+        x = map_tensor 
+        
+        # 2. 分离通道
+        obj_ids = x[:, 0, :, :].long() # [1, H, W]
+        col_ids = x[:, 1, :, :].long() # [1, H, W]
+        
+        # 3. One-Hot 编码
+        # obj_ids -> [1, H, W, 11] -> permute -> [1, 11, H, W]
+        obj_oh = F.one_hot(obj_ids, num_classes=self.num_obj_types).permute(0, 3, 1, 2).float()
+        
+        # col_ids -> [1, H, W, 6] -> permute -> [1, 6, H, W]
+        col_oh = F.one_hot(col_ids, num_classes=self.num_colors).permute(0, 3, 1, 2).float()
+        
+        # 4. 拼接: [1, 11+6, H, W]
+        return torch.cat([obj_oh, col_oh], dim=1)
 
     def get_reward(self, map_vec_tensor):
         """
-        map_vec_tensor: [1, 3, 15, 15] (Minigrid Vectorized Obs)
-        返回: float reward
+        输入: map_vec_tensor [2, H, W] (单个地图)
+        输出: float (标量奖励)
         """
-        with torch.no_grad():
-            # 提取特征 [64]
-            emb = self.encoder(map_vec_tensor.float()).cpu().numpy().flatten()
+        # 确保数据在正确的设备上
+        map_vec_tensor = map_vec_tensor.to(self.device)
         
-        # 如果档案库太小，先给 0 分
-        if len(self.archive) < self.k:
-            reward = 0.0
+        with torch.no_grad():
+            # 1. 预处理 (One-Hot + Unsqueeze)
+            x = self._preprocess(map_vec_tensor) # [1, 17, H, W]
+            
+            # 2. 编码提取特征
+            emb = self.encoder(x).cpu().numpy().flatten() # [64]
+            
+        # 3. KNN 距离计算 (新颖性)
+        if len(self.archive) == 0:
+             # Very first sample: no history, so it's infinitely novel? 
+             # Or just give 0. Or give a small default.
+             # Let's give 0 to be safe, next one will have 1 neighbor.
+             reward = 0.0
         else:
-            # 计算与 Archive 中所有点的距离
-            # archive_matrix: [N, 64]
             archive_matrix = np.stack(self.archive)
+            # 计算当前 emb 与 archive 中所有点的欧氏距离
             dists = np.linalg.norm(archive_matrix - emb, axis=1)
             
-            # 找到最近的 k 个邻居 (KNN)
-            dists.sort()
-            nearest_k = dists[:self.k]
+            # Use dynamic K if archive is small
+            # This solves the "Cold Start" problem where first K samples got 0 reward
+            current_k = min(len(self.archive), self.k)
             
-            # 距离越远，分数越高 (新颖性)
+            # 取最近的 k 个
+            dists.sort()
+            nearest_k = dists[:current_k]
+            
+            # 平均距离越大，说明越新颖
             reward = np.mean(nearest_k)
             
-        # 更新档案库 (FIFO)
+        # 4. 更新档案 (FIFO)
         self.archive.append(emb)
         if len(self.archive) > self.max_size:
             self.archive.pop(0)
             
-        return reward
+        return float(reward)
 
 def calculate_lp_reward(world_model, trajectory_data, lr=1e-3):
     """
-    计算 Head-only Learning Progress.
-    只更新模型的 '预测头' 部分进行影子测试，以此估算学习潜力。
+    计算 Head-only Learning Progress (LP).
+
+    核心思想：
+    - 只对预测头（head / decoder 等）做一次“影子更新”
+    - 测量 loss_before - loss_after 作为学习潜力
+    - 所有参数在函数结束时都会被完整恢复，不污染主训练
     """
-    
-    # === 1. 保存当前状态 (Snapshot) ===
-    # 我们不仅要回滚参数，还要回滚 requires_grad 的状态
-    original_state = {k: v.clone() for k, v in world_model.state_dict().items()}
-    
-    # === 2. 冻结 Backbone，只解冻 Head (关键步骤) ===
+
+    import torch
+
+    # ============================================================
+    # 1. Snapshot：只保存【参数数值】，不使用 state_dict()
+    #    （避免 Lightning / ShardedTensor 的 hook 问题）
+    # ============================================================
+    original_params = {
+        name: param.detach().clone()
+        for name, param in world_model.named_parameters()
+    }
+
+    # ============================================================
+    # 2. 冻结 Backbone，只解冻 Head
+    # ============================================================
     params_to_update = []
-    
+
     for name, param in world_model.named_parameters():
-        # 这里需要根据你 World Model 的实际层名称修改关键字
-        # 通常预测头会包含 'head', 'decoder', 'predictor', 'fc' 等字眼
-        # 而卷积层通常叫 'encoder', 'cnn', 'backbone'
         if any(key in name for key in ['head', 'decoder', 'predictor', 'fc_out']):
             param.requires_grad = True
             params_to_update.append(param)
         else:
             param.requires_grad = False
-            
-    # 如果没找到任何 Head 参数（防止名字不匹配导致空列表）
+
+    # 兜底：如果没找到 head（名字不匹配）
     if len(params_to_update) == 0:
-        print("Warning: No head parameters found for Shadow Update! Check layer names.")
-        # 降级方案：更新所有参数 (慢，但安全)
+        print("[LP Warning] No head parameters found, fallback to all parameters.")
         for param in world_model.parameters():
             param.requires_grad = True
             params_to_update.append(param)
 
-    # === 3. 创建临时优化器 ===
-    # 对于单步更新，SGD 比 Adam 更轻量且足够有效
+    # ============================================================
+    # 3. 临时优化器（Shadow Optimizer）
+    #    单步 SGD，避免 optimizer state snapshot
+    # ============================================================
     temp_optimizer = torch.optim.SGD(params_to_update, lr=lr)
 
-    # === 4. 摸底 (Loss Before) ===
-    # 此时 backward 只会计算 Head 的梯度，非常快
+    # ============================================================
+    # 4. Loss Before（更新前）
+    # ============================================================
     loss_before = world_model.calc_loss(trajectory_data)
-    
-    # === 5. 影子更新 (Shadow Update) ===
-    temp_optimizer.zero_grad()
+
+    # ============================================================
+    # 5. Shadow Update（只更新 head）
+    # ============================================================
+    temp_optimizer.zero_grad(set_to_none=True)
     loss_before.backward()
     temp_optimizer.step()
-    
-    # === 6. 复试 (Loss After) ===
+
+    # ============================================================
+    # 6. Loss After（更新后）
+    # ============================================================
     with torch.no_grad():
         loss_after = world_model.calc_loss(trajectory_data)
-        
-    # === 7. 恢复现场 (Restore) ===
-    # A. 恢复参数数值
-    world_model.load_state_dict(original_state)
-    # B. 恢复所有参数为可训练状态 (为接下来的主循环训练做准备)
+
+    # ============================================================
+    # 7. Restore：恢复所有参数数值 + requires_grad 状态
+    # ============================================================
+    with torch.no_grad():
+        for name, param in world_model.named_parameters():
+            param.copy_(original_params[name])
+
     for param in world_model.parameters():
         param.requires_grad = True
-    
+
+    # ============================================================
+    # 8. LP Reward
+    # ============================================================
     lp_reward = loss_before.item() - loss_after.item()
-    
-    # 过滤掉极小的负值 (误差波动)
+
+    # 过滤数值抖动导致的极小负值
     return max(0.0, lp_reward)

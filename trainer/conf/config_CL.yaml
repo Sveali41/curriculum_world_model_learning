@@ -1,8 +1,8 @@
 # 1. load the generator
 training_generator:
   # data 
-  map_width: 6
-  map_height: 6
+  map_width: 48
+  map_height: 48
   data_dir: ${oc.env:GENERATOR_PATH}/data/dataset/generated_data_final.json
   batch_size: 1
   n_cpu: 0

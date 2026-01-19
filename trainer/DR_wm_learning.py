@@ -6,6 +6,7 @@ import glob
 import torch
 import numpy as np
 import copy
+import csv
 
 from modelBased.common.utils import TRAINER_PATH
 from modelBased.world_model import AttentionWM_training
@@ -97,10 +98,10 @@ def filter_balanced_batch(new_batch, fisher_buffer, ratio=0.5, elements_ratio=0.
     config_path=str(TRAINER_PATH / "conf"),
     config_name="config_UED",
 )
-def adversarial_ued_training(cfg: DictConfig):
+def domain_randomization_baseline(cfg: DictConfig):
     """
-    UED Adversarial Training Loop.
-    Integrates Generator (PPO), World Model (AttentionWM), and Continual Learning (Fisher Buffer).
+    Domain Randomization (DR) Baseline.
+    Uses 'RandomGeneratorAgent' instead of PPO.
     """
 
     # --------------------------------------
@@ -110,13 +111,11 @@ def adversarial_ued_training(cfg: DictConfig):
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    import csv
-
     # 日志与数据路径
-    log_dir = TRAINER_PATH / "logs" / "results"
+    log_dir = TRAINER_PATH / "logs" / "results_dr" # [MODIFIED] Separate logs
     os.makedirs(log_dir, exist_ok=True)
-    csv_path = log_dir / "ued_adversarial_log.csv"
-    summary_csv_path = log_dir / "experiment_summary.csv"
+    csv_path = log_dir / "dr_log.csv"
+    summary_csv_path = log_dir / "experiment_summary_dr.csv"
     data_save_dir = TRAINER_PATH / "data"
 
     # === 初始化 Summary CSV ===
@@ -152,6 +151,7 @@ def adversarial_ued_training(cfg: DictConfig):
         world_model=wm_instance,
         device=device,
         cfg=cfg,
+        agent_type='random' # [MODIFIED] Force Random Agent
     )
 
     # === C. 初始化 Fisher Replay Buffer ===
@@ -161,9 +161,9 @@ def adversarial_ued_training(cfg: DictConfig):
 
     # === D. 训练状态变量 ===
     old_params, fisher = None, None
-    old_params, fisher = None, None
     total_iterations = cfg.generator_agent.total_iterations
-    warmup_iterations = getattr(cfg.generator_agent, "warmup_iterations", 0) # Read with default 0
+    # [MODIFIED] DR has no "Warmup" (Agent never learns). Force 0 to skip special logic.
+    warmup_iterations = 0 
     wm_train_frequency = cfg.generator_agent.wm_train_frequency  
 
     # === E. 验证集定义 ===
@@ -191,7 +191,7 @@ def adversarial_ued_training(cfg: DictConfig):
     ]
 
     print(
-        f">>> Starting UED Adversarial Training for {total_iterations} iterations..."
+        f">>> Starting Domain Randomization (DR) Baseline for {total_iterations} iterations..."
     )
 
     # --------------------------------------
@@ -243,12 +243,8 @@ def adversarial_ued_training(cfg: DictConfig):
         # --------------------------------------------------------
         # Step 3: 更新 Generator (PPO Update)
         # --------------------------------------------------------
-        # --------------------------------------------------------
-        # Step 3: 更新 Generator (PPO Update)
-        # --------------------------------------------------------
-        # [MODIFIED] User Request: Warmup is for Generator now.
-        # Generator trains from the start (Iter 0).
-        if True:
+        # [MODIFIED] Warmup Fix: Do NOT update generator during warmup.
+        if iteration >= warmup_iterations:
             gen_loss, gen_mean_reward = gen_interface.update()
 
             if gen_loss is not None:
@@ -258,32 +254,36 @@ def adversarial_ued_training(cfg: DictConfig):
             else:
                 print("[Generator] Policy Updated. Loss: NaN (Skipped due to instability)")
                 gen_loss = 0.0 
+        else:
+             print(f"[System] Warmup Phase ({iteration+1}/{warmup_iterations}): Skipping Generator Update.")
+             gen_loss = 0.0
+             gen_mean_reward = 0.0
 
         # --------------------------------------------------------
         # Step 4: 更新 World Model (Adversarial Learning)
         # --------------------------------------------------------
         wm_final_loss = 0.0 # default if not trained
         
-        # [MODIFIED] Warmup Logic: Freeze World Model during warmup.
-        # Only start training WM after warmup_iterations.
-        is_warmup = (iteration < warmup_iterations)
-        
-        if (not is_warmup) and (iteration % wm_train_frequency == 0):
+        # [MODIFIED] Warmup Fix: ALLOW WM training during warmup!
+        if iteration % wm_train_frequency == 0:
             print("[World Model] Retraining on current + replay data...")
             
             # --- [New Filter Logic] ---
-            # [MODIFIED] Do NOT filter for training! Train on FULL batch.
-            # Filtering only happens during Buffer Update (Step 4.5).
-            # if new_batch is not None:
-            #     new_batch = filter_balanced_batch(
-            #         new_batch, 
-            #         fisher_buffer, 
-            #         ratio=cfg.attention_model.current_sample_ratio, 
-            #         elements_ratio=cfg.attention_model.fisher_buffer_elements_ratio
-            #     )
-            
-            # Save FULL batch to disk
+            # 1. Filter current batch (new_batch)
             if new_batch is not None:
+                # [MODIFIED] Disabled filtering to match UED full-batch training
+                # new_batch = filter_balanced_batch(
+                #     new_batch, 
+                #     fisher_buffer, 
+                #     ratio=cfg.attention_model.current_sample_ratio, 
+                #     elements_ratio=cfg.attention_model.fisher_buffer_elements_ratio
+                # )
+                
+                # Update logged data size (Not needed, already full size)
+                # if new_batch is not None:
+                #     new_data_size = len(new_batch['obs'])
+
+                # Save filtered batch to disk
                 current_data_path = data_save_dir / f"training_set_iter_{iteration}.npz"
                 save_dict = {
                     'a': new_batch['obs'].cpu().numpy() if torch.is_tensor(new_batch['obs']) else new_batch['obs'],
@@ -467,8 +467,8 @@ def adversarial_ued_training(cfg: DictConfig):
                     print(f"[Warning] Could not delete {f}: {e}")
             print(f"[Cleanup] Done.")
 
-    print(">>> UED Adversarial Training Finished.")
+    print(">>> Domain Randomization Baseline Finished.")
 
 
 if __name__ == "__main__":
-    adversarial_ued_training()
+    domain_randomization_baseline()

@@ -17,8 +17,57 @@ Process
 5. return score in the final task as the feedback
 '''
 
+@hydra.main(version_base=None, config_path=str(TRAINER_PATH / "conf"), config_name="config_CL")
+def collect_data_for_txt(cfg: DictConfig):
+    """
+    Collects data from a MiniGrid environment defined by a text file.
 
+    Args:
+        cfg (DictConfig): Configuration object containing environment and collection settings
+    """
+    seed = getattr(cfg, "seed", 0)
+    set_seed(seed)
 
+    # Loop over target tasks 0 to 14
+    for i in range(15):
+        env_text_file_name = f'target_task{i}.txt'
+        file_name = os.path.splitext(env_text_file_name)[0]
+        cfg.env.collect.data_type = 'uniform'
+        explore_type = cfg.env.collect.data_type   
+
+        cfg.env.collect.data_save_path = TRAINER_PATH / 'data' / f'{file_name}_test_{explore_type}.npz'
+        cfg.env.collect.episodes = 400
+        cfg.env.collect.maximum_dataset_size = 6000 # Reduced to speed up
+        cfg.env.collect.visualize_save_path = TRAINER_PATH / 'logs' / 'dataset_visualization'
+        cfg.env.collect.visualize_filename = f"{file_name}_{explore_type}.png"
+
+        print(f"\n[Collection] Processing {env_text_file_name} with explore_type={explore_type}...")
+
+        # Path to source map
+        env_source_path = TRAINER_PATH / 'level' / 'target_task' / env_text_file_name
+
+        # Logic to replace S with E if uniform
+        if explore_type == 'uniform':
+            with open(env_source_path, 'r') as f:
+                content = f.read()
+            
+            if 'S' in content:
+                print(f"[Auto-fix] Replacing 'S' with 'E' for uniform exploration in {env_text_file_name}")
+                content = content.replace('S', 'E')
+                
+                # Create temp file
+                temp_path = TRAINER_PATH / 'level' / 'target_task' / f"temp_{env_text_file_name}"
+                with open(temp_path, 'w') as f:
+                    f.write(content)
+                env_source_path = temp_path
+
+        collect_data_general(
+            cfg,
+            env_source=env_source_path,
+            save_name=file_name,
+            max_steps=1000,
+            recollect_data=False # Force recollect
+        )
 
 @hydra.main(version_base=None, config_path=str(TRAINER_PATH / "conf"), config_name="config_CL")
 def test_1(cfg: DictConfig):
@@ -109,7 +158,13 @@ def test_1(cfg: DictConfig):
             'info': task_npz['f'] if 'f' in task_npz else None
         }
         model_eval = AttentionWorldModel(cfg.attention_model).to(device)
-        fisher_buffer.update_combined(samples, 0.3, 0.5)
+        model_eval = AttentionWorldModel(cfg.attention_model).to(device)
+        fisher_buffer.update_combined(
+            samples, 
+            current_sample_ratio=0.3, 
+            fisher_buffer_elements_ratio=0.5,
+            target_shape=(48, 48)
+        )
 
         # ----------------------------------------------------------
         # (3) Validation (same as before)
@@ -168,20 +223,18 @@ def curriculum_learning_transitions(cfg: DictConfig):
     seed = getattr(cfg, "seed", 0)
     set_seed(seed)
 
-    test = False # True: using random data directly collect from target task -- baseline / False: using minitask strings
+    test = True # True: using random data directly collect from target task -- baseline / False: using minitask strings
     manually_define_minitask_name = True # True: manually define minitask names / False: auto generate minitask names
-    interval_size = 4266 # number of transitions per training phase # not split when None # 3125 for each of baseline
+    interval_size = 6000 # number of transitions per training phase # not split when None # 3125 for each of baseline
     training_data_intotal = None # total number of transitions for training
     explore_type = cfg.env.collect.data_type # uniform / random
     data_save_dir = TRAINER_PATH / "data"
 
     log_dir = TRAINER_PATH / "logs"/ "results"
-    csv_path = log_dir / "target_eval_log_compare_6_targets.csv"
+    csv_path = log_dir / "target_loss_baseline_ued.csv"
     os.makedirs(log_dir, exist_ok=True)
 
-    target_task_name = ['target_task.txt', 'target_task1.txt',
-                        'target_task2.txt', 'target_task3.txt', 'target_task4.txt', 'target_task5.txt'
-                       ]
+    target_task_name = [f'target_task{i}.txt' for i in range(10)]
     if manually_define_minitask_name:
         minitask_name = [ 'combination_minitask_0.txt','combination_minitask_1.txt',
                             'combination_minitask_2.txt', 'combination_minitask_3.txt',
@@ -211,9 +264,7 @@ def curriculum_learning_transitions(cfg: DictConfig):
     combined_data = {k: [] for k in ['a', 'b', 'c', 'd', 'e', 'f']}
     phases_collected = 0
     if test:
-        phase_files = ['target_task.txt',  'target_task1.txt', 'target_task2.txt', 'target_task3.txt','target_task4.txt',
-                        'target_task5.txt'
-                       ]
+        phase_files = [f'target_task{i}.txt' for i in range(15)]
         mode = "Baseline" # 'CL' / 'Baseline'
     else:
         if manually_define_minitask_name:
@@ -246,10 +297,10 @@ def curriculum_learning_transitions(cfg: DictConfig):
             phase_name = os.path.splitext(phase)[0]
             dataset_path = collect_data_general(
                 cfg,
-                env_source=TRAINER_PATH / "level" / phase,
+                env_source=TRAINER_PATH / "level" / "target_task" / phase,
                 save_name=phase_name,
-                max_steps=100000,
-                maximum_dataset_size=300000,
+                max_steps=1000,
+                maximum_dataset_size=6000,
                 recollect_data=False
             )
             task_npz = np.load(dataset_path, allow_pickle=True)
@@ -302,16 +353,63 @@ def curriculum_learning_transitions(cfg: DictConfig):
             # Create subsets (using the combined data)
             # --------------------------------------
             subsets = create_data_subsets(final_npz, interval_size)
+            
+            # --- [Injection] Pad subsets to 48x48 here to avoid modifying utils.py ---
+            def pad_to_48(arr):
+                # Handle (B, H, W, C) -> Pad and Transpose to (B, C, 48, 48)
+                if len(arr.shape) != 4: return arr
+                
+                target_h, target_w = 48, 48
+                
+                # Check if HWC (heuristic: last dim is channels which is small)
+                if arr.shape[3] <= 4: 
+                    h, w = arr.shape[1], arr.shape[2]
+                    
+                    # 1. Pad spatial dims
+                    pad_h = max(0, target_h - h)
+                    pad_w = max(0, target_w - w)
+                    
+                    if pad_h > 0 or pad_w > 0:
+                        arr = np.pad(arr, ((0,0), (0, pad_h), (0, pad_w), (0,0)), mode='constant', constant_values=0)
+                    elif h > target_h or w > target_w:
+                         arr = arr[:, :target_h, :target_w, :]
+
+                    # 2. Transpose to CHW (B, 3, 48, 48)
+                    return arr.transpose(0, 3, 1, 2)
+                    
+                else:
+                    # Already CHW? Ensure padded
+                    h, w = arr.shape[2], arr.shape[3]
+                    pad_h = max(0, target_h - h)
+                    pad_w = max(0, target_w - w)
+                    if pad_h > 0 or pad_w > 0:
+                         return np.pad(arr, ((0,0), (0,0), (0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
+                    return arr
+
+            print("[Baseline] Padding subsets to 48x48 and transposing to CHW...")
+            for s in subsets:
+                s['a'] = pad_to_48(s['a'])
+                s['b'] = pad_to_48(s['b'])
+            # -------------------------------------------------------------------------
+            
+            # -------------------------------------------------------------------------
 
             # --------------------------------------
             # Train WM on subsets
             # --------------------------------------
+
+            # --------------------------------------
+            # Train WM on subsets
+            # --------------------------------------
+            temp_dir = TRAINER_PATH / 'data' / "temp"
+            os.makedirs(temp_dir, exist_ok=True)
+            
             net, old_params, fisher, phase_transitions_used = train_wm_with_subsets(
                 cfg,
                 net,
                 subsets,
                 fisher_buffer,
-                temp_dir=TRAINER_PATH /'data'/"temp",
+                temp_dir=temp_dir,
                 num_iterations=1,
                 old_params=old_params,    
                 fisher=fisher,             
@@ -326,6 +424,10 @@ def curriculum_learning_transitions(cfg: DictConfig):
             # --------------------------------------
             validate_loss_on_target_task = []
             for i in target_file:
+                # Check if data exists
+                if not os.path.exists(data_save_dir / i):
+                    continue
+                    
                 avg_loss = validate_on_target_task(
                     cfg,
                     net,
@@ -336,7 +438,11 @@ def curriculum_learning_transitions(cfg: DictConfig):
                     VALID_TIMES=1
                 )
                 validate_loss_on_target_task.append(avg_loss)
-            avg_loss = float(np.mean(validate_loss_on_target_task))
+            
+            if len(validate_loss_on_target_task) > 0:
+                avg_loss = float(np.mean(validate_loss_on_target_task))
+            else:
+                avg_loss = 0.0
             print(f"[Unified Validation] {log_phase_name} → Overall Avg Target Loss = {avg_loss:.5f}")
 
             # --------------------------------------

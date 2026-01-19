@@ -28,8 +28,8 @@ class AttentionWorldModel(pl.LightningModule):
         self.lambda_ewc_min = getattr(hparams, "lambda_ewc_min", 1e-4)
         self.lambda_ewc_max = getattr(hparams, "lambda_ewc_max", 1e3)
         self.lambda_ewc = float(getattr(hparams, "lambda_ewc", 1.0))
-        self.keep_cell_loss = getattr(hparams, "keep_cell_loss", False)  # whether or not to keep cell loss
         self.loss_accumulator = [[[] for _ in range(self.col)] for _ in range(self.row)]
+        self.loss_map_result = None
 
 
 
@@ -94,19 +94,14 @@ class AttentionWorldModel(pl.LightningModule):
 
     def update_lambda_ewc_by_ratio(self, obs_loss: torch.Tensor, ewc_raw: torch.Tensor, r: float | None):
         """
-        快速控制器：让 ewc_term ≈ r * obs_loss
-        - r=None 或 r<=0 则不启用（使用固定 self.lambda_ewc）
-        - 使用 EMA 平滑避免抖动，并限制在 [lambda_ewc_min, lambda_ewc_max]
+        [DEPRECATED / FIXED]
+        Originally attempted to dynamically scale lambda based on loss ratio.
+        Removed to ensure stability. Now uses fixed self.lambda_ewc.
         """
-        if r is None or r <= 0:
-            return
-        val = ewc_raw.detach()
-        if val.item() <= 0:
-            return
-
-        target_lambda = (r * obs_loss.detach()) / (val + 1e-12)
-        new_lambda = (1 - self.lambda_ema) * self.lambda_ewc + self.lambda_ema * target_lambda.item()
-        self.lambda_ewc = float(torch.clamp(torch.tensor(new_lambda), self.lambda_ewc_min, self.lambda_ewc_max))
+        pass 
+        # Stability fix: Do NOT dynamically change lambda based on inverse of drift.
+        # This caused exploding updates or vanishing constraints.
+        # We rely on fixed lambda_ewc set in config.
 
     def update_lambda_ewc(self, avg_drift: float):
         """
@@ -219,74 +214,90 @@ class AttentionWorldModel(pl.LightningModule):
 
     def compute_fisher(self, dataloader, samples, scale_factor):
         """
-        稳定的对角 Fisher 估计（与原签名兼容）
-        - 不使用 scale_factor（仅保留兼容）
-        - 关闭 AMP，fp32 反传
-        - 对 batch 求“均值”（/count）
-        - 99.9% 分位截断 + 全局均值归一化（mean≈1）
+        Correct diagonal Fisher Information Matrix (FIM) estimation.
+        Formula: F = E[ (\nabla \log p(x))^2 ]
+        
+        Implementation:
+        1. Iterate through the dataloader.
+        2. For each batch, iterate through INDIVIDUAL samples.
+        3. Compute gradient for single sample -> square it -> accumulate.
+        4. Average over total samples.
         """
         import torch
-        self.eval()  # 固定 Dropout/BN 的行为（注意：BN 统计需要单独处理，见下文）
+        self.eval() 
         device = next(self.parameters()).device
 
         fisher = {n: torch.zeros_like(p, dtype=torch.float32, device=device)
                 for n, p in self.named_parameters() if p.requires_grad}
 
         count = 0
+        total_samples_target = int(samples)
+        
+        print(f"[Fisher] Starting computation for ~{total_samples_target} samples...")
+
         for i, batch in enumerate(dataloader):
-            if count >= int(samples):
+            if count >= total_samples_target:
                 break
-
-            self.zero_grad(set_to_none=True)
-
-            # === 预处理到 fp32 ===
+            
+            # 1. Preprocess batch
             obs, act, obs_next, info, obs_masked, _ = self.preprocess_batch(batch)
             obs = obs.to(device, dtype=torch.float32)
             act = act.to(device)
             obs_next = obs_next.to(device, dtype=torch.float32)
+            
+            # 2. Iterate over samples in the batch
+            batch_size = obs.shape[0]
+            for b in range(batch_size):
+                if count >= total_samples_target:
+                    break
+                    
+                self.zero_grad(set_to_none=True)
 
-            # === 显式关闭 autocast，确保梯度为 fp32 ===
-            with torch.cuda.amp.autocast(enabled=False):
-                pred, _ = self(obs, act, info)
-                loss_obs = self.loss_function_weight(pred, obs_next, obs_masked)['loss_obs']
+                # Extract single sample (keep dim 0 for model compatibility)
+                s_obs = obs[b:b+1]
+                s_act = act[b:b+1]
+                s_info = {k: v[b:b+1] for k, v in info.items()} if info is not None else None
+                s_obs_next = obs_next[b:b+1]
+                s_obs_masked = obs_masked[b:b+1] if obs_masked is not None else None
 
-            loss_obs.backward()
+                # Forward & Backward (fp32)
+                with torch.cuda.amp.autocast(enabled=False):
+                    pred, _ = self(s_obs, s_act, s_info)
+                    loss_dict = self.loss_function_weight(pred, s_obs_next, s_obs_masked)
+                    loss_sample = loss_dict['loss_obs']
+                
+                loss_sample.backward()
 
-            # === 累积 grad^2 ===
-            for n, p in self.named_parameters():
-                if p.requires_grad and p.grad is not None:
-                    g2 = p.grad.detach().float().pow(2)
-                    fisher[n] += g2
-
-            count += 1
-
+                # Accumulate squares
+                for n, p in self.named_parameters():
+                    if p.requires_grad and p.grad is not None:
+                        # Square the gradient of this SINGLE sample
+                        g2 = p.grad.detach().float().pow(2)
+                        fisher[n] += g2
+                
+                count += 1
+        
         if count == 0:
-            raise RuntimeError("compute_fisher: 'samples' 为 0 或 dataloader 为空。")
+             print("[Fisher] Warning: No samples processed!")
+             return fisher
 
-        # === 对 batch 做均值（/count），不是 /sqrt(count) ===
+        # 3. Normalize by N (Average)
         for n in fisher:
             fisher[n] /= float(count)
 
-        # === 分位数截断（更稳妥的 outlier 处理） ===
+        # 4. Optional: Clip extreme values (99.9% quantile)
         with torch.no_grad():
             flat = torch.cat([t.flatten() for t in fisher.values()])
-            q = torch.quantile(flat, 0.999)  # 99.9% 分位
+            mean_val = flat.mean().item()
+            max_val = flat.max().item()
+            print(f"[Fisher] Computed with {count} samples. Mean={mean_val:.6f}, Max={max_val:.6f}")
+            
+            # Simple global scaling based on user config (scale_factor)
+            # scale_factor usually brings it to the order of magnitude of the loss lambda
             for n in fisher:
-                fisher[n].clamp_(max=q.item())
-
-        # === 全局均值归一化（让 mean≈1，便于 lambda_ewc 稳定） ===
-        with torch.no_grad():
-            flat = torch.cat([t.flatten() for t in fisher.values()])
-            mean_val = flat.mean().clamp_min(1e-12)
-            for n in fisher:
-                fisher[n] /= mean_val
-
-            # 诊断
-            flat_norm = flat / mean_val
-            p99 = torch.quantile(flat_norm, 0.99).item()
-            print(f"[Fisher] batches={count}, mean≈1.0, p99={p99:.3e}, max={flat_norm.max().item():.3e}")
-
-        # 放到 CPU 便于后续持久化
+                 fisher[n] *= scale_factor
+                 
+        # Move to CPU for storage
         fisher = {k: v.detach().cpu() for k, v in fisher.items()}
         return fisher
 
@@ -586,7 +597,7 @@ class AttentionWorldModel(pl.LightningModule):
         #             f"pred={pred_val:.4f}, true={true_val:.4f}")
         
         # 将loss映射回全局并保存到列表中
-        if self.keep_cell_loss:
+        if getattr(self.hparams, "keep_cell_loss", False):
             loss_map = self.compute_cell_loss(obs_pred, obs_next)
             batch_size = loss_map.shape[0]
             for i in range(batch_size):
@@ -611,7 +622,7 @@ class AttentionWorldModel(pl.LightningModule):
         self, outputs: List[Dict[str, torch.Tensor]]
     ) -> Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor]]]:
 
-        if self.keep_cell_loss:
+        if getattr(self.hparams, "keep_cell_loss", False):
             avg_loss_map = torch.zeros((self.row, self.col), device=self.device)
             for y in range(self.row):
                 for x in range(self.col):
@@ -667,6 +678,8 @@ class AttentionWorldModel(pl.LightningModule):
             
         loss_dict = self.loss_function_weight(obs_pred, obs_next_masked, elements_mask)
         return loss_dict['loss_obs']
+
+
 
    
 

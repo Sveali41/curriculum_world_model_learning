@@ -73,6 +73,20 @@ class WMRLDataset(Dataset):
 
     @func_set_timeout(1000)
     def make_data(self, loaded, replay_data=None):
+        """
+        准备训练数据集：将当前迭代的新数据与历史 Replay Buffer 数据进行混合。
+        
+        核心逻辑：
+        1. **回放控制 (Replay Control)**：为了防止海量历史数据淹没当前的新数据（导致“灾难性遗忘”当前任务），
+           强制限制 Replay 数据的数量不超过当前数据的一定比例（默认 50%）。
+        2. **随机采样 (Sampling)**：如果 Replay Buffer 的数据量超过了上述限制，则进行随机抽样。
+        3. **目标计算 (Target Calculation)**：计算 `obs_delta` (下一帧 - 当前帧) 作为 World Model 的预测目标，
+           而不是直接预测原始的下一帧图像。这能显著提高学习的数值稳定性。
+        
+        Args:
+            loaded (dict): 包含当前迭代新数据的字典 (obs, next, act, info)。
+            replay_data (dict, optional): 来自 Replay Buffer 的历史数据字典。
+        """
         import numpy as np
         rng = np.random.default_rng()  # 统一随机源
 
@@ -195,8 +209,8 @@ class WMRLDataModule(pl.LightningDataModule):
         # )
         self.data_train = torch.utils.data.Subset(data, range(0, split_size))
         self.data_test = torch.utils.data.Subset(data, range(split_size, len(data)))
-        if len(self.data_test) < 256:
-            raise ValueError("The test set is too small. Please ensure the dataset is large enough for splitting.")
+        if len(self.data_test) < 64: # Relaxed from 256 to 64 to allow smaller batches (1200*0.1=120)
+            raise ValueError(f"The test set is too small ({len(self.data_test)}). Please ensure the dataset is large enough for splitting.")
 
     def train_dataloader(self):
         return DataLoader(

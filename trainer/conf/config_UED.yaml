@@ -10,14 +10,14 @@ training_generator:
   z_shape: 128
   generator: "deconv"
   n_epochs: 130
-  lr: 1e-4
+  lr: 8e-4
   wd : 0.0
   pth_path: ${oc.env:GENERATOR_PATH}/models/gan_model_classifer.ckpt #${oc.env:GENERATOR_PATH}/models/gan_model_classifier.ckpt
   validation_path: ${oc.env:GENERATOR_PATH}/models/gan_model_classifier.ckpt 
   map_element: {
         "wall": "W",
         "goal": "G",
-        "door": "D",
+        "door": "O",
         "key": "K",
         "lava": "L",
         "empty": "E",
@@ -52,10 +52,11 @@ env:
   save_visualized_img: True
   visualize_save_path: ${oc.env:TRAINER_PATH}/logs/env_visualization/
   collect:
+    mini_dataset_size: 1000
     env_type: norm # empty means empty only wall in preprocess no info for keys, lava/door/key/wall/norm
     data_type: random # random/ uniform -- data collection   random -- training
-    episodes: 100  # 500 number of episodes to start
-    maximum_dataset_size: None # maximum number of samples to collect, if no then None
+    episodes: 30  # 500 number of episodes to start
+    maximum_dataset_size: 1000 # maximum number of samples to collect, if no then None
     data_folder: ${oc.env:TRAINER_PATH}/data/ # folder where to save the rollouts
     data_save_path: ${oc.env:TRAINER_PATH}/data/gridworld_trainer.npz # folder where to save the rollouts
     num_workers: 0 # number of workers to use for data collection
@@ -72,15 +73,18 @@ attention_model:
   env_type: empty # empty means empty only wall in preprocess no info for keys, lava/door/key/wall/norm
   data_type: discrete # 'norm' or 'discrete'  # 这两种类型效果都还不错 20250213
   model_type: Attention       # Attention, Embedding, MLP
-  grid_shape: [3, 9, 10]  # Channel, Row, Col  # Row, Col 暂时不用，所以设为0就ok 20250213
-  attention_mask_size: 3
-  batch_size: 256  # test 64/128/256
+  grid_shape:
+    - 3
+    - ${generator_agent.map_height}
+    - ${generator_agent.map_width}  # Channel, Row, Col aligned to env size
+  attention_mask_size: 5
+  batch_size: 64  # reduced from 256 to avoid empty dataloader with small dataset
   n_cpu: 8
-  embed_dim: 128  # 128 64/128/256
+  embed_dim: 256  # 128 64/128/256
   num_heads: 1   # 1 if the embed_dim is 64, num_heads should better be 1
   data_dir: ${oc.env:TRAINER_PATH}/data/gridworld_trainer.npz # ${oc.env:TRAINER_PATH}/data/gridworld_episode.npz 
-  n_epochs: 25 # 25
-  lr: 1e-3 # 1e-4 
+  n_epochs: 30 # 25
+  lr: 5e-4 #1e-4 
   wd: 1e-5
   obs_norm_values: [10, 5, 3] # object, color, state --> agent_state: 1-down 2-left 3-up 0-right 
   action_norm_values: 6 # 0-left 1-right 2-forward 3-pickup 4-drop 5-toggle 6-done
@@ -108,10 +112,11 @@ attention_model:
   continue_learning: true
   fisher_buffer_size: 500000
   current_sample_ratio: 0.3
-  fisher_buffer_elements_ratio: 0.9 # proportion of key/door/lava samples in current fisher buffer sampling
-  fisher_beta: 0.5 # fisher_beta 越大 → 越“快忘”旧任务。fisher_beta 越小 → 越“记得牢”旧任务。
-  lambda_ewc: 300
-  ewc_ratio: 0.4 # r 越大 → 越不忘旧任务，但越难学新任务。r 越小 → 越容易适应新任务，但更容易忘。
+  replay_frac: 1.0 # 4.0 -> 1.0: Balanced Replay (1 old : 1 new) to avoid stale bias
+  fisher_buffer_elements_ratio: 0.8
+  fisher_beta: 0.5 # 0.3 -> 0.5: Standard update speed
+  lambda_ewc: 1000 # 2000 -> 500: Relax constraint to allow learning
+  ewc_ratio: 0.5 # r 越大 → 越不忘旧任务，但越难学新任务。r 越小 → 越容易适应新任务，但更容易忘。
   lambda_ewc_min: 1e-4
   lambda_ewc_max: 1e3       
   lambda_ema: 0.05        # 让 λ 更新更平滑     
@@ -121,11 +126,13 @@ attention_model:
   
 generator_agent:
   total_iterations: 50
+  warmup_iterations: 0 # 0 -> 5: Crucial! Force 5 rounds of Random Data to build general foundation.
   wm_train_frequency: 1
-  batch_size: 16
-  map_height: 8
-  map_width: 8
+  batch_size: 15
+  map_height: 10
+  map_width: 10
   context_dim: 64
-  max_edits: 0.3
+  max_edits: 0.7 # how many edits cells to make
   his_emb_dim: 16
-  ratio: 0.25
+  ctx_top_k_features: 16
+  div_k: 10

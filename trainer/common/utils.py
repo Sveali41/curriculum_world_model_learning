@@ -148,11 +148,13 @@ def collect_data_general(
         # From minitask strings
         layout_str, color_str = env_source
 
+        render_mode = "human" if cfg.env.visualize else None
+
         env = FullyObsWrapper(CustomMiniGridEnv(
             layout_str=layout_str,
             color_str=color_str,
             custom_mission="Learn minitask",
-            render_mode=None,
+            render_mode=render_mode,
             max_steps=max_steps,
         ))
     else:
@@ -426,7 +428,7 @@ def extract_loss_map_over_validations(
 
     for _ in range(valid_times):
         # Run one validation
-        val_result, model = AttentionWM_training.train_api(cfg, net, old_params, None)
+        val_result, _, model = AttentionWM_training.train_api(cfg, net, old_params, None)
         loss_map = model.loss_map_result  # (H,W) array
 
         # Accumulate map
@@ -455,9 +457,47 @@ def extract_loss_map_over_validations(
 def convert_trajectories_to_batch(trajectories):
     """
     convert_trajectories_to_batch: make a list of trajectories into a dict of numpy arrays
-    Each trajectory is a list of (state, action, reward, next_state, done, info) tuples.
-    The output dict has keys 'a' (obs), 'b' (next_obs), 'c' (action).   
+    Input:
+      - List of trajectories (legacy): each traj is List[(state, action, reward, next_state, done, info)]
+      - List of dicts (new): each dict has 'obs', 'act', 'obs_next', 'info' as tensors/arrays
+    
+    Output:
+      - dict with keys: 'obs', 'obs_next', 'act', 'info' (numpy arrays)
     """
+    # 1. New Format: List of Dicts (already batched per trajectory)
+    if len(trajectories) > 0 and isinstance(trajectories[0], dict):
+        # trajectories is a list of dicts. We need to concatenate them.
+        # Assuming each dict contains tensors/arrays for a single trajectory.
+        
+        obs_list = []
+        act_list = []
+        next_obs_list = []
+        info_list = []
+        
+        has_info = 'info' in trajectories[0] and trajectories[0]['info'] is not None
+
+        for traj in trajectories:
+            # Helper to convert tensor/array to numpy
+            def to_numpy(x):
+                if isinstance(x, torch.Tensor):
+                    return x.detach().cpu().numpy()
+                return np.array(x)
+
+            obs_list.append(to_numpy(traj['obs']))
+            act_list.append(to_numpy(traj['act']))
+            next_obs_list.append(to_numpy(traj['obs_next']))
+            if has_info:
+                info_list.append(to_numpy(traj['info']))
+
+        # Concatenate along the first dimension (batch/time dimension)
+        return {
+            'obs': np.concatenate(obs_list, axis=0),
+            'obs_next': np.concatenate(next_obs_list, axis=0),
+            'act': np.concatenate(act_list, axis=0),
+            'info': np.concatenate(info_list, axis=0) if has_info else None
+        }
+
+    # 2. Legacy Format: List of Lists of Tuples
     obs_list, act_list, next_obs_list = [], [], []
     
     for traj in trajectories:
@@ -468,7 +508,8 @@ def convert_trajectories_to_batch(trajectories):
             next_obs_list.append(np.array(next_state))
             
     return {
-        'a': np.array(obs_list),     
-        'b': np.array(next_obs_list), 
-        'c': np.array(act_list),      
+        'obs': np.array(obs_list),     
+        'obs_next': np.array(next_obs_list), 
+        'act': np.array(act_list),
+        'info': None      
     }
