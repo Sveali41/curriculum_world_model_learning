@@ -285,18 +285,29 @@ class AttentionWorldModel(pl.LightningModule):
         for n in fisher:
             fisher[n] /= float(count)
 
-        # 4. Optional: Clip extreme values (99.9% quantile)
+        # 4. Standardize Fisher (Normalize to Mean=1.0) to make lambda_ewc scale-invariant
         with torch.no_grad():
-            flat = torch.cat([t.flatten() for t in fisher.values()])
-            mean_val = flat.mean().item()
-            max_val = flat.max().item()
-            print(f"[Fisher] Computed with {count} samples. Mean={mean_val:.6f}, Max={max_val:.6f}")
+            all_vals = torch.cat([f.flatten() for f in fisher.values()])
+            mean_val = all_vals.mean()
+            max_val = all_vals.max()
             
-            # Simple global scaling based on user config (scale_factor)
-            # scale_factor usually brings it to the order of magnitude of the loss lambda
-            for n in fisher:
-                 fisher[n] *= scale_factor
-                 
+            print(f"[Fisher] Computed with {count} samples. Raw Mean={mean_val:.3e}, Max={max_val:.3e}")
+            
+            if mean_val > 1e-20:
+                scale = 1.0 / mean_val
+                # Apply normalization FIRST
+                for n in fisher:
+                    fisher[n] *= scale
+                print(f"[Fisher] Normalized to Mean=1.0. Applied scale: {scale:.3e}")
+                
+                # THEN apply user scale_factor if needed (usually 1.0 now)
+                if scale_factor != 1.0:
+                    for n in fisher:
+                        fisher[n] *= scale_factor
+                    print(f"[Fisher] Applied extra config scale_factor: {scale_factor}")
+            else:
+                print("[Fisher] Warning: Fisher values are essentially zero. Check gradients!")
+
         # Move to CPU for storage
         fisher = {k: v.detach().cpu() for k, v in fisher.items()}
         return fisher
@@ -402,6 +413,25 @@ class AttentionWorldModel(pl.LightningModule):
             if count > 0:
                 total = total / count
 
+        # [DEBUG]
+        if self.global_step % 1000 == 0:
+             print(f"[EWC DEBUG] Step {self.global_step}")
+             if self.fisher is None: print("  -> self.fisher is None")
+             if self.old_params is None: print("  -> self.old_params is None")
+             if self.fisher and self.old_params:
+                 keys_f = set(self.fisher.keys())
+                 keys_o = set(self.old_params.keys())
+                 common = keys_f.intersection(keys_o)
+                 print(f"  -> Common keys: {len(common)}")
+                 if len(common) > 0:
+                     k = list(common)[0]
+                     p = dict(self.named_parameters())[k]
+                     p_old = self.old_params[k].to(device)
+                     diff = (p - p_old).norm()
+                     print(f"  -> Sample param '{k}' diff: {diff.item()}")
+                     print(f"  -> Count accumulated: {count}")
+                     print(f"  -> Total EWC calculated: {total.item()}")
+
         return total  # 注意：这里不乘 lambda
     
     def accumulate_loss(self, loss_map, agent_pos):
@@ -452,37 +482,46 @@ class AttentionWorldModel(pl.LightningModule):
         return loss
     
 
-    def loss_function_weight(self, next_observations_predict, next_observations_true, obs_masked=None):
-        device = next_observations_predict.device  # 获取模型所在设备（保险起见）
+    def loss_function_weight(self, next_observations_predict, next_observations_true, obs_masked=None, obs_prev=None):
+        """
+        Custom Loss with tiered aggressive weighting:
+        - Static: 1.0
+        - Movement: +10.0
+        - State Change (Door/Key Interaction): +100.0! (Critical for UED)
+        """
+        device = next_observations_predict.device 
+        
+        # 1. Raw MSE (Flat)
+        # pred [B, C, H, W], true [B, C, H, W]
+        raw_sq_error = (next_observations_predict - next_observations_true) ** 2
 
+        # 2. Change Mask (Any change)
+        if obs_prev is not None:
+             # Ensure types match
+             if obs_prev.dtype != next_observations_true.dtype:
+                 obs_prev = obs_prev.float() 
+             
+             # General Diff (Sum of all channels)
+             diff = torch.abs(next_observations_true - obs_prev).sum(dim=1, keepdim=True)
+             change_mask = (diff > 1e-5).float()
+             
+             # 3. State Channel Diff (Channel 2 is State: 0=Open, 1=Closed, 2=Locked)
+             # Focus strictly on channel 2
+             state_diff = torch.abs(next_observations_true[:, 2:3, :, :] - obs_prev[:, 2:3, :, :])
+             state_change_mask = (state_diff > 1e-5).float()
+             
+        else:
+             # Fallback if no prev frame (rare)
+             change_mask = (next_observations_true.abs() > 1e-6).any(dim=1, keepdim=True).float()
+             state_change_mask = torch.zeros_like(change_mask)
 
-        # 1. 所有通道中任意变化都算作变化（当前已有）
-        change_mask = (next_observations_true.abs() > 1e-6).any(dim=1, keepdim=True)  # (B,1,H,W)
-        if obs_masked is not None:
-            obs_masked = obs_masked.to(device)
-            change_mask = change_mask.to(device)
+        # 4. Combine Weights
+        # Base=1.0, Move=+10, Interaction=+100 -> Total 111.0 for Opening Door
+        weights = 1.0 + (change_mask * 10.0) + (state_change_mask * 100.0)
 
-        # 2. 基础 MSE（不减维度）
-        base = F.mse_loss(
-            next_observations_predict,
-            next_observations_true,
-            reduction='none'   # (B,C,H,W)
-        )
-
-        # 3. 初始权重：默认 1，变化位置 ×5
-        w = torch.ones_like(base)
-        w[change_mask.expand_as(base)] *= 5.0
-
-        # 4. 如果提供了 obs_masked，额外对门/钥匙区域加权（×3）
-        if obs_masked is not None:
-            combined_mask = obs_masked & change_mask.squeeze(1)  # 同时必须有变化
-
-            # 扩展为所有通道
-            elements_mask_full = combined_mask.unsqueeze(1).expand_as(base)  # (B,C,H,W)
-            w[elements_mask_full] *= 2.0  # 基于已有权重再叠加 +5 → 总共 ×10
-
-        # 5. 最终加权 loss
-        loss = (base * w).mean()
+        # 5. Weighted Mean
+        loss = (raw_sq_error * weights).mean()
+        
         return {"loss_obs": loss}
 
 
@@ -542,47 +581,55 @@ class AttentionWorldModel(pl.LightningModule):
 
         if obs_next.dtype != obs_pred.dtype:
             obs_next = obs_next.float()
+        
+        # Ensure obs is float for diff calculation
+        if obs.dtype != obs_pred.dtype:
+            obs = obs.float()
 
-        loss_dict = self.loss_function_weight(obs_pred, obs_next, elements_mask)
-        obs_loss = loss_dict['loss_obs']
-
+        # [TRAINING] Aggressive Weighted Loss for Optimization
+        loss_dict = self.loss_function_weight(obs_pred, obs_next, elements_mask, obs_prev=obs)
+        weighted_obs_loss = loss_dict['loss_obs']
+        
+        # [LOGGING] Pure Raw MSE for Scientific Reporting
+        # This is what will be written to CSV and plots as "Gen_Real_Loss" / "WM_Val_Loss"
+        raw_mse = F.mse_loss(obs_pred, obs_next)
+        
         # —— raw EWC（未乘 λ）—— #
         ewc_raw = self.ewc_loss()
 
-        # —— 快控制：把 EWC 项对齐到 obs_loss 的固定占比（如 20%）—— #
-        self.update_lambda_ewc_by_ratio(obs_loss, ewc_raw, self.ewc_ratio)
+        # —— 快控制：这里用 Weighted Loss 来平衡 EWC，因为它们都在 "Optimization Space" —— #
+        self.update_lambda_ewc_by_ratio(weighted_obs_loss, ewc_raw, self.ewc_ratio)
 
         # —— 合成总损失 —— #
         ewc_term = self.lambda_ewc * ewc_raw
-        loss_total = obs_loss + ewc_term
+        loss_total = weighted_obs_loss + ewc_term
 
-        # —— 统一日志（用标量 tensor 更稳）—— #
-        self.log_dict(loss_dict, prog_bar=True, on_step=True, on_epoch=True)
+        # —— 统一日志 —— #
+        # Critical: Log Raw MSE as 'loss_obs' so it aligns with standard metrics
+        self.log("loss_obs", raw_mse, prog_bar=True, on_step=True, on_epoch=True) 
+        
+        # Log weighted loss separately for debugging
+        self.log("train/loss_weighted", weighted_obs_loss, on_step=True, on_epoch=True)
+        
         self.log("train/ewc_raw", ewc_raw.detach(), on_step=True, on_epoch=True)
-        self.log("train/lambda_ewc", torch.tensor(self.lambda_ewc, device=obs_loss.device),
+        self.log("train/lambda_ewc", torch.tensor(self.lambda_ewc, device=obs.device),
                 on_step=True, on_epoch=True)
         self.log("train/ewc_term", ewc_term.detach(), on_step=True, on_epoch=True)
         self.log("train/loss_total", loss_total.detach(), on_step=True, on_epoch=True)
 
         if self.global_step % 1000 == 0:
             print(f"[Step {self.global_step}] "
-                f"loss_obs: {obs_loss.item():.6f}, "
-                f"ewc_raw: {ewc_raw.item():.6f}, "
-                f"lambda: {self.lambda_ewc:.4f}, "
-                f"ewc_term: {ewc_term.item():.6f}, "
-                f"total: {loss_total.item():.6f}")
-
-        # # —— 慢速外环（有旧参数时才调；函数内部有 cooldown）—— #
-        # if self.old_params is not None:
-        #     avg_drift = self.compute_avg_param_drift()
-        #     self.update_lambda_ewc(avg_drift)
+                f"Raw MSE: {raw_mse.item():.6f}, "
+                f"Weighted Loss: {weighted_obs_loss.item():.6f}, "
+                f"EWC: {ewc_raw.item():.6f}, "
+                f"Total: {loss_total.item():.6f}")
 
         return loss_total
 
     
    
     def validation_step(self, batch, batch_idx):
-        obs, act, obs_next, info, _, agent_position = self.preprocess_batch(batch)
+        obs, act, obs_next, info, elements_mask, agent_position = self.preprocess_batch(batch)
         obs_pred, attention_weight = self(obs, act, info)
         # if self.hparams.freeze_weight:
         #     diff = torch.abs(obs_pred - obs_next)  # (128, 3, 3, 3)
@@ -606,9 +653,24 @@ class AttentionWorldModel(pl.LightningModule):
   
         if obs_next.dtype != obs_pred.dtype:
             obs_next = obs_next.float()
-        loss = self.loss_function(obs_pred, obs_next)
+        
+        # Ensure obs is float for diff calculation
+        if obs.dtype != obs_pred.dtype:
+            obs = obs.float()
+
+        # [TRAINING LOGIC (Kept for consistency)] 
+        # But for Validation Logging, we want Pure MSE.
+        
+        # 1. Pure Raw MSE (The scientific metric)
+        raw_mse = F.mse_loss(obs_pred, obs_next)
+        
+        # 2. Weighted (Just for debug print if needed, or consistency check)
+        # loss_dict = self.loss_function_weight(obs_pred, obs_next, elements_mask, obs_prev=obs)
+        
+        loss = raw_mse
+        
         # print(torch.round(obs_pred))
-        self.log_dict(loss)
+        self.log_dict({"val_loss": loss})
         ## visualization
         # self.step_counter += 1
         # if self.visualizationFlag and self.step_counter % self.visualize_every == 0:
@@ -616,7 +678,17 @@ class AttentionWorldModel(pl.LightningModule):
         #     pre = obs_pred + obs
         #     self.visual_func.visualize_attention(obs, act, attention_weight, next, pre, self.step_counter, info)
         # return {"batch_idx": batch_idx, "val_loss": loss['loss_obs']}
-        return {"loss_wm_val": loss['loss_obs']}
+        # [MODIFIED] Validation Metric Switch
+        loss_val = raw_mse
+        if getattr(self.hparams, "validation_metric", "mse") == "weighted":
+             loss_dict = self.loss_function_weight(obs_pred, obs_next, elements_mask, obs_prev=obs)
+             loss_val = loss_dict['loss_obs']
+
+        self.log_dict({"val_loss": loss_val})
+        
+        return {
+            "loss_wm_val": loss_val,             
+        }
 
     def validation_epoch_end(
         self, outputs: List[Dict[str, torch.Tensor]]
@@ -643,7 +715,10 @@ class AttentionWorldModel(pl.LightningModule):
 
         avg_loss = torch.stack([x["loss_wm_val"] for x in outputs]).mean()
         self.log("avg_val_loss_wm", avg_loss)
-        return {"avg_val_loss_wm": avg_loss}
+        
+        return {
+            "avg_val_loss_wm": avg_loss,
+        }
 
     def on_save_checkpoint(self, checkpoint):
         # Example checkpoint customization: removing specific keys if needed

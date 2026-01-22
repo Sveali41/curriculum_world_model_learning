@@ -228,7 +228,7 @@ class WMRLDataModule(pl.LightningDataModule):
             self.data_test, 
             batch_size=self.hparams.batch_size, 
             shuffle=True,
-            drop_last=True,
+            drop_last=False,
             num_workers=self.hparams.n_cpu,
             pin_memory=True,
             persistent_workers=False

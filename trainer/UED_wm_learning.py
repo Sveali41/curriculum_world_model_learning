@@ -116,7 +116,20 @@ def adversarial_ued_training(cfg: DictConfig):
     log_dir = TRAINER_PATH / "logs" / "results"
     os.makedirs(log_dir, exist_ok=True)
     csv_path = log_dir / "ued_adversarial_log.csv"
-    summary_csv_path = log_dir / "experiment_summary.csv"
+    # [ABLATION] Suffix for CSV
+    ablation_suffix = ""
+    if hasattr(cfg, "ablation") and cfg.ablation.type != "none":
+        ablation_suffix = f"_{cfg.ablation.type}"
+    
+    # [METRIC] Suffix for CSV (if not default mse)
+    metric_suffix = ""
+    if getattr(cfg.attention_model, "validation_metric", "mse") != "mse":
+        metric_suffix = f"_{cfg.attention_model.validation_metric}"
+        
+    if ablation_suffix or metric_suffix:
+        summary_csv_path = log_dir / f"experiment_summary_mask3_mse{ablation_suffix}{metric_suffix}.csv"
+        print(f"[Log] CSV Path Adjusted: {summary_csv_path}")
+
     data_save_dir = TRAINER_PATH / "data"
 
     # === 初始化 Summary CSV ===
@@ -127,12 +140,14 @@ def adversarial_ued_training(cfg: DictConfig):
             "Gen_Mean_Reward",  # Initial Difficulty (Proxy)
             "Gen_Real_Loss",    # [NEW] Raw Loss on generated maps (Unscaled)
             "Gen_Loss", 
-            "WM_Val_Loss",      # Global Capability (Target Tasks Mean)
+            "Gen_Div_Reward",   # [NEW] Diversity Reward
+            "WM_Val_Loss",      # Target Tasks Mean (MSE or Weighted based on cfg)
             "WM_Val_Max",       # [NEW] Worst-case Capability
             "WM_Val_Std",       # [NEW] Stability
-            "Valid_Trajs",
             "New_Data_Size",
-            "Buffer_Size"
+            "Buffer_Size",
+            "Solvable_Count",  # [MODIFIED] Rate -> Count
+            "Avg_Path_Len"     # [NEW]
         ])
     print(f"[Logger] Experiment summary will be saved to {summary_csv_path}")
     
@@ -209,11 +224,12 @@ def adversarial_ued_training(cfg: DictConfig):
             "[Generator] Generating environments and collecting trajectories..."
         )
 
-        valid_trajectories, gen_raw_loss = gen_interface.step(iteration)
-
+        # [MODIFIED] Added Solvable Count & Max BFS
+        # Returns: (maps, heats, loss, div, trajs, solvable_count, avg_bfs)
+        _, _, gen_raw_loss, gen_div_score, valid_trajectories, gen_solvable_count, gen_avg_bfs = gen_interface.step(iteration=iteration)
         num_valid_trajs = len(valid_trajectories)
         print(
-            f"[Generator] Collected {num_valid_trajs} valid trajectories."
+            f"[Generator] Collected {num_valid_trajs} valid trajectories. Solvable: {gen_solvable_count} | Avg BFS: {gen_avg_bfs:.2f}"
         )
 
         if num_valid_trajs == 0:
@@ -406,17 +422,17 @@ def adversarial_ued_training(cfg: DictConfig):
                 # deepcopy triggers broken hooks on the source model.
                 # Creating a new instance and loading state_dict is safer.
                 
-                loss = validate_on_target_task(
+                t_loss = validate_on_target_task(
                     cfg, 
-                    net=wm_instance, # Map 'wm' to 'net'
-                    old_params=None, # pass default
-                    data_save_dir=str(data_save_dir), # data_save_dir is defined earlier as TRAINER_PATH / "data"
+                    net=wm_instance, 
+                    old_params=None, 
+                    data_save_dir=str(data_save_dir), 
                     target_file=t_file, 
                     phase_name=f"Iter_{iteration}",
                     VALID_TIMES=1
                 )
-                if loss is not None:
-                     avg_losses.append(loss)
+                if t_loss is not None:
+                     avg_losses.append(t_loss)
             
             # Restore configs
             cfg.attention_model.freeze_weight = old_freeze
@@ -426,7 +442,7 @@ def adversarial_ued_training(cfg: DictConfig):
                 target_mean_loss = sum(avg_losses) / len(avg_losses)
                 target_max_loss = max(avg_losses)
                 target_std_loss = np.std(avg_losses)
-                print(f"[Metrics] Global Capability (Target Tasks) -> Mean: {target_mean_loss:.6f} | Max: {target_max_loss:.6f} | Std: {target_std_loss:.6f}")
+                print(f"[Metrics] Target Task Loss -> Mean: {target_mean_loss:.6f} | Max: {target_max_loss:.6f}")
             else:
                 target_max_loss = 0.0
                 target_std_loss = 0.0
@@ -443,12 +459,15 @@ def adversarial_ued_training(cfg: DictConfig):
                         f"{gen_mean_reward:.4f}",
                         f"{gen_raw_loss:.6f}",
                         f"{gen_loss:.4f}",
+                        f"{gen_div_score:.4f}",
+                        f"{gen_div_score:.4f}",
                         f"{target_mean_loss:.6f}",
                         f"{target_max_loss:.6f}",
                         f"{target_std_loss:.6f}",
-                        num_valid_trajs,
                         new_data_size,
-                        len(fisher_buffer)
+                        len(fisher_buffer),
+                        f"{gen_solvable_count}",  # Count (Integer)
+                        f"{gen_avg_bfs:.2f}"      # Avg Path Length
                     ])
             except Exception as e:
                 print(f"[Error] Failed to write CSV log: {e}")

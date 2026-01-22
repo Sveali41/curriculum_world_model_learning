@@ -115,7 +115,7 @@ def domain_randomization_baseline(cfg: DictConfig):
     log_dir = TRAINER_PATH / "logs" / "results_dr" # [MODIFIED] Separate logs
     os.makedirs(log_dir, exist_ok=True)
     csv_path = log_dir / "dr_log.csv"
-    summary_csv_path = log_dir / "experiment_summary_dr.csv"
+    summary_csv_path = log_dir / "experiment_summary_dr_mask_3_mse_div.csv"
     data_save_dir = TRAINER_PATH / "data"
 
     # === 初始化 Summary CSV ===
@@ -126,12 +126,15 @@ def domain_randomization_baseline(cfg: DictConfig):
             "Gen_Mean_Reward",  # Initial Difficulty (Proxy)
             "Gen_Real_Loss",    # [NEW] Raw Loss on generated maps (Unscaled)
             "Gen_Loss", 
+            "Gen_Div_Reward",   # [NEW] Diversity Reward
             "WM_Val_Loss",      # Global Capability (Target Tasks Mean)
             "WM_Val_Max",       # [NEW] Worst-case Capability
             "WM_Val_Std",       # [NEW] Stability
             "Valid_Trajs",
             "New_Data_Size",
-            "Buffer_Size"
+            "Buffer_Size",
+            "Solvable_Count",
+            "Avg_Path_Len"
         ])
     print(f"[Logger] Experiment summary will be saved to {summary_csv_path}")
     
@@ -209,7 +212,7 @@ def domain_randomization_baseline(cfg: DictConfig):
             "[Generator] Generating environments and collecting trajectories..."
         )
 
-        valid_trajectories, gen_raw_loss = gen_interface.step(iteration)
+        _, _, gen_raw_loss, gen_div_reward, valid_trajectories, solvable_count, avg_bfs_dist = gen_interface.step(iteration)
 
         num_valid_trajs = len(valid_trajectories)
         print(
@@ -443,12 +446,15 @@ def domain_randomization_baseline(cfg: DictConfig):
                         f"{gen_mean_reward:.4f}",
                         f"{gen_raw_loss:.6f}",
                         f"{gen_loss:.4f}",
+                        f"{gen_div_reward:.4f}",
                         f"{target_mean_loss:.6f}",
                         f"{target_max_loss:.6f}",
                         f"{target_std_loss:.6f}",
                         num_valid_trajs,
                         new_data_size,
-                        len(fisher_buffer)
+                        len(fisher_buffer),
+                        solvable_count,
+                        f"{avg_bfs_dist:.2f}"
                     ])
             except Exception as e:
                 print(f"[Error] Failed to write CSV log: {e}")

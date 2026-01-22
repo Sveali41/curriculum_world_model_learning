@@ -80,6 +80,11 @@ class MapEditorActorCritic(nn.Module):
         last_layer = self.actor[-1]
         nn.init.orthogonal_(last_layer.weight, gain=0.01)
         nn.init.constant_(last_layer.bias, 0)
+        # Hack: Bias the "No-Op" (Action 0) to be higher initially to encourage sparsity
+        # [REVERTED] Bias back to 3.0.
+        # User Feedback: Bias=1.0 made maps too dense, limiting exploration.
+        # We need high sparsity (No-Op) initially.
+        last_layer.bias.data[0] = 3.0
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):

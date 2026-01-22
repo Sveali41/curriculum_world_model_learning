@@ -75,7 +75,14 @@ class GeneratorInterface:
             for _ in range(self.batch_size):
                 z = np.random.randint(0, 1e6)
                 grid = self.seeder.generate(z=z)
-                grid, _ = task_placer(grid)
+                
+                # [MODIFIED] Adaptive task placement based on map size
+                # Small maps (<10) need strict long-distance (0.7) to avoid trivial paths.
+                # Large maps can be more relaxed (0.4).
+                min_dim = min(self.map_height, self.map_width)
+                adaptive_ratio = 0.85 if min_dim <= 10 else 0.4
+                
+                grid, _ = task_placer(grid, min_dist_ratio=adaptive_ratio)
                 base_maps.append(grid)
 
             # 优化：先转 numpy 再转 tensor，避免 UserWarning
@@ -97,18 +104,30 @@ class GeneratorInterface:
             if self.prev_data is None:
                 self.prev_data = self._zero_context(curr_map.size(0), self.map_height, self.map_width)
 
+            # [ABLATION] w/o History
+            ppo_input_context = self.prev_data
+            if hasattr(self.cfg, 'ablation') and self.cfg.ablation.type == 'no_history':
+                 ppo_input_context = self._zero_context(curr_map.size(0), self.map_height, self.map_width)
+                 # print("[Ablation] History/Context disabled.")
+
             # 2. 生成器选择动作 (关键：获取采样时的 topk_action_mask)
             # 假设 select_action 返回: actions, logp, values, topk_action_mask, global_ctx
             actions, logp, values, topk_action_mask, _ = self.ppo.select_action(
-                curr_map, self.prev_data, mask, max_edits=self.max_edits
+                curr_map, ppo_input_context, mask, max_edits=self.max_edits
             )
 
             next_maps, next_heats = [], []
             valid_trajs = []
             raw_scalar_losses = []
+            raw_scalar_losses = []
+            div_rewards = []
+            bfs_stats = [] # [NEW] Track path lengths
 
             base_ids_np = base_ids.detach().cpu().numpy()
             actions_np = actions.detach().cpu().numpy()
+
+            # [NEW] Track solvability rate
+            solvable_count = 0
 
             for i in range(self.batch_size):
                 # 3. 应用编辑动作
@@ -119,23 +138,37 @@ class GeneratorInterface:
                 final_map = np.stack([obj_map, color_map], axis=0)
 
                 # --- 第一层过滤：物理连通性 (Hard Filter) ---
-                # --- 第一层过滤：物理连通性 (Hard Filter) ---
                 is_solvable, bfs_dist = check_solvability(obj_map)
+                if is_solvable:
+                    solvable_count += 1
+                    bfs_stats.append(bfs_dist) # [NEW] Only track valid path lengths
+                else:
+                    bfs_stats.append(0)
                 
-                # [MODIFIED] Do NOT skip data collection even if unsolvable.
-                # Just mark it so we can penalize the generator later.
-                if not is_solvable:
-                    # 如果物理上不可达，给予重罚，但在物理世界中仍然可以运行（撞墙）
-                    print(f"[Warning] Trajectory {i} is unsolvable (disconnected). Applying Penalty but collecting data.")
-                    # continue # DISABLED: Allow rollout for physics learning
-
+                # [REVERTED] User Request: Record Unsolvable Data for Physics Learning.
+                # We still penalize the Generator (-5.0) later in the reward section.
+                # if not is_solvable:
+                #     print(f"[Warning] Trajectory {i} is unsolvable (disconnected). Applying Penalty but collecting data.")
+                
                 # 4. 执行 Rollout 采集数据 (包含智能体在该图上的预测误差 heat 和是否解决 solved)
                 traj, heat, scalar_loss, solved = self._rollout_env(final_map, iteration=iteration, batch_idx=i)
                 
                 # 检查 traj 是否有效
                 if not traj or 'obs' not in traj:
                     print(f"[Warning] Trajectory {i} is empty, skipping.")
-                    self._save(i, -1.0, curr_map, mask, actions, logp, values, topk_action_mask)
+                    # [MODIFIED] 如果是物理不可解导致的失败，直接给重罚 -5.0，而不是默认的 -1.0
+                    
+                    # [ABLATION] w/o Validity Reward (Penalty)
+                    if hasattr(self.cfg, 'ablation') and self.cfg.ablation.type == 'no_validity_reward':
+                        fail_reward = -1.0 # Standard failure penalty (like in DR)
+                        # No print needed
+                    else:
+                        # Standard UED: Strong Penalty
+                        fail_reward = -5.0 if not is_solvable else -1.0
+                        if not is_solvable:
+                            print(f"  -> Applied Penalty -5.0 (Unsolvable)")
+                    
+                    self._save(i, fail_reward, curr_map, mask, actions, logp, values, topk_action_mask)
                     continue
 
                 # --- 关键逻辑：分层奖励与数据保留 ---
@@ -147,6 +180,12 @@ class GeneratorInterface:
                 r_div = self.diversity.get_reward(
                     torch.tensor(final_map).unsqueeze(0).to(self.device)
                 )
+                
+                # [ABLATION] w/o Diversity
+                if hasattr(self.cfg, 'ablation') and self.cfg.ablation.type == 'no_diversity':
+                     r_div = 0.0
+                
+                div_rewards.append(r_div)
 
                 # 5. 奖励计算逻辑
                 raw_scalar_losses.append(scalar_loss) # Log raw loss
@@ -155,7 +194,16 @@ class GeneratorInterface:
                 scalar_loss = np.log(scalar_loss + 1e-10) + 8.0 
                 
                 # [NEW] Solution Length Reward (Complexity Bonus)
-                r_len = bfs_dist * 1.0 
+                # Reduced to 0.1 so it doesn't overpower the Loss Reward.
+                # We want High_Loss + Solvable, not just Long_Path + Easy.
+                
+                # Case 1 (Current): Loss=4.5, BFS=16 -> Total=20.5 (Prefers Easy Long)
+                # Case 2 (Hard): Loss=5.7, BFS=12 -> Total=17.7
+                
+                # If BFS*0.1:
+                # Case 1: 4.5 + 1.6 = 6.1
+                # Case 2: 5.7 + 1.2 = 6.9 (Prefers Hard!)
+                r_len = bfs_dist * 0.1 
                 
                 if not is_solvable:
                      # [CRITICAL] 物理不可达：强制重罚
@@ -163,12 +211,24 @@ class GeneratorInterface:
                      reward = -5.0
                 elif solved:
                     # 智能体跑通了：全额奖励
-                    reward = scalar_loss + 0.1 * r_div + r_len
+                    # [Diversity Boost] 0.1 -> 0.5. Prevent Mode Collapse.
+                    reward = scalar_loss + 0.5 * r_div + r_len
                 else:
                     # 连通但未跑通：说明这是一个极佳的“困难样本”
                     # 依然给予 BFS 长度奖励，鼓励生成这类“看着能通但很难走”的图
-                    reward = (scalar_loss * 0.8) + 0.05 * r_div + r_len
+                    reward = (scalar_loss * 0.8) + 0.25 * r_div + r_len
                     # print(f"[UED] Iter {iteration} Env {i}: Solvable but not solved. LP: {scalar_loss:.4f}")
+
+                # [NEW] Warmup Logic override
+                # If in warmup phase, ignore WM loss and focus PURELY on structural validity & complexity
+                warmup_iters = self.cfg.generator_agent.get("warmup_iterations", 0)
+                if iteration < warmup_iters:
+                     # Warmup Reward:
+                     # 1. Base: +1.0 for being Solvable (vs -5.0 for fail)
+                     # 2. Complexity: + BFS * 0.2 (Encourage long paths)
+                     # 3. Diversity: + Div * 0.5 (Encourage variety)
+                     # 4. WM Loss: IGNORED (0.0)
+                     reward = 1.0 + (bfs_dist * 0.2) + (r_div * 0.5)
 
                 # 保存到生成器的 PPO Buffer
                 self._save(i, reward, curr_map, mask, actions, logp, values, topk_action_mask)
@@ -181,10 +241,29 @@ class GeneratorInterface:
                 )
              
             # Calculate mean raw scalar loss for logging
+            # Calculate mean raw scalar loss for logging
             mean_raw_loss = np.mean(raw_scalar_losses) if raw_scalar_losses else 0.0
             
-            return valid_trajs, mean_raw_loss
+            # [NEW] Calculate mean diversity score
+            # Fix: Handle both Tensor and float return types
+            mean_div_score = np.mean([r.item() if hasattr(r, 'item') else r for r in div_rewards]) if div_rewards else 0.0
+            
+            # [NEW] Calculate mean diversity score
+            # Fix: Handle both Tensor and float return types
+            mean_div_score = np.mean([r.item() if hasattr(r, 'item') else r for r in div_rewards]) if div_rewards else 0.0
+            
+            # [NEW] Calculate avg BFS distance
+            avg_bfs_dist = np.mean(bfs_stats) if bfs_stats else 0.0
 
+            return (
+                torch.stack(next_maps).to(self.device),
+                torch.stack(next_heats).to(self.device),
+                mean_raw_loss, # Changed from mean_valid_loss to mean_raw_loss to match existing variable
+                mean_div_score,
+                valid_trajs,
+                solvable_count, # [MODIFIED] Rate -> Count
+                avg_bfs_dist    # [NEW] Avg Path Length
+            )
     def update(self):
         loss = self.ppo.update()
         return loss, self.ppo.last_mean_reward
@@ -351,7 +430,7 @@ class GeneratorInterface:
                     self.support.cfg,
                     env_source=env_str,
                     save_name=save_name,
-                    max_steps=2000,             # 单个 Episode 最多 2000 步 (防止死循环)
+                    max_steps=800,             # 单个 Episode 最多 2000 步 (防止死循环)
                     maximum_dataset_size=self.support.cfg.env.collect.mini_dataset_size*2,  # 硬顶，超过就停
                     recollect_data=True 
                 )

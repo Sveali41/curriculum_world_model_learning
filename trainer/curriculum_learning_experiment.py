@@ -225,7 +225,7 @@ def curriculum_learning_transitions(cfg: DictConfig):
 
     test = True # True: using random data directly collect from target task -- baseline / False: using minitask strings
     manually_define_minitask_name = True # True: manually define minitask names / False: auto generate minitask names
-    interval_size = 6000 # number of transitions per training phase # not split when None # 3125 for each of baseline
+    interval_size = 2000 # [MODIFIED] Aligned with UED (approx 2000 step/iter) for fairness comparisons
     training_data_intotal = None # total number of transitions for training
     explore_type = cfg.env.collect.data_type # uniform / random
     data_save_dir = TRAINER_PATH / "data"
