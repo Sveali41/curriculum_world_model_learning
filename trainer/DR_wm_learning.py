@@ -125,7 +125,9 @@ def domain_randomization_baseline(cfg: DictConfig):
             "Iter", 
             "Gen_Mean_Reward",  # Initial Difficulty (Proxy)
             "Gen_Real_Loss",    # [NEW] Raw Loss on generated maps (Unscaled)
+            "Gen_Real_Loss",    # [NEW] Raw Loss on generated maps (Unscaled)
             "Gen_Loss", 
+            "Gen_Entropy",      # [NEW] Entropy
             "Gen_Div_Reward",   # [NEW] Diversity Reward
             "WM_Val_Loss",      # Global Capability (Target Tasks Mean)
             "WM_Val_Max",       # [NEW] Worst-case Capability
@@ -247,19 +249,22 @@ def domain_randomization_baseline(cfg: DictConfig):
         # Step 3: 更新 Generator (PPO Update)
         # --------------------------------------------------------
         # [MODIFIED] Warmup Fix: Do NOT update generator during warmup.
+        # [MODIFIED] Warmup Fix: Do NOT update generator during warmup.
         if iteration >= warmup_iterations:
-            gen_loss, gen_mean_reward = gen_interface.update()
+            gen_loss, gen_entropy, gen_mean_reward = gen_interface.update()
 
             if gen_loss is not None:
                 print(
-                    f"[Generator] Policy Updated. Loss: {gen_loss:.4f}"
+                    f"[Generator] Policy Updated. Loss: {gen_loss:.4f} | Entropy: {gen_entropy:.4f}"
                 )
             else:
                 print("[Generator] Policy Updated. Loss: NaN (Skipped due to instability)")
                 gen_loss = 0.0 
+                gen_entropy = 0.0
         else:
              print(f"[System] Warmup Phase ({iteration+1}/{warmup_iterations}): Skipping Generator Update.")
              gen_loss = 0.0
+             gen_entropy = 0.0
              gen_mean_reward = 0.0
 
         # --------------------------------------------------------
@@ -445,7 +450,10 @@ def domain_randomization_baseline(cfg: DictConfig):
                         iteration + 1,
                         f"{gen_mean_reward:.4f}",
                         f"{gen_raw_loss:.6f}",
+                        f"{gen_raw_loss:.6f}",
                         f"{gen_loss:.4f}",
+                        f"{gen_entropy:.4f}",
+                        f"{gen_div_reward:.4f}",
                         f"{gen_div_reward:.4f}",
                         f"{target_mean_loss:.6f}",
                         f"{target_max_loss:.6f}",

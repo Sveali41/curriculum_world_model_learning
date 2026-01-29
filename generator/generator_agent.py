@@ -18,10 +18,10 @@ class GeneratorPPO:
         self,
         his_emb_dim=16,
         context_dim=64,
-        lr_actor=1e-4,
+        lr_actor=1e-4, # [TUNED] 3e-4 -> 1e-4: Calm down. Fine-tune instead of jumping.
         lr_critic=3e-4,
         gamma=0.99,
-        K_epochs=4,
+        K_epochs=10,   # Keep K_epochs=10 high to learn efficiently from safe steps
         eps_clip=0.2,
         num_actions=11,
         # ratio=0.25, # removed
@@ -233,7 +233,7 @@ class GeneratorPPO:
             # --- Step 0: 安全检查 ---
             if len(self.buffer["curr_map"]) == 0:
                 print("[GeneratorPPO] Warning: Buffer is empty, skipping update.")
-                return 0.0
+                return 0.0, 0.0
 
             # --- Step 1: 基础数据准备与归一化 ---
             rewards = torch.tensor(self.buffer["reward"], device=device)
@@ -318,7 +318,7 @@ class GeneratorPPO:
                 # --- 数值安全性检查 ---
                 if torch.isnan(total_loss):
                     print(f"[GeneratorPPO] Warning: NaN detected in Epoch {i}. Stopping update.")
-                    return None 
+                    return 0.0, 0.0 
 
                 # --- Step 4: 反向传播与梯度裁剪 ---
                 self.optimizer.zero_grad()
@@ -336,8 +336,9 @@ class GeneratorPPO:
             # 更新完成后，将旧策略同步到最新状态，并清空 Buffer 迎接下一轮采样
             self.policy_old.load_state_dict(self.policy.state_dict())
             self.clear_buffer()
-
-            return last_loss
+            
+            # [MODIFIED] Return entropy for monitoring
+            return last_loss, entropy.mean().item()
 
     # ------------------------------------------------------------------
     # Save / Load

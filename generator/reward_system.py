@@ -124,6 +124,13 @@ class DiversityModule(nn.Module):
             nn.Linear(32 * input_h * input_w, 64) 
         ).to(device)
 
+        # [NEW] Orthogonal Initialization for better feature extraction sensitivity
+        for m in self.encoder:
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.orthogonal_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
     def _preprocess(self, map_tensor):
         """
         将 [2, H, W] 的 ID 地图转换为 [1, 17, H, W] 的 One-Hot 特征图
@@ -136,8 +143,13 @@ class DiversityModule(nn.Module):
         col_ids = x[:, 1, :, :].long() # [1, H, W]
         
         # 3. One-Hot 编码
+        # [FIX] Mask out Agent (ID=10) to Empty/Floor (ID=1)
+        # Avoid calculating diversity based on random agent spawn position
+        obj_ids_clean = obj_ids.clone()
+        obj_ids_clean[obj_ids_clean == 10] = 1
+
         # obj_ids -> [1, H, W, 11] -> permute -> [1, 11, H, W]
-        obj_oh = F.one_hot(obj_ids, num_classes=self.num_obj_types).permute(0, 3, 1, 2).float()
+        obj_oh = F.one_hot(obj_ids_clean, num_classes=self.num_obj_types).permute(0, 3, 1, 2).float()
         
         # col_ids -> [1, H, W, 6] -> permute -> [1, 6, H, W]
         col_oh = F.one_hot(col_ids, num_classes=self.num_colors).permute(0, 3, 1, 2).float()
@@ -158,7 +170,11 @@ class DiversityModule(nn.Module):
             x = self._preprocess(map_vec_tensor) # [1, 17, H, W]
             
             # 2. 编码提取特征
-            emb = self.encoder(x).cpu().numpy().flatten() # [64]
+            emb_raw = self.encoder(x) # [1, 64]
+            # [NEW] Feature Normalization (Unit Norm)
+            # This ensures Euclidean distance is bounded [0, 2] and highly sensitive to direction
+            norm = torch.norm(emb_raw, p=2, dim=1, keepdim=True)
+            emb = (emb_raw / (norm + 1e-8)).cpu().numpy().flatten() # [64]
             
         # 3. KNN 距离计算 (新颖性)
         if len(self.archive) == 0:

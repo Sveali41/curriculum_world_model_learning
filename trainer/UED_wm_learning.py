@@ -126,8 +126,9 @@ def adversarial_ued_training(cfg: DictConfig):
     if getattr(cfg.attention_model, "validation_metric", "mse") != "mse":
         metric_suffix = f"_{cfg.attention_model.validation_metric}"
         
+    # Always construct path (handles empty suffixes naturally for default case)
+    summary_csv_path = log_dir / f"experiment_summary_mask3_mse{ablation_suffix}{metric_suffix}.csv"
     if ablation_suffix or metric_suffix:
-        summary_csv_path = log_dir / f"experiment_summary_mask3_mse{ablation_suffix}{metric_suffix}.csv"
         print(f"[Log] CSV Path Adjusted: {summary_csv_path}")
 
     data_save_dir = TRAINER_PATH / "data"
@@ -140,6 +141,7 @@ def adversarial_ued_training(cfg: DictConfig):
             "Gen_Mean_Reward",  # Initial Difficulty (Proxy)
             "Gen_Real_Loss",    # [NEW] Raw Loss on generated maps (Unscaled)
             "Gen_Loss", 
+            "Gen_Entropy",      # [NEW] Policy Entropy for debugging convergence
             "Gen_Div_Reward",   # [NEW] Diversity Reward
             "WM_Val_Loss",      # Target Tasks Mean (MSE or Weighted based on cfg)
             "WM_Val_Max",       # [NEW] Worst-case Capability
@@ -259,21 +261,20 @@ def adversarial_ued_training(cfg: DictConfig):
         # --------------------------------------------------------
         # Step 3: 更新 Generator (PPO Update)
         # --------------------------------------------------------
-        # --------------------------------------------------------
-        # Step 3: 更新 Generator (PPO Update)
-        # --------------------------------------------------------
         # [MODIFIED] User Request: Warmup is for Generator now.
         # Generator trains from the start (Iter 0).
         if True:
-            gen_loss, gen_mean_reward = gen_interface.update()
+            # [MODIFIED] Now returns entropy
+            gen_loss, gen_entropy, gen_mean_reward = gen_interface.update()
 
             if gen_loss is not None:
                 print(
-                    f"[Generator] Policy Updated. Loss: {gen_loss:.4f}"
+                    f"[Generator] Policy Updated. Loss: {gen_loss:.4f} | Entropy: {gen_entropy:.4f}"
                 )
             else:
                 print("[Generator] Policy Updated. Loss: NaN (Skipped due to instability)")
                 gen_loss = 0.0 
+                gen_entropy = 0.0
 
         # --------------------------------------------------------
         # Step 4: 更新 World Model (Adversarial Learning)
@@ -403,10 +404,12 @@ def adversarial_ued_training(cfg: DictConfig):
         target_max_loss = 0.0
         target_std_loss = 0.0
         
-        # [MODIFIED] Always validate to show the full learning curve
-        # Previously skippped during warmup
-        if True: 
-            # print("\n>>> Validating on Target Tasks...")
+        # [MODIFIED] Validation Logic:
+        # 1. Warmup: Skip validation to save time (except the very last warmup step to establish baseline).
+        # 2. Training: Validate every step to track progress closely.
+        warmup_iters = cfg.generator_agent.warmup_iterations
+        if iteration >= (warmup_iters - 1): 
+            print(f"\n>>> Validating on Target Tasks...")
             avg_losses = []
             
             # Temporary set to validation mode
@@ -459,8 +462,9 @@ def adversarial_ued_training(cfg: DictConfig):
                         f"{gen_mean_reward:.4f}",
                         f"{gen_raw_loss:.6f}",
                         f"{gen_loss:.4f}",
+                        f"{gen_entropy:.4f}",
                         f"{gen_div_score:.4f}",
-                        f"{gen_div_score:.4f}",
+
                         f"{target_mean_loss:.6f}",
                         f"{target_max_loss:.6f}",
                         f"{target_std_loss:.6f}",

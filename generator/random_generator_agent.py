@@ -95,7 +95,7 @@ class RandomGeneratorAgent:
 
     def update(self, *args, **kwargs):
         """No-op update for random agent"""
-        return 0.0 # gen_loss (scalar)
+        return 0.0, 0.0 # gen_loss, entropy (scalars)
     
     def save_buffer(self, *args, **kwargs):
         pass

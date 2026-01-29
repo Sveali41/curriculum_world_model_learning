@@ -84,7 +84,10 @@ class MapEditorActorCritic(nn.Module):
         # [REVERTED] Bias back to 3.0.
         # User Feedback: Bias=1.0 made maps too dense, limiting exploration.
         # We need high sparsity (No-Op) initially.
-        last_layer.bias.data[0] = 3.0
+        # [REMOVED] Bias for No-Op. 
+        # User request: Cancel No-Op bias to allow equal probability for all edits initially.
+        # last_layer.bias.data[0] = 3.0
+        last_layer.bias.data[0] = 0.0
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):
@@ -140,21 +143,35 @@ class MapEditorActorCritic(nn.Module):
         return x
 
 
-    def _get_topk_mask(self, logits, max_edits):
+    def _get_topk_mask(self, logits, max_edits, action_mask=None):
         """
         Helper to compute the Top-K mask based on logits and max_edits ratio.
         Shared by act() and evaluate().
+        If action_mask is provided, k is calculated based on the count of MUTABLE cells.
         """
         probs = F.softmax(logits, dim=1)
         prob_change = 1.0 - probs[:, 0, :, :]  # [B,H,W]
 
         B, H, W = prob_change.shape
         flat_probs = prob_change.view(B, -1)
-        num_cells = H * W
+        
+        # [MODIFIED] Dynamic K based on empty (mutable) cells
+        if action_mask is not None:
+             # action_mask: 1.0=Immutable, 0.0=Mutable
+             # We want to count MUTABLE cells.
+             with torch.no_grad():
+                 # Count 0s. Assuming mask is [B, 1, H, W] or [B, H, W]
+                 num_mutable_per_sample = (action_mask < 0.5).sum(dim=(1, 2, 3) if action_mask.dim()==4 else (1, 2))
+                 # Use Mean count for batch stability
+                 avg_mutable = num_mutable_per_sample.float().mean().item()
+                 num_cells = max(1.0, avg_mutable)
+        else:
+             num_cells = H * W
         
         # Calculate k
         k = int(max(1, round(max_edits * num_cells)))
-        k = min(k, num_cells)
+        # Clamp k to total cells just in case
+        k = min(k, H * W)
         
         # Find Top-K threshold
         topk_values, _ = torch.topk(flat_probs, k=k, dim=1)
@@ -196,7 +213,10 @@ class MapEditorActorCritic(nn.Module):
             logits[:, 1:, :, :].masked_fill_(mask_others, -1e9)   
 
         # --- Top-K edits logic ---
-        topk_mask = self._get_topk_mask(logits, max_edits)
+        # [MODIFIED] Pass action_mask to calculate dynamic K
+        # Pass the ORIGINAL action_mask (before casting/dimensions mangling if possible, but strict float/bool is key)
+        # Note: action_mask here is a Tensor. _get_topk_mask handles standard tensor.
+        topk_mask = self._get_topk_mask(logits, max_edits, action_mask)
 
         # 对非 topk 的位置：
         # 1. 强制 No-op (logits[0] -> 1e9)
@@ -249,7 +269,8 @@ class MapEditorActorCritic(nn.Module):
         if target_topk_mask is not None:
             topk_mask = target_topk_mask
         else:
-            topk_mask = self._get_topk_mask(logits, max_edits)
+            # [MODIFIED] Pass action_mask
+            topk_mask = self._get_topk_mask(logits, max_edits, action_mask)
 
         # Apply Top-K Mask
         logits[:, 0, :, :].masked_fill_(~topk_mask, 1e9)

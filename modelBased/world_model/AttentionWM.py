@@ -244,6 +244,8 @@ class AttentionWorldModel(pl.LightningModule):
             obs = obs.to(device, dtype=torch.float32)
             act = act.to(device)
             obs_next = obs_next.to(device, dtype=torch.float32)
+            if obs_masked is not None:
+                obs_masked = obs_masked.to(device)
             
             # 2. Iterate over samples in the batch
             batch_size = obs.shape[0]
@@ -518,6 +520,24 @@ class AttentionWorldModel(pl.LightningModule):
         # 4. Combine Weights
         # Base=1.0, Move=+10, Interaction=+100 -> Total 111.0 for Opening Door
         weights = 1.0 + (change_mask * 10.0) + (state_change_mask * 100.0)
+        
+        # [MODIFIED] Interaction Weighting (Dynamic)
+        # Logic: If a pixel changed (`change_mask`) AND it is a Critical Element (`obs_masked`),
+        # it means an INTERACTION happened (Stepped on Lava, Picked Key, Opened Door).
+        # We boost this specific event to +100.0.
+        if obs_masked is not None:
+             # obs_masked is (B, H, W) -> Unsqueeze to match weights (B, 1, H, W)
+             if obs_masked.ndim == 3:
+                 static_mask = obs_masked.unsqueeze(1).float()
+             else:
+                 static_mask = obs_masked.float()
+             
+             # INTERACTION = CHANGE * ELEMENT
+             # Even for Lava, when agent steps on it, the pixel changes (Agent covers Lava).
+             # This change happens AT the Lava location.
+             interaction_mask = change_mask * static_mask
+             
+             weights = weights + (interaction_mask * 100.0)
 
         # 5. Weighted Mean
         loss = (raw_sq_error * weights).mean()

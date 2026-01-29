@@ -20,7 +20,10 @@ from modelBased.common import utils
 
 def visualize_env(env, cfg: DictConfig, save_img=False):
     env.reset()[0]
-    img = env.get_frame()
+    try:
+        img = env.get_frame()
+    except AttributeError:
+        img = env.unwrapped.get_frame()
     return img 
 
 
@@ -87,7 +90,10 @@ def run_env_vectorized(env, cfg: DictConfig, wandb_run, policy=None, rmax_explor
     device = torch.device('cpu')
     if save_img and wandb_run is not None:
         obs = env.reset()[0]
-        img = env.get_frame()
+        try:
+             img = env.get_frame()
+        except AttributeError:
+             img = env.unwrapped.get_frame()
         wandb_run.log({"Mini-tasks": wandb.Image(img)})
 
     if torch.cuda.is_available():
@@ -289,13 +295,19 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
 
 
     if save_img and wandb_run is not None:
-        img = env.get_frame()
+        try:
+            img = env.get_frame()
+        except AttributeError:
+             img = env.unwrapped.get_frame()
         wandb_run.log({log_name: wandb.Image(img)})
     # Visit count for RMax or exploration tracking
     visit_count = {}
 
     if cfg.env.save_visualized_img:
-        img = env.get_frame()
+        try:
+             img = env.get_frame()
+        except AttributeError:
+             img = env.unwrapped.get_frame()
         # --- save locally ---
         os.makedirs(cfg.env.visualize_save_path, exist_ok=True)
         save_path = os.path.join(cfg.env.visualize_save_path, f"{log_name}_start.png")
@@ -333,7 +345,8 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
             elif "door" in task_name:
                 action_probs = [0.1, 0.1, 0.1, 0.3, 0.4]  # 重点在toggle
             else:
-                action_probs = [0.3, 0.15, 0.15, 0.2, 0.2]  # 默认
+                # [Optimized] Higher forward (0.5) to explore, modest toggle (0.2) for doors
+                action_probs = [0.2, 0.2, 0.2, 0.2, 0.2]  # [Fwd, L, R, Pick, Tog]
             # Select an action
             if policy is None:
                 act = np.random.choice(meaningful_actions, p=action_probs)  # Weighted random sampling
@@ -547,7 +560,10 @@ def run_env_uniform(env, cfg, wandb_run, log_name, policy=None, rmax_exploration
     # Optional W&B image logging
     if save_img and wandb_run is not None:
         try:
-            img = env.get_frame()
+            try:
+                img = env.get_frame()
+            except AttributeError:
+                img = env.unwrapped.get_frame()
             wandb_run.log({log_name: wandb.Image(img)})
         except Exception:
             pass

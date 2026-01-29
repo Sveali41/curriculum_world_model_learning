@@ -312,7 +312,7 @@ def train_wm_with_subsets(
 def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, phase_name, VALID_TIMES=1):
     """
     Run WM validation on the fixed target task, return avg loss.
-    Save no heatmap here (can add if needed).
+    Returns: (avg_mse_loss, avg_weighted_loss)
     """
 
     cfg.attention_model.freeze_weight = True
@@ -320,11 +320,25 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
     cfg.attention_model.data_dir = os.path.join(data_save_dir, target_file)
 
     losses = []
+    weighted_losses = []
 
     for v in range(VALID_TIMES):
         val_result, _, model = AttentionWM_training.train_api(cfg, net, old_params, None)
+        
+        # 1. Standard Loss (usually MSE)
         loss_val = float(val_result[0]['avg_val_loss_wm'])
         losses.append(loss_val)
+        
+        # 2. Weighted Loss (if available)
+        # Check keys just in case
+        res_dict = val_result[0]
+        if 'avg_val_loss_wm_weighted' in res_dict:
+            w_loss = float(res_dict['avg_val_loss_wm_weighted'])
+        else:
+             # Fallback: same as normal loss
+            w_loss = loss_val
+            
+        weighted_losses.append(w_loss)
 
         del model
         torch.cuda.empty_cache()

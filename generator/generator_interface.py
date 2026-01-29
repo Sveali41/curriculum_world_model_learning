@@ -160,7 +160,7 @@ class GeneratorInterface:
                     
                     # [ABLATION] w/o Validity Reward (Penalty)
                     if hasattr(self.cfg, 'ablation') and self.cfg.ablation.type == 'no_validity_reward':
-                        fail_reward = -1.0 # Standard failure penalty (like in DR)
+                        fail_reward = 0.0 # Standard failure penalty (like in DR)
                         # No print needed
                     else:
                         # Standard UED: Strong Penalty
@@ -182,16 +182,25 @@ class GeneratorInterface:
                 )
                 
                 # [ABLATION] w/o Diversity
-                if hasattr(self.cfg, 'ablation') and self.cfg.ablation.type == 'no_diversity':
-                     r_div = 0.0
+                # Fix: We must LOG the real diversity score (r_div) to see mode collapse,
+                # but we must ZERO out the reward given to the agent.
+                r_div_for_reward = r_div.item() if hasattr(r_div, 'item') else r_div
                 
-                div_rewards.append(r_div)
+                if hasattr(self.cfg, 'ablation') and self.cfg.ablation.type == 'no_diversity':
+                     r_div_for_reward = 0.0
+                
+                div_rewards.append(r_div) # Log actual score
 
                 # 5. 奖励计算逻辑
                 raw_scalar_losses.append(scalar_loss) # Log raw loss
                 
-                # [MODIFIED] Use Log-Scale Reward to amplify gradients when loss is small
-                scalar_loss = np.log(scalar_loss + 1e-10) + 8.0 
+                # [MODIFIED] Balanced Difficulty Tuning
+                # 1. Reduced Multiplier 10000 -> 2000: Align with EWC strength to prevent gradient explosion.
+                scalar_loss = (scalar_loss * 10000.0) 
+
+                # [ABLATION] No Learning Progress (No Loss Reward)
+                if hasattr(self.cfg, 'ablation') and self.cfg.ablation.type == 'no_learning_progress':
+                     scalar_loss = 0.0
                 
                 # [NEW] Solution Length Reward (Complexity Bonus)
                 # Reduced to 0.1 so it doesn't overpower the Loss Reward.
@@ -204,19 +213,26 @@ class GeneratorInterface:
                 # Case 1: 4.5 + 1.6 = 6.1
                 # Case 2: 5.7 + 1.2 = 6.9 (Prefers Hard!)
                 r_len = bfs_dist * 0.1 
+
+                if hasattr(self.cfg, 'ablation') and self.cfg.ablation.type == 'no_diversity':
+                     r_len = 0.0 
                 
                 if not is_solvable:
                      # [CRITICAL] 物理不可达：强制重罚
                      # 无论 Loss 多高，只要不可达就是失败的设计。
-                     reward = -5.0
+                     if hasattr(self.cfg, 'ablation') and self.cfg.ablation.type == 'no_validity_reward':
+                         # [ABLATION] Disable strong penalty
+                         reward = 0.0
+                     else:
+                         reward = -5.0
                 elif solved:
                     # 智能体跑通了：全额奖励
-                    # [Diversity Boost] 0.1 -> 0.5. Prevent Mode Collapse.
-                    reward = scalar_loss + 0.5 * r_div + r_len
+                    # [Diversity Adjustment] 10.0 -> 5.0. 让多样性彻底成为辅助信号。
+                    reward = scalar_loss + 5.0 * r_div_for_reward + r_len + 1.0 
                 else:
-                    # 连通但未跑通：说明这是一个极佳的“困难样本”
-                    # 依然给予 BFS 长度奖励，鼓励生成这类“看着能通但很难走”的图
-                    reward = (scalar_loss * 0.8) + 0.25 * r_div + r_len
+                    # 连通但未跑通：
+                    # [Diversity Adjustment] 5.0 -> 2.5.
+                    reward = (scalar_loss * 0.8) + 2.5 * r_div_for_reward + r_len + 0.5 
                     # print(f"[UED] Iter {iteration} Env {i}: Solvable but not solved. LP: {scalar_loss:.4f}")
 
                 # [NEW] Warmup Logic override
@@ -225,10 +241,15 @@ class GeneratorInterface:
                 if iteration < warmup_iters:
                      # Warmup Reward:
                      # 1. Base: +1.0 for being Solvable (vs -5.0 for fail)
-                     # 2. Complexity: + BFS * 0.2 (Encourage long paths)
-                     # 3. Diversity: + Div * 0.5 (Encourage variety)
+                     # 2. Complexity: + BFS * 0.2 (Encourage long paths) -> ZERO if no_diversity
+                     # 3. Diversity: + Div * 0.5 (Encourage variety) -> ZERO if no_diversity
                      # 4. WM Loss: IGNORED (0.0)
-                     reward = 1.0 + (bfs_dist * 0.2) + (r_div * 0.5)
+                     
+                     r_bfs_warmup = bfs_dist * 0.2
+                     if hasattr(self.cfg, 'ablation') and self.cfg.ablation.type == 'no_diversity':
+                         r_bfs_warmup = 0.0
+                     
+                     reward = 1.0 + r_bfs_warmup + (r_div_for_reward * 5.0)
 
                 # 保存到生成器的 PPO Buffer
                 self._save(i, reward, curr_map, mask, actions, logp, values, topk_action_mask)
@@ -244,16 +265,29 @@ class GeneratorInterface:
             # Calculate mean raw scalar loss for logging
             mean_raw_loss = np.mean(raw_scalar_losses) if raw_scalar_losses else 0.0
             
-            # [NEW] Calculate mean diversity score
-            # Fix: Handle both Tensor and float return types
-            mean_div_score = np.mean([r.item() if hasattr(r, 'item') else r for r in div_rewards]) if div_rewards else 0.0
-            
-            # [NEW] Calculate mean diversity score
-            # Fix: Handle both Tensor and float return types
-            mean_div_score = np.mean([r.item() if hasattr(r, 'item') else r for r in div_rewards]) if div_rewards else 0.0
+            # [LOGGING] Calculate mean diversity reward (Weighted)
+            # Replaced 10.0 with 5.0 to match the new reward formula.
+            raw_div_score = np.mean([r.item() if hasattr(r, 'item') else r for r in div_rewards]) if div_rewards else 0.0
+            mean_div_score = raw_div_score * 5.0
             
             # [NEW] Calculate avg BFS distance
             avg_bfs_dist = np.mean(bfs_stats) if bfs_stats else 0.0
+
+            # [FIX] Handle empty next_maps (all rollouts failed)
+            if len(next_maps) == 0:
+                print("[Generator] Critical Warning: All environments failed to generate valid data!")
+                # Return dummy tensors to prevent crash, downstream task should handle empty batch
+                dummy_map = torch.zeros(0, 3, self.map_height, self.map_width, device=self.device)
+                dummy_heat = torch.zeros(0, 1, self.map_height, self.map_width, device=self.device)
+                return (
+                    dummy_map,
+                    dummy_heat,
+                    0.0,
+                    0.0,
+                    [],
+                    0,
+                    0.0
+                )
 
             return (
                 torch.stack(next_maps).to(self.device),
@@ -265,8 +299,8 @@ class GeneratorInterface:
                 avg_bfs_dist    # [NEW] Avg Path Length
             )
     def update(self):
-        loss = self.ppo.update()
-        return loss, self.ppo.last_mean_reward
+        loss, entropy = self.ppo.update()
+        return loss, entropy, self.ppo.last_mean_reward
 
     # ------------------------------------------------------------
     # Helpers
@@ -430,7 +464,7 @@ class GeneratorInterface:
                     self.support.cfg,
                     env_source=env_str,
                     save_name=save_name,
-                    max_steps=800,             # 单个 Episode 最多 2000 步 (防止死循环)
+                    max_steps=1000,             # 单个 Episode 最多 2000 步 (防止死循环)
                     maximum_dataset_size=self.support.cfg.env.collect.mini_dataset_size*2,  # 硬顶，超过就停
                     recollect_data=True 
                 )
@@ -464,7 +498,11 @@ class GeneratorInterface:
                 )
                 scalar_loss = np.mean(loss_list) if loss_list else 0.0
                 
-                heat = torch.tensor(avg_loss_map, device=self.device).unsqueeze(0).unsqueeze(0)
+                # [MODIFIED] Log-Scale Heatmap to make small errors visible to Generator
+                # MSE is typically 1e-3 to 1e-4, which is invisible to NN compared to integer inputs.
+                # Log scale brings it to range [-9, 0], providing distinct gradients.
+                scaled_loss_map = np.log(avg_loss_map + 1e-8)
+                heat = torch.tensor(scaled_loss_map, device=self.device).unsqueeze(0).unsqueeze(0)
 
             except Exception as e:
                 print(f"Error in rollout/heat computation: {e}")

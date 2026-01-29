@@ -102,7 +102,7 @@ class WMRLDataset(Dataset):
         # ===== (1) 控制 replay 占比：replay ≤ new =====
         # 从 hparams 读取可选的比例配置；默认 0.5
         replay_frac = float(getattr(self.hparams, "replay_frac", 0.5))
-        replay_frac = max(0.0, min(1.0, replay_frac))  # clamp 到 [0,1]
+        replay_frac = max(0.0, min(50.0, replay_frac))  # Allow higher ratios (e.g., 6.0 user request)
         max_replay = int(current_n * replay_frac)
 
         if replay_data is not None and 'obs' in replay_data and replay_data['obs'] is not None:
