@@ -29,7 +29,7 @@ def collect_data_for_txt(cfg: DictConfig):
     set_seed(seed)
 
     # Loop over target tasks 0 to 14
-    for i in range(15):
+    for i in range(20):
         env_text_file_name = f'target_task{i}.txt'
         file_name = os.path.splitext(env_text_file_name)[0]
         cfg.env.collect.data_type = 'uniform'
@@ -37,7 +37,7 @@ def collect_data_for_txt(cfg: DictConfig):
 
         cfg.env.collect.data_save_path = TRAINER_PATH / 'data' / f'{file_name}_test_{explore_type}.npz'
         cfg.env.collect.episodes = 400
-        cfg.env.collect.maximum_dataset_size = 6000 # Reduced to speed up
+        cfg.env.collect.maximum_dataset_size = 7000 # Reduced to speed up
         cfg.env.collect.visualize_save_path = TRAINER_PATH / 'logs' / 'dataset_visualization'
         cfg.env.collect.visualize_filename = f"{file_name}_{explore_type}.png"
 
@@ -225,7 +225,7 @@ def curriculum_learning_transitions(cfg: DictConfig):
 
     test = True # True: using random data directly collect from target task -- baseline / False: using minitask strings
     manually_define_minitask_name = True # True: manually define minitask names / False: auto generate minitask names
-    interval_size = 2000 # [MODIFIED] Aligned with UED (approx 2000 step/iter) for fairness comparisons
+    interval_size = 7000 # [MODIFIED] Aligned with UED (approx 2000 step/iter) for fairness comparisons
     training_data_intotal = None # total number of transitions for training
     explore_type = cfg.env.collect.data_type # uniform / random
     data_save_dir = TRAINER_PATH / "data"
@@ -234,13 +234,13 @@ def curriculum_learning_transitions(cfg: DictConfig):
     csv_path = log_dir / "target_loss_baseline_ued.csv"
     os.makedirs(log_dir, exist_ok=True)
 
-    target_task_name = [f'target_task{i}.txt' for i in range(10)]
+    target_task_name = [f'target_task{i}.txt' for i in range(20)]
     if manually_define_minitask_name:
         minitask_name = [ 'combination_minitask_0.txt','combination_minitask_1.txt',
                             'combination_minitask_2.txt', 'combination_minitask_3.txt',
                             'combination_minitask_4.txt', 'combination_minitask_5.txt',
                             'combination_minitask_6.txt', 'combination_minitask_7.txt',
-                        
+
                          ] # manually define minitask names if needed
 
     target_file = [os.path.splitext(i)[0] + f"_test_uniform.npz" for i in target_task_name]
@@ -264,7 +264,7 @@ def curriculum_learning_transitions(cfg: DictConfig):
     combined_data = {k: [] for k in ['a', 'b', 'c', 'd', 'e', 'f']}
     phases_collected = 0
     if test:
-        phase_files = [f'target_task{i}.txt' for i in range(15)]
+        phase_files = [f'target_task{i}.txt' for i in range(20)]
         mode = "Baseline" # 'CL' / 'Baseline'
     else:
         if manually_define_minitask_name:
@@ -300,7 +300,7 @@ def curriculum_learning_transitions(cfg: DictConfig):
                 env_source=TRAINER_PATH / "level" / "target_task" / phase,
                 save_name=phase_name,
                 max_steps=1000,
-                maximum_dataset_size=6000,
+                maximum_dataset_size=7000,
                 recollect_data=False
             )
             task_npz = np.load(dataset_path, allow_pickle=True)

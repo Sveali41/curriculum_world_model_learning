@@ -28,6 +28,7 @@ class MapEditorActorCritic(nn.Module):
         max_color_id=6,
         max_state_id=3,
         context_dim=64,
+        ablation_type="none",  # Options: ["none", "no_diversity", "no_history", "no_validity_reward", "no_learning_progress"]
     ):
         super().__init__()
 
@@ -39,10 +40,17 @@ class MapEditorActorCritic(nn.Module):
         self.emb_obj = nn.Embedding(max_obj_id + 1, self.emb_dim_obj)
         self.emb_color = nn.Embedding(max_color_id + 1, self.emb_dim_color)
         self.emb_state = nn.Embedding(max_state_id + 1, self.emb_dim_state)
+        self.ablation_type = ablation_type
 
         # === 2. 输入通道数 ===
         # Embeddings + Context(context_dim) + Coords(2)
-        total_in_channels = (self.emb_dim_obj + self.emb_dim_color + self.emb_dim_state) + context_dim + 2
+        # === 2. 输入通道数 ===
+        base_in_channels = (self.emb_dim_obj + self.emb_dim_color + self.emb_dim_state) + 2  # + coords(2)
+
+        if self.ablation_type == "no_history":
+            total_in_channels = base_in_channels 
+        else:  # "none"
+            total_in_channels = base_in_channels + context_dim
 
         # === 3. Backbone (ResNet) ===
         self.stem = nn.Sequential(
@@ -131,11 +139,14 @@ class MapEditorActorCritic(nn.Module):
         # 2) Coords
         xx, yy = self.get_coordinate_channels(B, H, W, base_map_vec.device)
 
-        # 3) Context broadcast: [B, C] -> [B, C, H, W]
-        context_tiled = context_vec.view(B, -1, 1, 1).expand(-1, -1, H, W)
-
-        # 4) Concat
-        x = torch.cat([feat_obj, feat_col, feat_sta, context_tiled, xx, yy], dim=1)
+        if self.ablation_type == "no_history":
+            x = torch.cat([feat_obj, feat_col, feat_sta, xx, yy], dim=1)
+        else:
+            # full history-as-obs
+            if context_vec is None:
+                raise ValueError("history_mode='obs' requires context_vec not None")
+            context_tiled = context_vec.view(B, -1, 1, 1).expand(-1, -1, H, W)
+            x = torch.cat([feat_obj, feat_col, feat_sta, context_tiled, xx, yy], dim=1)
 
         # 5) Backbone
         x = self.stem(x)
@@ -173,12 +184,16 @@ class MapEditorActorCritic(nn.Module):
         # Clamp k to total cells just in case
         k = min(k, H * W)
         
-        # Find Top-K threshold
-        topk_values, _ = torch.topk(flat_probs, k=k, dim=1)
-        threshold = topk_values[:, -1].view(B, 1, 1)
+        # [FIX] Use indices instead of threshold to handle ties correctly.
+        # Threshold logic 'prob >= threshold' selects ALL tied cells, potentially flooding the map.
+        topk_values, topk_indices = torch.topk(flat_probs, k=k, dim=1)
         
-        # Determine mask
-        topk_mask = prob_change >= threshold  # [B,H,W]
+        # Create a boolean mask of shape [B, H*W] using scatter
+        flat_mask = torch.zeros_like(flat_probs, dtype=torch.bool)
+        flat_mask.scatter_(1, topk_indices, True)
+        
+        # Reshape back to [B, H, W]
+        topk_mask = flat_mask.view(B, H, W)
         return topk_mask
 
     @torch.no_grad()

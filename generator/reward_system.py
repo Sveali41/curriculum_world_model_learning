@@ -178,9 +178,8 @@ class DiversityModule(nn.Module):
             
         # 3. KNN 距离计算 (新颖性)
         if len(self.archive) == 0:
-             # Very first sample: no history, so it's infinitely novel? 
-             # Or just give 0. Or give a small default.
-             # Let's give 0 to be safe, next one will have 1 neighbor.
+             # Archive is empty (first step), so no novelty can be computed relative to history.
+             # Return 0.0. The archive will be populated immediately after this.
              reward = 0.0
         else:
             archive_matrix = np.stack(self.archive)

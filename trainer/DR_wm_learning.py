@@ -115,7 +115,13 @@ def domain_randomization_baseline(cfg: DictConfig):
     log_dir = TRAINER_PATH / "logs" / "results_dr" # [MODIFIED] Separate logs
     os.makedirs(log_dir, exist_ok=True)
     csv_path = log_dir / "dr_log.csv"
-    summary_csv_path = log_dir / "experiment_summary_dr_mask_3_mse_div.csv"
+    
+    # [METRIC] Suffix for CSV
+    metric_suffix = ""
+    if getattr(cfg.attention_model, "validation_metric", "mse") != "mse":
+        metric_suffix = f"_{cfg.attention_model.validation_metric}"
+        
+    summary_csv_path = log_dir / f"experiment_summary_dr_mask_3_mse{metric_suffix}.csv"
     data_save_dir = TRAINER_PATH / "data"
 
     # === 初始化 Summary CSV ===
@@ -124,7 +130,6 @@ def domain_randomization_baseline(cfg: DictConfig):
         writer.writerow([
             "Iter", 
             "Gen_Mean_Reward",  # Initial Difficulty (Proxy)
-            "Gen_Real_Loss",    # [NEW] Raw Loss on generated maps (Unscaled)
             "Gen_Real_Loss",    # [NEW] Raw Loss on generated maps (Unscaled)
             "Gen_Loss", 
             "Gen_Entropy",      # [NEW] Entropy
@@ -188,6 +193,11 @@ def domain_randomization_baseline(cfg: DictConfig):
         "target_task12.txt",
         "target_task13.txt",
         "target_task14.txt",
+        "target_task15.txt",
+        "target_task16.txt",
+        "target_task17.txt",
+        "target_task18.txt",
+        "target_task19.txt",
     ]
 
     target_files = [
@@ -411,8 +421,6 @@ def domain_randomization_baseline(cfg: DictConfig):
 
             for t_name, t_file in zip(target_tasks, target_files):
                 # Fix: Create a FRESH model instance for validation instead of deepcopying.
-                # deepcopy triggers broken hooks on the source model.
-                # Creating a new instance and loading state_dict is safer.
                 
                 loss = validate_on_target_task(
                     cfg, 
@@ -423,6 +431,7 @@ def domain_randomization_baseline(cfg: DictConfig):
                     phase_name=f"Iter_{iteration}",
                     VALID_TIMES=1
                 )
+                
                 if loss is not None:
                      avg_losses.append(loss)
             
@@ -434,7 +443,8 @@ def domain_randomization_baseline(cfg: DictConfig):
                 target_mean_loss = sum(avg_losses) / len(avg_losses)
                 target_max_loss = max(avg_losses)
                 target_std_loss = np.std(avg_losses)
-                print(f"[Metrics] Global Capability (Target Tasks) -> Mean: {target_mean_loss:.6f} | Max: {target_max_loss:.6f} | Std: {target_std_loss:.6f}")
+                
+                print(f"[Metrics] Global Capability (Target Tasks) -> Loss: {target_mean_loss:.6f} | Max: {target_max_loss:.6f}")
             else:
                 target_max_loss = 0.0
                 target_std_loss = 0.0
@@ -450,10 +460,8 @@ def domain_randomization_baseline(cfg: DictConfig):
                         iteration + 1,
                         f"{gen_mean_reward:.4f}",
                         f"{gen_raw_loss:.6f}",
-                        f"{gen_raw_loss:.6f}",
                         f"{gen_loss:.4f}",
                         f"{gen_entropy:.4f}",
-                        f"{gen_div_reward:.4f}",
                         f"{gen_div_reward:.4f}",
                         f"{target_mean_loss:.6f}",
                         f"{target_max_loss:.6f}",

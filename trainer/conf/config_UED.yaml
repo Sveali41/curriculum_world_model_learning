@@ -52,11 +52,11 @@ env:
   save_visualized_img: True
   visualize_save_path: ${oc.env:TRAINER_PATH}/logs/env_visualization/
   collect:
-    mini_dataset_size: 2000
+    mini_dataset_size: 400
     env_type: norm # empty means empty only wall in preprocess no info for keys, lava/door/key/wall/norm
-    data_type: random # random/ uniform -- data collection   random -- training
+    data_type: Random # random/ uniform -- data collection   random -- training
     episodes: 100  # 500 number of episodes to start
-    maximum_dataset_size: 2000 # maximum number of samples to collect, if no then None
+    maximum_dataset_size: 400 # maximum number of samples to collect, if no then None
     data_folder: ${oc.env:TRAINER_PATH}/data/ # folder where to save the rollouts
     data_save_path: ${oc.env:TRAINER_PATH}/data/gridworld_trainer.npz # folder where to save the rollouts
     num_workers: 0 # number of workers to use for data collection
@@ -84,7 +84,7 @@ attention_model:
   num_heads: 1   # 1 if the embed_dim is 64, num_heads should better be 1
   data_dir: ${oc.env:TRAINER_PATH}/data/gridworld_trainer.npz # ${oc.env:TRAINER_PATH}/data/gridworld_episode.npz 
   n_epochs: 10 # 30 -> 10: Reduce risk of over-fitting to noisy generated maps.
-  lr: 1e-4 # 5e-4 -> 1e-4: Slower learning for better stability under high loss weights.
+  lr: 1e-5 # 5e-4 -> 1e-4: Slower learning for better stability under high loss weights.
   wd: 1e-5
   obs_norm_values: [10, 5, 3] # object, color, state --> agent_state: 1-down 2-left 3-up 0-right 
   action_norm_values: 6 # 0-left 1-right 2-forward 3-pickup 4-drop 5-toggle 6-done
@@ -115,11 +115,11 @@ attention_model:
   continue_learning: true
   fisher_buffer_size: 500000
   current_sample_ratio: 0.3
-  replay_frac: 2.33 # 6.0 -> 1.5: Achievement of 6:4 (Old:New) ratio. (1.5 * new = old)
+  replay_frac: 3 # 6.0 -> 1.5: Achievement of 6:4 (Old:New) ratio. (1.5 * new = old)
   fisher_buffer_elements_ratio: 0.8
-  fisher_beta: 0.5 # 0.3 -> 0.5: Standard update speed
-  lambda_ewc: 50000 # 2000 -> 50000: Massive boost to shield memory against generator noise.
-  ewc_ratio: 0.8 # r 越大 → 越不忘旧任务，但越难学新任务。r 越小 → 越容易适应新任务，但更容易忘。
+  fisher_beta: 0.3 # 0.3 -> 0.5: Standard update speed
+  lambda_ewc: 20000 # 2000 -> 50000: Massive boost to shield memory against generator noise.
+  ewc_ratio: 0.9 # r 越大 → 越不忘旧任务，但越难学新任务。r 越小 → 越容易适应新任务，但更容易忘。
   lambda_ewc_min: 1e-4
   lambda_ewc_max: 1e7 # 1e3 -> 1e7: Allow EWC to grow strong enough to shield knowledge.
   lambda_ema: 0.05        # 让 λ 更新更平滑     
@@ -128,17 +128,18 @@ attention_model:
   drift_cooldown: 100
   
 generator_agent:
-  total_iterations: 60
-  warmup_iterations: 30 # 0 -> 5: Crucial! Force 5 rounds of Random Data to build general foundation.
+  total_iterations: 100
+  warmup_iterations: 10 # 0 -> 5: Crucial! Force 5 rounds of Random Data to build general foundation.
   wm_train_frequency: 1
-  batch_size: 6
+  batch_size: 8
   map_height: 8
   map_width: 8
   context_dim: 64
-  max_edits: 0.5 # how many edits cells to make (Relative to MUTABLE cells)
+  max_edits: 0.15 # how many edits cells to make (Relative to MUTABLE cells)
   his_emb_dim: 16
   ctx_top_k_features: 16
   div_k: 10
+  use_elites: false
 
 ablation:
-  type: "no_diversity"  # Options: ["none", "no_diversity", "no_history", "no_validity_reward", "no_learning_progress"]
+  type: "no_history"  # Options: ["none", "no_diversity", "no_history", "no_validity_reward", "no_learning_progress"]

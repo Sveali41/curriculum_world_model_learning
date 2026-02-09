@@ -26,6 +26,7 @@ class GeneratorPPO:
         num_actions=11,
         # ratio=0.25, # removed
         top_k_features=16,
+        ablation_type="none",
 
     ):
         self.gamma = gamma
@@ -39,18 +40,24 @@ class GeneratorPPO:
         
 
         # === Networks ===
-        self.encoder = HistoryEncoder(context_dim=context_dim,    
+        if ablation_type == "no_history":
+            self.encoder = None  # No history encoder needed for this ablation
+        else:
+            self.encoder = HistoryEncoder(context_dim=context_dim,    
             emb_dim=his_emb_dim).to(device)
 
         self.policy = MapEditorActorCritic(
             context_dim=context_dim,
             num_actions=num_actions,
+            ablation_type=ablation_type,
         ).to(device)
 
         self.policy_old = MapEditorActorCritic(
             context_dim=context_dim,
             num_actions=num_actions,
+            ablation_type=ablation_type,
         ).to(device)
+
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         # === Optimizer (encoder + policy) ===
@@ -308,10 +315,10 @@ class GeneratorPPO:
                 # 4. 损失函数组合
                 # - Policy Loss: 让奖励高的动作概率变大
                 # - Value Loss: 让 Critic 估分更准 (MSE)
-                # - Entropy Loss: 鼓励探索，防止生成器退化成只会出一种题
+                # - Entropy Loss: 鼓励探索，防止生成器退化成只会出一种题 (Increased to 0.8 to break collapse)
                 loss_policy = -torch.min(surr1, surr2).mean()
                 loss_value = 0.5 * self.mse(value, rewards)
-                loss_entropy = -0.05 * entropy.mean()
+                loss_entropy = -0.8 * entropy.mean()
 
                 total_loss = loss_policy + loss_value + loss_entropy
                 

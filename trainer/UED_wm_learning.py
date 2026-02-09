@@ -200,6 +200,11 @@ def adversarial_ued_training(cfg: DictConfig):
         "target_task12.txt",
         "target_task13.txt",
         "target_task14.txt",
+        "target_task15.txt",
+        "target_task16.txt",
+        "target_task17.txt",
+        "target_task18.txt",
+        "target_task19.txt",
     ]
 
     target_files = [
@@ -284,6 +289,14 @@ def adversarial_ued_training(cfg: DictConfig):
         # [MODIFIED] Warmup Logic: Freeze World Model during warmup.
         # Only start training WM after warmup_iterations.
         is_warmup = (iteration < warmup_iterations)
+        
+        # [NEW] Transition Handling: Clear Diversity Archive when warmup ends
+        # This ensures the agent's strategic diversity is measured against its own history,
+        # not the random noise maps from the warmup phase.
+        if iteration == warmup_iterations:
+             print(f"[System] Iter {iteration}: Warmup ended. Clearing Diversity Archive and Elite Buffer for fresh exploration.")
+             gen_interface.diversity.archive.clear()
+             gen_interface.elite_buffer.clear()
         
         if (not is_warmup) and (iteration % wm_train_frequency == 0):
             print("[World Model] Retraining on current + replay data...")
@@ -397,13 +410,6 @@ def adversarial_ued_training(cfg: DictConfig):
         target_mean_loss = 0.0
         target_max_loss = 0.0
         target_std_loss = 0.0
-        # --------------------------------------------------------
-        # Step 5: 验证与日志 (Validation on Target Tasks)
-        # --------------------------------------------------------
-        target_mean_loss = 0.0
-        target_max_loss = 0.0
-        target_std_loss = 0.0
-        
         # [MODIFIED] Validation Logic:
         # 1. Warmup: Skip validation to save time (except the very last warmup step to establish baseline).
         # 2. Training: Validate every step to track progress closely.
@@ -434,6 +440,7 @@ def adversarial_ued_training(cfg: DictConfig):
                     phase_name=f"Iter_{iteration}",
                     VALID_TIMES=1
                 )
+                
                 if t_loss is not None:
                      avg_losses.append(t_loss)
             

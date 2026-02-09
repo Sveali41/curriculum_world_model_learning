@@ -320,25 +320,16 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
     cfg.attention_model.data_dir = os.path.join(data_save_dir, target_file)
 
     losses = []
-    weighted_losses = []
 
     for v in range(VALID_TIMES):
         val_result, _, model = AttentionWM_training.train_api(cfg, net, old_params, None)
         
-        # 1. Standard Loss (usually MSE)
-        loss_val = float(val_result[0]['avg_val_loss_wm'])
-        losses.append(loss_val)
-        
-        # 2. Weighted Loss (if available)
-        # Check keys just in case
-        res_dict = val_result[0]
-        if 'avg_val_loss_wm_weighted' in res_dict:
-            w_loss = float(res_dict['avg_val_loss_wm_weighted'])
+        if 'avg_val_loss_wm' in val_result[0]:
+             loss_val = float(val_result[0]['avg_val_loss_wm'])
         else:
-             # Fallback: same as normal loss
-            w_loss = loss_val
-            
-        weighted_losses.append(w_loss)
+             loss_val = 0.0 # Fallback
+        
+        losses.append(loss_val)
 
         del model
         torch.cuda.empty_cache()

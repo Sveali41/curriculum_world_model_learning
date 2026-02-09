@@ -250,7 +250,7 @@ class PCGSeeder:
                 else:
                     grid[i, j] = (
                         WALL
-                        if random.random() < random.random()
+                        if random.random() < 0.15
                         else EMPTY
                     )
         return grid
