@@ -37,6 +37,7 @@ env:
 
 # 3. attension model
 attention_model:
+  domain_type: crafter
   env_type: empty # empty means empty only wall in preprocess no info for keys, lava/door/key/wall/norm
   data_type: discrete # 'norm' or 'discrete'  # 这两种类型效果都还不错 20250213
   model_type: Attention       # Attention, Embedding, MLP

@@ -13,6 +13,7 @@ from omegaconf import DictConfig, OmegaConf
 from modelBased.world_model import AttentionWM_support
 from modelBased.world_model import Embedding_support
 from modelBased.world_model import MLP_support
+from domain.minigrid import minigrid_support as minigrid_utils
 import wandb
 from modelBased.policy_training.PPO import preprocess_observation 
 import time
@@ -91,8 +92,8 @@ def find_position(array, target):
         return None
 
 def process_data(state, maks_size):
-    agent_postion_yx = utils.get_agent_position(state)
-    state_masked = utils.extract_masked_state(state, maks_size, agent_postion_yx) 
+    agent_postion_yx = minigrid_utils.get_agent_position(state)
+    state_masked = minigrid_utils.extract_masked_state(state, maks_size, agent_postion_yx) 
     return state_masked
 
 def evaluate_policy(policy, env, episodes, obs_norm_values):
@@ -102,14 +103,14 @@ def evaluate_policy(policy, env, episodes, obs_norm_values):
     total_reward = 0
     for _ in range(episodes):
         obs = env.reset()[0]['image']
-        state = utils.ColRowCanl_to_CanlRowCol(obs)
+        state = minigrid_utils.ColRowCanl_to_CanlRowCol(obs)
         done = False
         ep_reward = 0
         for _ in range(env.max_steps):
             state_tensor = torch.tensor(utils.normalize_obs(state, obs_norm_values)).to(device)
             action, _, _, _, _ = policy.select_action(state_tensor.flatten())
             obs, reward, done, _, _ = env.step(action)
-            state = utils.ColRowCanl_to_CanlRowCol(obs['image'])
+            state = minigrid_utils.ColRowCanl_to_CanlRowCol(obs['image'])
             ep_reward += reward
             if done:
                 break
@@ -212,7 +213,7 @@ def run_ppo_wm(cfg):
     # training_agent()
 
     if visualize_flag:
-        visualize = utils.Visualization(hparams_world_model)
+        visualize = minigrid_utils.Visualization(hparams_world_model)
     # 3. Real environment
     env = FullyObsWrapper(
         CustomMiniGridEnv(txt_file_path=env_path, custom_mission="Find the key and open the door.",
@@ -256,7 +257,7 @@ def run_ppo_wm(cfg):
         if time_step == 0 and sub_run is not None:
             img = env.get_frame()
             sub_run.log({"final_tasks": wandb.Image(img)})
-        state_0 = utils.ColRowCanl_to_CanlRowCol(state_init)
+        state_0 = minigrid_utils.ColRowCanl_to_CanlRowCol(state_init)
         goal_position_yx = find_position(state_0, (8, 1, 0)) # find the goal position
         current_ep_reward = 0
         info = {'carrying_key': False}
@@ -282,14 +283,21 @@ def run_ppo_wm(cfg):
             # denorm the state
             # state_pre_denorm = utils.denormalize_obj(state_pre, hparams_world_model.obs_norm_values)
 
-            state_pre_masked = utils.map_obs_to_nearest_value(state_pre_masked, 
-                                                              hparams_world_model.valid_values_obj,
-                                                              hparams_world_model.valid_values_color,
-                                                              hparams_world_model.valid_values_state)
+            state_pre_masked = minigrid_utils.map_obs_to_nearest_value(
+                state_pre_masked,
+                hparams_world_model.valid_values_obj,
+                hparams_world_model.valid_values_color,
+                hparams_world_model.valid_values_state,
+            )
 
             info = add_object_to_inventory((state_pre_masked - state_masked), info)
-            agent_postion_yx = utils.get_agent_position(state_0)
-            state_pre = utils.put_back_masked_state(state_pre_masked, state_0, hparams_world_model.attention_mask_size, agent_postion_yx)
+            agent_postion_yx = minigrid_utils.get_agent_position(state_0)
+            state_pre = minigrid_utils.put_back_masked_state(
+                state_pre_masked,
+                state_0,
+                hparams_world_model.attention_mask_size,
+                agent_postion_yx,
+            )
             
 
                 

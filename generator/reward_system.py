@@ -96,12 +96,15 @@ def check_solvability(grid_obj_np):
 # 2. 多样性打分 (Diversity - RND + Archive)
 # ==========================================
 class DiversityModule(nn.Module):
-    def __init__(self, input_h=15, input_w=15, k=10, max_archive_size=1000, device='cuda'):
+    def __init__(self, input_h=15, input_w=15, k=10, max_archive_size=1000, device=None):
         super().__init__()
         self.k = k
         self.max_size = max_archive_size
         self.archive = [] 
-        self.device = device
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
         
         # === 1. 定义 One-Hot 的类别数 ===
         # Minigrid 通常 Object ID 最大约 11-13，Color ID 最大约 6
@@ -122,7 +125,7 @@ class DiversityModule(nn.Module):
             nn.Flatten(),
             # 展平后维度: 32 * H * W
             nn.Linear(32 * input_h * input_w, 64) 
-        ).to(device)
+        ).to(self.device)
 
         # [NEW] Orthogonal Initialization for better feature extraction sensitivity
         for m in self.encoder:

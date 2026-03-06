@@ -1,20 +1,21 @@
-import pytorch_lightning as pl
-from torch.utils.data import DataLoader, Dataset
 import sys
 sys.path.append('/home/siyao/project/rlPractice/MiniGrid')
-from modelBased.common.utils import get_env, normalize_obs
-from typing import Tuple, List, Any, Dict, Optional
-# import src.env.run_env_save as env_run_save
 import torch
-from modelBased.common import utils
-from func_timeout import func_set_timeout
 import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
-from typing import Optional
-from func_timeout import func_set_timeout  # Ensure you have this package
+from torch.utils.data import Dataset, DataLoader
+from typing import Dict, Optional
+from modelBased.common.utils import get_env, normalize_obs
 from modelBased.common.utils import merge_data_dicts
+
+try:
+    from func_timeout import func_set_timeout
+except ImportError:
+    # Fallback when func_timeout is not installed: keep behavior without timeout enforcement.
+    def func_set_timeout(_seconds):
+        def decorator(fn):
+            return fn
+        return decorator
 
 
 def extract_agent_cross_mask(state):

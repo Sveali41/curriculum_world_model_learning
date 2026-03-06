@@ -1,6 +1,9 @@
+import sys
+import os
+ROOT_DIR =os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(ROOT_DIR)
 import hydra
 from omegaconf import DictConfig, open_dict
-import os
 import torch
 import glob
 import torch
@@ -134,23 +137,26 @@ def adversarial_ued_training(cfg: DictConfig):
     data_save_dir = TRAINER_PATH / "data"
 
     # === 初始化 Summary CSV ===
-    with open(summary_csv_path, mode='w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "Iter", 
-            "Gen_Mean_Reward",  # Initial Difficulty (Proxy)
-            "Gen_Real_Loss",    # [NEW] Raw Loss on generated maps (Unscaled)
-            "Gen_Loss", 
-            "Gen_Entropy",      # [NEW] Policy Entropy for debugging convergence
-            "Gen_Div_Reward",   # [NEW] Diversity Reward
-            "WM_Val_Loss",      # Target Tasks Mean (MSE or Weighted based on cfg)
-            "WM_Val_Max",       # [NEW] Worst-case Capability
-            "WM_Val_Std",       # [NEW] Stability
-            "New_Data_Size",
-            "Buffer_Size",
-            "Solvable_Count",  # [MODIFIED] Rate -> Count
-            "Avg_Path_Len"     # [NEW]
-        ])
+    # Only write header if the CSV does not already exist so multiple seed runs append to the same file
+    if not summary_csv_path.exists():
+        with open(summary_csv_path, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "Seed",
+                "Iter", 
+                "Gen_Mean_Reward",  # Initial Difficulty (Proxy)
+                "Gen_Real_Loss",    # [NEW] Raw Loss on generated maps (Unscaled)
+                "Gen_Loss", 
+                "Gen_Entropy",      # [NEW] Policy Entropy for debugging convergence
+                "Gen_Div_Reward",   # [NEW] Diversity Reward
+                "WM_Val_Loss",      # Target Tasks Mean (MSE or Weighted based on cfg)
+                "WM_Val_Max",       # [NEW] Worst-case Capability
+                "WM_Val_Std",       # [NEW] Stability
+                "New_Data_Size",
+                "Buffer_Size",
+                "Solvable_Count",  # [MODIFIED] Rate -> Count
+                "Avg_Path_Len"     # [NEW]
+            ])
     print(f"[Logger] Experiment summary will be saved to {summary_csv_path}")
     
     # === Set default mini_dataset_size for data collection ===
@@ -465,6 +471,7 @@ def adversarial_ued_training(cfg: DictConfig):
                 with open(summary_csv_path, mode='a', newline='') as f:
                     writer = csv.writer(f)
                     writer.writerow([
+                        seed,
                         iteration + 1,
                         f"{gen_mean_reward:.4f}",
                         f"{gen_raw_loss:.6f}",
@@ -500,5 +507,42 @@ def adversarial_ued_training(cfg: DictConfig):
     print(">>> UED Adversarial Training Finished.")
 
 
+@hydra.main(
+    version_base=None,
+    config_path=str(TRAINER_PATH / "conf"),
+    config_name="config_UED",
+)
+def adversarial_ued_training_wrapper(cfg: DictConfig):
+    """Wrapper for running a single seed"""
+    adversarial_ued_training(cfg)
+
+
 if __name__ == "__main__":
-    adversarial_ued_training()
+
+    NUM_SEEDS = 5
+    ABLATION_TYPES = ["no_diversity"]
+
+    print(f"\n[Main] 将运行 {len(ABLATION_TYPES)} 个 ablation × {NUM_SEEDS} 个 seeds...\n")
+
+    for ab_type in ABLATION_TYPES:
+
+        print(f"\n{'#'*80}")
+        print(f"[Main] Ablation: {ab_type}")
+        print(f"{'#'*80}\n")
+
+        for seed_idx in range(NUM_SEEDS):
+
+            print(f"\n{'='*70}")
+            print(f"[Main] Ablation={ab_type} | Seed {seed_idx + 1}/{NUM_SEEDS}")
+            print(f"{'='*70}\n")
+
+            # 重新构造命令行参数传给 Hydra
+            sys.argv = [
+                'UED_wm_learning.py',
+                f'seed={seed_idx}',
+                f'ablation.type={ab_type}'
+            ]
+
+            adversarial_ued_training_wrapper()
+
+    print(f"\n[Main] ✓ 所有 ablation × seeds 运行完成！")

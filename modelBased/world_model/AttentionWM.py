@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from typing import List, Dict, Union
 from modelBased.common import utils
+from domain.minigrid import minigrid_support as minigrid_utils
 from . import AttentionWM_support
 from . import Embedding_support
 from . import MLP_support
@@ -64,7 +65,7 @@ class AttentionWorldModel(pl.LightningModule):
         if hparams.freeze_weight:
             utils.load_model_weight(self.model, hparams.model_save_path)
         self.loss = nn.MSELoss() # nn.SmoothL1Loss()
-        self.visual_func = utils.Visualization(hparams)
+        self.visual_func = minigrid_utils.Visualization(hparams)
         self.save_hyperparameters(hparams)
 
 
@@ -574,9 +575,9 @@ class AttentionWorldModel(pl.LightningModule):
             info = None
         
 
-        agent_postion_yx_batch = utils.get_agent_position(obs)
-        obs_masked = utils.extract_masked_state(obs, self.mask_size, agent_postion_yx_batch)
-        obs_next_masked = utils.extract_masked_state(obs_next, self.mask_size, agent_postion_yx_batch)
+        agent_postion_yx_batch = minigrid_utils.get_agent_position(obs)
+        obs_masked = minigrid_utils.extract_masked_state(obs, self.mask_size, agent_postion_yx_batch)
+        obs_next_masked = minigrid_utils.extract_masked_state(obs_next, self.mask_size, agent_postion_yx_batch)
 
         # extract positions where objects are located
         object_map = obs_masked[:, 0]  # 取第0通道 (B,H,W)
@@ -777,6 +778,5 @@ class AttentionWorldModel(pl.LightningModule):
 
 
    
-
 
 

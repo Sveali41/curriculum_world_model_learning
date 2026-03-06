@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from typing import List, Dict, Tuple
-from modelBased.common import utils
+from domain.minigrid import minigrid_support as minigrid_utils
 import random
 import os
 
@@ -31,10 +31,10 @@ class FisherReplayBuffer:
                 info = torch.tensor(samples['info']).to(device).float()
             else:
                 info = None
-            agent_postion_yx_batch = utils.get_agent_position(obs)
-            agent_postion_yx_batch_next = utils.get_agent_position(obs_next)
-            obs_masked = utils.extract_masked_state(obs, self.mask_size, agent_postion_yx_batch)
-            obs_next_masked = utils.extract_masked_state(obs_next, self.mask_size, agent_postion_yx_batch_next)
+            agent_postion_yx_batch = minigrid_utils.get_agent_position(obs)
+            agent_postion_yx_batch_next = minigrid_utils.get_agent_position(obs_next)
+            obs_masked = minigrid_utils.extract_masked_state(obs, self.mask_size, agent_postion_yx_batch)
+            obs_next_masked = minigrid_utils.extract_masked_state(obs_next, self.mask_size, agent_postion_yx_batch_next)
             pred, _ = model(obs_masked, act, info)
             loss = [F.mse_loss(pred[i], obs_next_masked[i]).item() for i in range(len(pred))]
 

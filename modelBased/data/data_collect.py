@@ -1,7 +1,12 @@
 import sys
 sys.path.append('/home/siyao/project/rlPractice/MiniGrid/modelBased')
-from ..common.utils import normalize_obs, ColRowCanl_to_CanlRowCol, WORLD_MODEL_PATH, PROJECT_ROOT, Visualization
-from domain.minigrid_custom_env import *
+from ..common.utils import normalize_obs, WORLD_MODEL_PATH, PROJECT_ROOT
+from domain.minigrid.minigrid_support import (
+    ColRowCanl_to_CanlRowCol,
+    Visualization,
+    get_agent_position,
+)
+from domain.minigrid.minigrid_custom_env import *
 from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -16,7 +21,6 @@ import numpy as np
 from multiprocessing import Pool, get_context
 import copy
 from matplotlib import pyplot as plt
-from modelBased.common import utils
 
 def visualize_env(env, cfg: DictConfig, save_img=False):
     env.reset()[0]
@@ -669,7 +673,7 @@ def uniformize_dataset_by_position(obs, obs_next, act, rew, done, info):
     """
     from collections import defaultdict
     obs_trans = obs.transpose(0, 3, 1, 2)
-    positions = utils.get_agent_position(obs_trans)
+    positions = get_agent_position(obs_trans)
     buckets = defaultdict(list)
     for i, pos in enumerate(positions):
         key = tuple(pos)
@@ -1045,7 +1049,7 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
     # 如果是 (N, H, W, C) 则转换，否则保持不变
     if obs_np.shape[1] not in [3, 4, 5]:  # 通道数异常 -> 应该是放在最后
         obs_np = np.moveaxis(obs_np, -1, 1)
-    positions = utils.get_agent_position(obs_np)  # (N, 2)
+    positions = get_agent_position(obs_np)  # (N, 2)
 
     # 自动推断地图大小
     if isinstance(obs_np, torch.Tensor):

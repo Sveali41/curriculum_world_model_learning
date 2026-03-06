@@ -4,12 +4,12 @@ import pandas as pd
 import gym
 import hydra
 import imageio  # Import imageio to save GIFs
-from modelBased.common.utils import PROJECT_ROOT, normalize_obs, map_obs_to_nearest_value
+from modelBased.common.utils import PROJECT_ROOT, normalize_obs
 from modelBased.policy_training.PPO import PPO
 from omegaconf import DictConfig, OmegaConf
 from minigrid.wrappers import FullyObsWrapper
 from domain_wrapper.minigrid_custom_env import *
-from modelBased.common import utils
+from domain.minigrid import minigrid_support as minigrid_utils
 from domain_wrapper.minigrid_custom_env import CustomMiniGridEnv
 
 # Set device to CPU or CUDA
@@ -42,7 +42,7 @@ def validate_policy(cfg):
     checkpoint_path = cfg.PPO.checkpoint_path
     env_type = cfg.PPO.env_type
     obs_norm_values = cfg.attention_model.obs_norm_values
-    visualize_obs = utils.Visualization(cfg.attention_model)
+    visualize_obs = minigrid_utils.Visualization(cfg.attention_model)
     visualize_flag = cfg.PPO.visualize
     env_path = cfg.PPO.env_path
     # save experiment results
@@ -82,7 +82,7 @@ def validate_policy(cfg):
     for ep in range(1, total_test_episodes + 1):
         ep_reward = 0
         state_init = env.reset()[0]['image']
-        state = utils.ColRowCanl_to_CanlRowCol(state_init)
+        state = minigrid_utils.ColRowCanl_to_CanlRowCol(state_init)
         
         frames = []  # Store frames for the GIF
 
@@ -102,7 +102,7 @@ def validate_policy(cfg):
             action = action.item()
             state_next, reward, done, trunc, _ = env.step(action)
             ep_reward += reward
-            state_next = utils.ColRowCanl_to_CanlRowCol(state_next['image'])
+            state_next = minigrid_utils.ColRowCanl_to_CanlRowCol(state_next['image'])
 
             # Save frames for the GIF
             if save_gif:

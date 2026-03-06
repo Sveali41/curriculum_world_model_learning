@@ -9,6 +9,7 @@ from omegaconf import DictConfig
 import hydra
 from datetime import datetime
 from common import utils
+from domain.minigrid import minigrid_support as minigrid_utils
 import modelBased.world_model.AttentionWM_support as AttentionWM_support
 import modelBased.world_model.Embedding_support as Embedding_support
 import modelBased.world_model.MLP_support as MLP_support
@@ -46,13 +47,18 @@ class GraphPlanner:
                 )
             delta_np = delta.squeeze(0).cpu().numpy()
             next_masked = masked + delta_np
-            next_masked = utils.map_obs_to_nearest_value(
+            next_masked = minigrid_utils.map_obs_to_nearest_value(
                 next_masked,
                 self.valid_values_obj,
                 self.valid_values_color,
                 self.valid_values_state
             )
-            next_full = utils.put_back_masked_state(next_masked, full_obs.copy(), self.mask_size, utils.get_agent_position(full_obs))
+            next_full = minigrid_utils.put_back_masked_state(
+                next_masked,
+                full_obs.copy(),
+                self.mask_size,
+                minigrid_utils.get_agent_position(full_obs),
+            )
             self.G.add_edge(
                 key,
                 self._state_key(next_full),
@@ -124,11 +130,11 @@ def run_planner_rollout(cfg: DictConfig):
 
     while time_step < max_steps:
         full_obs = env.reset()[0]['image']
-        state_0 = utils.ColRowCanl_to_CanlRowCol(full_obs)
+        state_0 = minigrid_utils.ColRowCanl_to_CanlRowCol(full_obs)
         goal_yx = find_position(state_0, (8, 1, 0))
         goal_obs = state_0.copy()
 
-        agent_yx = utils.get_agent_position(goal_obs)
+        agent_yx = minigrid_utils.get_agent_position(goal_obs)
         goal_obs[:, agent_yx[0], agent_yx[1]] = np.array([0, 0, 0], dtype=goal_obs.dtype)
         goal_obs[:, goal_yx[0], goal_yx[1]] = np.array([10, 0, 0], dtype=goal_obs.dtype)
 
@@ -147,15 +153,20 @@ def run_planner_rollout(cfg: DictConfig):
                 delta, _ = model(masked.unsqueeze(0).to(device), action, info)
             delta_np = delta.squeeze(0).cpu().numpy()
             next_masked = masked + delta_np
-            next_masked = utils.map_obs_to_nearest_value(
+            next_masked = minigrid_utils.map_obs_to_nearest_value(
                 next_masked,
                 hparams_wm.valid_values_obj,
                 hparams_wm.valid_values_color,
                 hparams_wm.valid_values_state
             )
             info = add_object_to_inventory((next_masked - masked), info)
-            agent_pos = utils.get_agent_position(state_0)
-            state_0 = utils.put_back_masked_state(next_masked, state_0, hparams_wm.attention_mask_size, agent_pos)
+            agent_pos = minigrid_utils.get_agent_position(state_0)
+            state_0 = minigrid_utils.put_back_masked_state(
+                next_masked,
+                state_0,
+                hparams_wm.attention_mask_size,
+                agent_pos,
+            )
 
             time_step += 1
             if time_step >= max_steps:

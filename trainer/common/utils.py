@@ -3,8 +3,12 @@ import os
 import random
 import numpy as np
 import torch
-from modelBased.common.utils import TRAINER_PATH, extract_unique_patches, generate_minitasks_until_covered
-from domain.minigrid_custom_env import CustomMiniGridEnv
+from modelBased.common.utils import TRAINER_PATH
+from domain.minigrid.minigrid_support import (
+    extract_unique_patches,
+    generate_minitasks_until_covered,
+)
+from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
 from modelBased.data.data_collect import visualize_agent_coverage, visualize_saved_dataset
 from modelBased.common.support import Support
 from minigrid.wrappers import FullyObsWrapper

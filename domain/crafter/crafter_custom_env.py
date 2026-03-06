@@ -275,15 +275,41 @@ class CustomCrafterEnv(gym.Env):
 
     metadata = {"render.modes": ["human", "rgb_array"]}
 
-    def __init__(self, layout_str, seed=0):
+    def __init__(
+            self,
+            txt_file_path=None,
+            layout_str=None,
+            color_str=None,
+            size=None,
+            agent_start_pos=None,
+            agent_start_dir=None,
+            custom_mission="Explore and craft.",
+            max_steps=None,
+            seed=0,
+            **kwargs,
+    ):
         super().__init__()
         import crafter.worldgen
         # Disable default random world generation
         crafter.worldgen.generate_world = lambda world, player: None
 
         self.seed = seed
+        self.txt_file_path = txt_file_path
+        self.layout_str = layout_str
+        self.max_steps = max_steps or 10000
+        self.current_step = 0
+        
+        # ========== Alignment: Parse Layout Input ==========
+        if self.txt_file_path:
+            with open(self.txt_file_path, 'r') as file:
+                sections = file.read().split('\n\n')
+                self.layout_str = sections[0].strip()
+        elif not self.layout_str:
+            # Fallback tiny map if nothing is provided
+            self.layout_str = "GGGGGGG\nGGGGGGG\nGGGPGGG\nGGGGGGG\nGGGGGGG"
+            
         self.char_grid = np.array(
-            [list(line.strip()) for line in layout_str.strip().split("\n") if line.strip()]
+            [list(line.strip()) for line in self.layout_str.strip().split("\n") if line.strip()]
         )
 
         # Initialize native Crafter environment
@@ -296,8 +322,47 @@ class CustomCrafterEnv(gym.Env):
 
         # Define action/observation space
         self.action_space = self.env.action_space
-        self.observation_space = spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8)
+        self.observation_space = spaces.Dict({
+            "image": spaces.Box(low=0, high=255, shape=(64, 64, 2), dtype=np.int32),
+            "inventory": spaces.Box(low=0.0, high=100.0, shape=(16,), dtype=np.float32)
+        })
         self.ai_enabled = False
+
+    def _extract_obs(self):
+        # 替换 RGB Image，直接调用原生符号化提取 (H, W, 2)
+        symbolic_grid = extract_tensor_grid(self.env)
+        player = self.env._player
+        
+        # 提取四大生理属性 + 十二种物品背包数量 (总计 16 维)
+        inv_list = [
+            float(player.health), 
+            float(player.inventory.get('food', 0)), 
+            float(player.inventory.get('drink', 0)), 
+            float(player.inventory.get('energy', 0)),
+            float(player.inventory.get('wood', 0)), float(player.inventory.get('stone', 0)),
+            float(player.inventory.get('coal', 0)), float(player.inventory.get('iron', 0)),
+            float(player.inventory.get('diamond', 0)), float(player.inventory.get('sapling', 0)),
+            float(player.inventory.get('wood_pickaxe', 0)), float(player.inventory.get('stone_pickaxe', 0)),
+            float(player.inventory.get('iron_pickaxe', 0)), float(player.inventory.get('wood_sword', 0)),
+            float(player.inventory.get('stone_sword', 0)), float(player.inventory.get('iron_sword', 0))
+        ]
+        
+        return {
+            "image": symbolic_grid,
+            "inventory": np.array(inv_list, dtype=np.float32)
+        }
+
+    def get_agent_position(self, obs=None):
+        """
+        Return the exact (y, x) position of the player in the Crafter environment.
+        In Crafter, coordinates are usually (x, y) but we return (y, x) to match 
+        the standard MiniGrid array convention.
+        """
+        if getattr(self, "env", None) and getattr(self.env, "_player", None):
+            pos = self.env._player.pos
+            # Crafter pos is typically [x, y], we return (y, x)
+            return np.array([int(pos[1]), int(pos[0])])
+        return np.array([-1, -1])
 
     # --------------------------------------------------------
     # Reset / Step / Render
@@ -322,8 +387,8 @@ class CustomCrafterEnv(gym.Env):
             self.env._textures, [view_h, item_rows]
         )
 
-        obs = self.env._obs()
-        return obs, {}
+        self.current_step = 0
+        return self._extract_obs(), {}
 
     def step(self, action):
         """
@@ -353,16 +418,17 @@ class CustomCrafterEnv(gym.Env):
             self.env._update_time()
 
         # --- 4. Get the new observation ---
-        obs = self.env._obs()
+        obs = self._extract_obs()
 
         # --- 5. Return standard Gym-style outputs ---
-        # Reward and done are dummy values since Crafter’s reward system
-        # is not used for World Model training.
+        self.current_step += 1
+        
+        # 触发 done 的条件：耗尽步数或玩家死亡
         reward = 0.0
-        done = False
+        done = (self.current_step >= self.max_steps) or (self.env._player.health <= 0)
         info = {}
 
-        return obs, reward, done, info
+        return obs, reward, done, False, info
 
 
     def render(self, mode="rgb_array"):
@@ -385,14 +451,14 @@ if __name__ == "__main__":
     GGIIGGG
     GGAGGGW
     GKGGGTG
-    RGGPGGI
+    RGOPGGI
     GWGGGGG
     GKGGGTG
     GWGGGGG
     """
 
     # --- 1. Create a custom environment from the layout string ---
-    base_env = CustomCrafterEnv(layout_str, seed=0)
+    base_env = CustomCrafterEnv(layout_str=layout_str, seed=0)
     base_env.ai_enabled = False  # keep deterministic (disable Cow/Zombie auto-movement)
 
     # --- 2. Reset the environment ---
@@ -429,20 +495,21 @@ if __name__ == "__main__":
         action_id = base_env.action_space.sample()
         action_name = action_names[action_id] if action_id < len(action_names) else str(action_id)
 
-        obs, reward, done, info = base_env.step(action_id)
+        obs, reward, done, trunc, info = base_env.step(action_id)
 
         # --- Extract symbolic grid representation ---
-        symbolic_obs = extract_tensor_grid(base_env.env)
+        symbolic_obs = obs['image']
+        inv_obs = obs['inventory']
+
         rgb = base_env.render(mode="rgb_array")
 
         # --- Print debug info ---
         print(f"\n=== Step {i} ===")
         print(f"Action ID: {action_id}  →  {action_name}")
-        print("Object layer:")
-        print(symbolic_obs[..., 0])
-        print("Direction layer:")
-        print(symbolic_obs[..., 1])
+        print("Object layer:", symbolic_obs[..., 0])
+        print("Direction layer:", symbolic_obs[..., 1])
         print("Symbolic obs shape:", symbolic_obs.shape)
+        print("Inventory obs shape & content:", inv_obs.shape, "\n", inv_obs)
 
         # --- Visualize RGB frame ---
         plt.imshow(rgb)

@@ -61,18 +61,24 @@ class GeneratorPPO:
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         # === Optimizer (encoder + policy) ===
-        self.optimizer = optim.Adam(
-            [
-                {"params": self.encoder.parameters(), "lr": lr_actor},
-                {"params": self.policy.stem.parameters(), "lr": lr_actor},
-                {"params": self.policy.res_blocks.parameters(), "lr": lr_actor},
-                {"params": self.policy.emb_obj.parameters(), "lr": lr_actor},
-                {"params": self.policy.emb_color.parameters(), "lr": lr_actor},
-                {"params": self.policy.emb_state.parameters(), "lr": lr_actor},
-                {"params": self.policy.actor.parameters(), "lr": lr_actor},
-                {"params": self.policy.critic.parameters(), "lr": lr_critic},
-            ]
-        )
+        optim_params = []
+
+        if self.encoder is not None:
+            optim_params.append(
+                {"params": self.encoder.parameters(), "lr": lr_actor}
+            )
+
+        optim_params += [
+            {"params": self.policy.stem.parameters(), "lr": lr_actor},
+            {"params": self.policy.res_blocks.parameters(), "lr": lr_actor},
+            {"params": self.policy.emb_obj.parameters(), "lr": lr_actor},
+            {"params": self.policy.emb_color.parameters(), "lr": lr_actor},
+            {"params": self.policy.emb_state.parameters(), "lr": lr_actor},
+            {"params": self.policy.actor.parameters(), "lr": lr_actor},
+            {"params": self.policy.critic.parameters(), "lr": lr_critic},
+        ]
+
+        self.optimizer = optim.Adam(optim_params)
 
         self.mse = nn.MSELoss()
 
@@ -171,12 +177,18 @@ class GeneratorPPO:
 
         B = base_map.size(0)
 
-        if prev_data is None:
-            global_ctx = torch.zeros(1, self.context_dim, device=device)
+        if self.encoder is None:   # no_history ablation
+            ctx = None
+            global_ctx = None
         else:
-            global_ctx = self._compute_global_context(*prev_data, self.top_k_features)  # [1, D]
-
-        ctx = global_ctx.repeat(B, 1) # the context for each sample in the batch
+            if prev_data is None:
+                global_ctx = torch.zeros(1, self.context_dim, device=device)
+            else:
+                global_ctx = self._compute_global_context(
+                    *prev_data,
+                    self.top_k_features
+                )
+            ctx = global_ctx.repeat(B, 1)
 
         action, logprob_map, value, topk_mask = self.policy_old.act(
             base_map, ctx, mask, max_edits
@@ -287,14 +299,16 @@ class GeneratorPPO:
                 
                 # 核心改动：调用统一的聚合函数，建立从奖励到 Encoder 参数的梯度链路
                 # 这样更新过程不仅优化了 Policy (MapEditor)，也同时进化了 HistoryEncoder
-                global_ctx = self._compute_global_context(
-                    prev_map, 
-                    prev_heat, 
-                    top_k_features=16  # 保持与采样时一致的参数
-                )
-                
-                # 广播上下文到当前 Batch 的每一行
-                ctx = global_ctx.repeat(curr_map.size(0), 1)
+                if self.encoder is None:
+                    ctx = None
+                else:
+                    global_ctx = self._compute_global_context(
+                        prev_map,
+                        prev_heat,
+                        top_k_features=16
+                    )
+                    ctx = global_ctx.repeat(curr_map.size(0), 1)
+
 
                 # 评估当前最新策略下的动作概率和价值
                 logprob_map, value, entropy = self.policy.evaluate(
@@ -333,7 +347,10 @@ class GeneratorPPO:
                 
                 # 同时裁剪 Policy 网络和 HistoryEncoder 的梯度，防止梯度爆炸
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
-                torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 0.5)
+
+                if self.encoder is not None:
+                    torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 0.5)
+
                 
                 self.optimizer.step()
 

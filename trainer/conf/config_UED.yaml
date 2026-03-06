@@ -128,7 +128,7 @@ attention_model:
   drift_cooldown: 100
   
 generator_agent:
-  total_iterations: 100
+  total_iterations: 40
   warmup_iterations: 10 # 0 -> 5: Crucial! Force 5 rounds of Random Data to build general foundation.
   wm_train_frequency: 1
   batch_size: 8
@@ -142,4 +142,5 @@ generator_agent:
   use_elites: false
 
 ablation:
-  type: "no_history"  # Options: ["none", "no_diversity", "no_history", "no_validity_reward", "no_learning_progress"]
+  type: "none"  # Options: ["none", "no_diversity", "no_history", "no_validity_reward", "no_learning_progress"]
+seed: 0

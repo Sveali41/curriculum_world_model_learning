@@ -310,6 +310,17 @@ class CustomMiniGridEnv(MiniGridEnv):
         index = np.random.randint(0, len(empty_positions))
         return empty_positions[index]
     
+    def get_agent_position(self, obs=None):
+        """
+        Return the exact (y, x) position of the player in the MiniGrid environment.
+        We return (y, x) so that row corresponds to y and col corresponds to x.
+        """
+        if getattr(self, "agent_pos", None) is not None:
+            # agent_pos is typically (col, row) or (x, y). We return (y, x).
+            x, y = self.agent_pos
+            return np.array([y, x])
+        return np.array([-1, -1])
+    
 
 
 
