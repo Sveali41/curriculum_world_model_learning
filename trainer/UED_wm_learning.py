@@ -518,31 +518,7 @@ def adversarial_ued_training_wrapper(cfg: DictConfig):
 
 
 if __name__ == "__main__":
-
-    NUM_SEEDS = 5
-    ABLATION_TYPES = ["no_diversity"]
-
-    print(f"\n[Main] 将运行 {len(ABLATION_TYPES)} 个 ablation × {NUM_SEEDS} 个 seeds...\n")
-
-    for ab_type in ABLATION_TYPES:
-
-        print(f"\n{'#'*80}")
-        print(f"[Main] Ablation: {ab_type}")
-        print(f"{'#'*80}\n")
-
-        for seed_idx in range(NUM_SEEDS):
-
-            print(f"\n{'='*70}")
-            print(f"[Main] Ablation={ab_type} | Seed {seed_idx + 1}/{NUM_SEEDS}")
-            print(f"{'='*70}\n")
-
-            # 重新构造命令行参数传给 Hydra
-            sys.argv = [
-                'UED_wm_learning.py',
-                f'seed={seed_idx}',
-                f'ablation.type={ab_type}'
-            ]
-
-            adversarial_ued_training_wrapper()
-
-    print(f"\n[Main] ✓ 所有 ablation × seeds 运行完成！")
+    # 默认直接运行，Hydra 会自动从 config_UED.yaml 读取配置（包括 ablation 和 seed）。
+    # 如果需要运行多个 seed 或 ablation，可以使用 Hydra 的 multirun 功能：
+    # python UED_wm_learning.py -m seed=0,1,2 ablation.type=none,no_diversity
+    adversarial_ued_training_wrapper()

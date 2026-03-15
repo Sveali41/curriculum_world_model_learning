@@ -129,7 +129,7 @@ attention_model:
   
 generator_agent:
   total_iterations: 40
-  warmup_iterations: 10 # 0 -> 5: Crucial! Force 5 rounds of Random Data to build general foundation.
+  warmup_iterations: 0 # 0 -> 5: Crucial! Force 5 rounds of Random Data to build general foundation.
   wm_train_frequency: 1
   batch_size: 8
   map_height: 8
@@ -140,6 +140,7 @@ generator_agent:
   ctx_top_k_features: 16
   div_k: 10
   use_elites: false
+  episodes_per_env: 20 # Number of episodes to collect from EACH generated map (default 1 for UED speed)
 
 ablation:
   type: "none"  # Options: ["none", "no_diversity", "no_history", "no_validity_reward", "no_learning_progress"]

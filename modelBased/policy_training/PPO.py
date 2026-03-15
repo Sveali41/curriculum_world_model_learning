@@ -7,7 +7,7 @@ import torch.nn as nn
 from torch.distributions import MultivariateNormal
 from torch.distributions import Categorical
 import numpy as np
-from domain.minigrid_custom_env import CustomMiniGridEnv
+from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
 from minigrid.wrappers import FullyObsWrapper
 import random
 

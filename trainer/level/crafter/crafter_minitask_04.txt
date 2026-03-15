@@ -1,0 +1,7 @@
+GGCCGG
+GGAGGG
+GGCCGG
+
+# --- Minitask 04: Coal Mining ---
+health: 9
+wood_pickaxe: 1

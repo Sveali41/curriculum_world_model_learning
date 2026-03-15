@@ -1,0 +1,7 @@
+GGMGGG
+GGAGGO
+GGMGGG
+
+# --- Minitask 06: Diamond/Survival ---
+health: 9
+iron_pickaxe: 1

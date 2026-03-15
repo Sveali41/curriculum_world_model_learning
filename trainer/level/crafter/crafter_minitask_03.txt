@@ -1,0 +1,6 @@
+RRGRRR
+RRARRR
+RRGRRR
+
+# --- Initial Stats ---
+wood_pickaxe: 2

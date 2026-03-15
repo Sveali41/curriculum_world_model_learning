@@ -172,8 +172,9 @@ class FisherReplayBuffer:
         near_mask = torch.zeros(B, dtype=torch.bool, device=obs.device)
 
         for b in range(B):
-            # 直接在 obj_map 中查找值为 10 的位置（agent）
-            agent_pos = (obj_map[b] == 10).nonzero(as_tuple=False)
+            # ID=13 for Crafter player, ID=10 for MiniGrid player
+            player_id = 13 if (obj_map[b] == 13).any() else 10
+            agent_pos = (obj_map[b] == player_id).nonzero(as_tuple=False)
             if agent_pos.numel() == 0:
                 continue
 
@@ -289,8 +290,12 @@ class FisherReplayBuffer:
                 'act': samples['act'][i],
                 'obs_next': samples['obs_next'][i]
             }
-            if 'info' in samples:
+            if 'info' in samples and samples['info'] is not None:
                 item['info'] = samples['info'][i]
+            if 'inv' in samples and samples['inv'] is not None:
+                item['inv'] = samples['inv'][i]
+            if 'inv_next' in samples and samples['inv_next'] is not None:
+                item['inv_next'] = samples['inv_next'][i]
             selected.append(item)
 
         self.buffer.extend(selected)
@@ -321,8 +326,12 @@ class FisherReplayBuffer:
                 'act': data_dict['act'][i],
                 'obs_next': data_dict['obs_next'][i]
             }
-            if 'info' in data_dict:
+            if 'info' in data_dict and data_dict['info'] is not None:
                 sample['info'] = data_dict['info'][i]
+            if 'inv' in data_dict and data_dict['inv'] is not None:
+                sample['inv'] = data_dict['inv'][i]
+            if 'inv_next' in data_dict and data_dict['inv_next'] is not None:
+                sample['inv_next'] = data_dict['inv_next'][i]
             self.buffer.append(sample)
 
     def save_to_file(self, path: str):

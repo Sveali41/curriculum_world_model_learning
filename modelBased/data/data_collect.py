@@ -1,6 +1,9 @@
-import sys
-sys.path.append('/home/siyao/project/rlPractice/MiniGrid/modelBased')
-from ..common.utils import normalize_obs, WORLD_MODEL_PATH, PROJECT_ROOT
+try:
+    # Package import (e.g., `python -m modelBased.data.data_collect`)
+    from ..common.utils import normalize_obs, WORLD_MODEL_PATH, PROJECT_ROOT
+except ImportError:
+    # Script import (e.g., `python modelBased/data/data_collect.py`)
+    from modelBased.common.utils import normalize_obs, WORLD_MODEL_PATH, PROJECT_ROOT
 from domain.minigrid.minigrid_support import (
     ColRowCanl_to_CanlRowCol,
     Visualization,
@@ -285,17 +288,39 @@ def run_env_multiprocess(cfg, wandb_run, policy=None, rmax_exploration=None, sav
         np.concatenate(info_np),
     )
 
-def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_exploration=None, save_img=False):
+def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_exploration=None, save_img=False, randomize_inventory=False):
     device = torch.device('cpu')
     if torch.cuda.is_available():
         device = torch.device('cuda:0')
     obs_list, obs_next_list, act_list, rew_list, done_list, info_list = [], [], [], [], [], []
+    inv_list_cur, inv_list_next = [], []  # Crafter only: inventory (16-dim)
     episodes = 0
     obs = env.reset()[0]
     has_carried_key_this_episode = False  # 新增：本轮是否已经捡过钥匙
     step_in_episode = 0  # 当前 episode 中的 step 计数器
-    task_name = cfg.env.collect.env_type
-    maximum_dataset_size = cfg.env.collect.maximum_dataset_size
+    collect_cfg = cfg.env.collect if hasattr(cfg, "env") else cfg.collect
+    if hasattr(collect_cfg, "env_type") and collect_cfg.env_type:
+        task_name = str(collect_cfg.env_type).lower()
+    elif hasattr(cfg, "env") and hasattr(cfg.env, "env_type"):
+        task_name = str(cfg.env.env_type).lower()
+    else:
+        task_name = ""
+    is_crafter = ("crafter" in task_name)
+    data_type = str(getattr(collect_cfg, "data_type", "")).lower()
+    maximum_dataset_size = getattr(collect_cfg, "maximum_dataset_size", None)
+
+    obs = env.reset()[0]
+    # --- BOOST 1: Randomize the very FIRST episode ---
+    if randomize_inventory and is_crafter:
+        player = env.unwrapped.env._player
+        for stat in ['health', 'food', 'drink', 'energy']:
+            setattr(player, stat, float(np.random.randint(5, 10)))
+        all_possible_items = ['wood', 'stone', 'coal', 'iron', 'diamond', 'sapling', 'wood_pickaxe', 'stone_pickaxe', 'iron_pickaxe', 'wood_sword', 'stone_sword', 'iron_sword']
+        for item in all_possible_items:
+            # 强化高级工具概率 (70% 概率携带)
+            player.inventory[item] = 1.0 if (('pickaxe' in item or 'sword' in item) and np.random.random() < 0.7) else float(np.random.randint(0, 5))
+        # 立即同步观测数据
+        obs = env.unwrapped._extract_obs()
 
 
     if save_img and wandb_run is not None:
@@ -307,27 +332,71 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     # Visit count for RMax or exploration tracking
     visit_count = {}
 
-    if cfg.env.save_visualized_img:
+    if getattr(collect_cfg, "save_env_visualize", False):
         try:
-             img = env.get_frame()
-        except AttributeError:
-             img = env.unwrapped.get_frame()
+            try:
+                img = env.get_frame()
+            except AttributeError:
+                img = env.unwrapped.get_frame()
+        except Exception:
+            if hasattr(env, "render_global"):
+                img = env.render_global()
+            elif hasattr(env.unwrapped, "render_global"):
+                img = env.unwrapped.render_global()
+            else:
+                try:
+                    img = env.render(mode="rgb_array")
+                except Exception:
+                    img = env.render()
+        
         # --- save locally ---
-        os.makedirs(cfg.env.visualize_save_path, exist_ok=True)
-        save_path = os.path.join(cfg.env.visualize_save_path, f"{log_name}_start.png")
+        env_vis_path = getattr(collect_cfg, "env_visualize_save_path", "trainer/logs/env_visualization")
+        os.makedirs(env_vis_path, exist_ok=True)
+        img_filename = getattr(collect_cfg, "env_visualize_filename", f"{log_name}_env.png")
+        save_path = os.path.join(env_vis_path, img_filename)
 
         import matplotlib.pyplot as plt
-        plt.imsave(save_path, img)
+        
+        if is_crafter and isinstance(obs, dict) and 'inventory' in obs:
+            fig, ax = plt.subplots(figsize=(8, 8))
+            ax.imshow(img)
+            ax.axis('off')
+            
+            inv = obs['inventory']
+            inv_labels = ['Health', 'Food', 'Drink', 'Energy', 'Wood', 'Stone', 'Coal', 'Iron', 'Diamond', 'Sapling', 'Wood_Pickaxe', 'Stone_Pickaxe', 'Iron_Pickaxe', 'Wood_Sword', 'Stone_Sword', 'Iron_Sword']
+            items = []
+            for i, val in enumerate(inv):
+                if val > 0 or i < 4:
+                    items.append(f"{inv_labels[i]}:{int(val)}")
+            
+            # Join every 4 items with a newline to prevent overflowing
+            lines = [" | ".join(items[i:i+4]) for i in range(0, len(items), 4)]
+            title_str = "Initial Inventory:\n" + "\n".join(lines)
+            
+            ax.set_title(title_str, fontsize=10, fontfamily='monospace', color='black')
+            plt.tight_layout()
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+        else:
+            plt.imsave(save_path, img)
 
         print(f"[Saved Frame] {save_path}")
 
     # Define meaningful actions (forward, turn_left, turn_right)
-    meaningful_actions = [env.unwrapped.actions.forward, env.unwrapped.actions.left, env.unwrapped.actions.right, env.unwrapped.actions.pickup, env.unwrapped.actions.toggle]
+    if is_crafter:
+        meaningful_actions = list(range(env.action_space.n))
+    else:
+        meaningful_actions = [
+            env.unwrapped.actions.forward,
+            env.unwrapped.actions.left,
+            env.unwrapped.actions.right,
+            env.unwrapped.actions.pickup,
+            env.unwrapped.actions.toggle,
+        ]
 
     # Use tqdm for progress tracking
-    visual_func = Visualization(cfg.attention_model)
-    target_episodes = cfg.env.collect.episodes
-    mini_dataset_size = getattr(cfg.env.collect, "mini_dataset_size", 0)
+    target_episodes = collect_cfg.episodes
+    mini_dataset_size = getattr(collect_cfg, "mini_dataset_size", 0)
 
     with tqdm(total=target_episodes, desc="Collecting Episodes") as pbar:
         info_list.append([{'carrying_key': False}])  
@@ -337,33 +406,39 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
         while episodes < target_episodes or (mini_dataset_size > 0 and len(obs_list) < mini_dataset_size):
             step_in_episode += 1
 
-            obs_list.append([obs['image']])
+            obs_image = obs['image'] if isinstance(obs, dict) else obs
+            obs_list.append([obs_image])
+            # Crafter only: collect current inventory
+            if is_crafter and isinstance(obs, dict) and 'inventory' in obs:
+                inv_list_cur.append(obs['inventory'])
             # teleport_near_important_tiles(env, obs, step_in_episode, interval=50)
 
-            if "wall" in task_name:
-                action_probs = [0.6, 0.2, 0.2, 0.0, 0.0]  # 多往前撞墙
+            if is_crafter:
+                action_probs = np.ones(len(meaningful_actions), dtype=np.float32)
+                action_probs /= action_probs.sum()
+            elif "wall" in task_name:
+                action_probs = [0.6, 0.2, 0.2, 0.0, 0.0]
             elif "lava" in task_name:
-                action_probs = [0.7, 0.15, 0.15, 0.0, 0.0]  # 多尝试前进（踩lava）
+                action_probs = [0.7, 0.15, 0.15, 0.0, 0.0]
             elif "key" in task_name:
-                action_probs = [0.2, 0.15, 0.15, 0.4, 0.1]  # pickup + toggle 多点
+                action_probs = [0.2, 0.15, 0.15, 0.4, 0.1]
             elif "door" in task_name:
-                action_probs = [0.1, 0.1, 0.1, 0.3, 0.4]  # 重点在toggle
+                action_probs = [0.1, 0.1, 0.1, 0.3, 0.4]
             else:
-                # [Optimized] Higher forward (0.5) to explore, modest toggle (0.2) for doors
-                action_probs = [0.2, 0.2, 0.2, 0.2, 0.2]  # [Fwd, L, R, Pick, Tog]
+                action_probs = [0.2, 0.2, 0.2, 0.2, 0.2]
             # Select an action
             if policy is None:
                 act = np.random.choice(meaningful_actions, p=action_probs)  # Weighted random sampling
             else:
-                state_norm = normalize_obs(obs['image']).to(device)
+                state_norm = normalize_obs(obs_image).to(device)
                 act = policy.select_action(state_norm)
 
             # Step in the environment
             obs_next, reward, done, trunc, info = env.step(act)
 
 
-            if env.env.carrying and env.env.carrying.type == 'key':
-                info['carrying_key'] = True
+            if not is_crafter and hasattr(env, "env") and getattr(env.env, "carrying", None) is not None:
+                info['carrying_key'] = (env.env.carrying.type == 'key')
             else:
                 info['carrying_key'] = False
             # check the data
@@ -395,7 +470,11 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
             # Collect data
             # mapping toggle to 4 for the PPO training
             act_list.append([act])
-            obs_next_list.append([obs_next['image']])   
+            obs_next_image = obs_next['image'] if isinstance(obs_next, dict) else obs_next
+            obs_next_list.append([obs_next_image])
+            # Crafter only: collect next inventory
+            if is_crafter and isinstance(obs_next, dict) and 'inventory' in obs_next:
+                inv_list_next.append(obs_next['inventory'])   
             rew_list.append([reward])
             done_list.append([done])
             info_list.append([info])
@@ -408,10 +487,10 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
 
 
             # Update visit count and RMax exploration
-            state_action_key = (tuple(obs['image'].flatten()), act)
+            state_action_key = (tuple(np.asarray(obs_image).flatten()), int(act))
             visit_count[state_action_key] = visit_count.get(state_action_key, 0) + 1
             if rmax_exploration is not None:
-                rmax_exploration.update_visit_count(obs['image'], act)
+                rmax_exploration.update_visit_count(obs_image, act)
 
             # Visualize if needed
             if cfg.env.visualize:
@@ -424,6 +503,16 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
                 episodes += 1
                 pbar.update(1)
                 obs = env.reset()[0]
+                # --- BOOST 2: Inject for subsequent episodes ---
+                if randomize_inventory and is_crafter:
+                    player = env.unwrapped.env._player
+                    for stat in ['health', 'food', 'drink', 'energy']:
+                        setattr(player, stat, float(np.random.randint(5, 10)))
+                    all_possible_items = ['wood', 'stone', 'coal', 'iron', 'diamond', 'sapling', 'wood_pickaxe', 'stone_pickaxe', 'iron_pickaxe', 'wood_sword', 'stone_sword', 'iron_sword']
+                    for item in all_possible_items:
+                        player.inventory[item] = 1.0 if (('pickaxe' in item or 'sword' in item) and np.random.random() < 0.7) else float(np.random.randint(0, 5))
+                    obs = env.unwrapped._extract_obs()
+
                 info_list.append([{'carrying_key': False}])  
                 has_carried_key_this_episode = False  # 重置本轮状态
                 step_in_episode = 0
@@ -435,11 +524,28 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     obs_np = np.concatenate(obs_list)
     obs_next_np = np.concatenate(obs_next_list)
     act_np = np.concatenate(act_list)
-    # preprocess actions: map toggle (5) to drop (4) just for the model training --> don't forget to change it back during policy training
-    act_np[act_np == 5] = 4  
+    # Only for MiniGrid convention.
+    if not is_crafter:
+        act_np[act_np == 5] = 4
     rew_np = np.concatenate(rew_list)
     done_np = np.concatenate(done_list)
     info_np = np.concatenate(info_list)
+    # Crafter only: build inventory arrays
+    if is_crafter and len(inv_list_cur) > 0:
+        inv_np = np.stack(inv_list_cur, axis=0).astype(np.float32)       # (N, 16)
+        inv_next_np = np.stack(inv_list_next, axis=0).astype(np.float32) # (N, 16)
+        # Align length with obs (episode boundary pop)
+        min_len = min(len(obs_np), len(inv_np))
+        inv_np = inv_np[:min_len]
+        inv_next_np = inv_next_np[:min_len]
+        obs_np = obs_np[:min_len]
+        obs_next_np = obs_next_np[:min_len]
+        act_np = act_np[:min_len]
+        rew_np = rew_np[:min_len]
+        done_np = done_np[:min_len]
+        info_np = info_np[:min_len]
+    else:
+        inv_np, inv_next_np = None, None
 
     # Log statistics
     print(f"Observation shape: {obs_np.shape}")
@@ -451,7 +557,7 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     print(f"Unique state-action pairs visited: {len(visit_count)}")
     env.close()
 
-    return obs_np, obs_next_np, act_np, rew_np, done_np, info_np
+    return obs_np, obs_next_np, act_np, rew_np, done_np, info_np, inv_np, inv_next_np
 
 
 def teleport_near_important_tiles(env, obs, step_in_episode, interval):
@@ -708,10 +814,18 @@ def uniform_collect_data_postprocess(env, cfg, wandb_run, log_name, policy=None,
     return obs_u, obsn_u, act_u, rew_u, done_u, info_u
 
 
-def save_experiments(cfg: DictConfig, obs, obs_next, act, rew, done, info=None):
+def save_experiments(cfg: DictConfig, obs, obs_next, act, rew, done, info=None, inv=None, inv_next=None):
     obs = ColRowCanl_to_CanlRowCol(obs)
     obs_next = ColRowCanl_to_CanlRowCol(obs_next)
-    np.savez_compressed(cfg.collect.data_save_path, a=obs, b=obs_next, c=act, d=rew, e=done, f=info)
+    save_path = cfg.collect.data_save_path
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    save_kwargs = dict(a=obs, b=obs_next, c=act, d=rew, e=done, f=info)
+    if inv is not None:
+        save_kwargs['g'] = inv        # inventory at time t
+        save_kwargs['h'] = inv_next   # inventory at time t+1
+    np.savez_compressed(save_path, **save_kwargs)
 
 def data_augmentation(cfg: DictConfig, obs, obs_next, act, rew, done):
     """
@@ -909,15 +1023,63 @@ def downsample_moves_only(
 
 @hydra.main(version_base=None, config_path = str(WORLD_MODEL_PATH / "config"), config_name="config")
 def data_collect(cfg: DictConfig):
-    hparam = cfg.env
-    mode =None
-    if hparam.visualize:
-        mode = 'human'
-    env = FullyObsWrapper(CustomMiniGridEnv(txt_file_path=hparam.env_path, 
-                                        custom_mission="Find the key and open the door.",
-                                        max_steps=10000, render_mode=mode))
-    obs, obs_next, act,rew, done = run_env(env, hparam, log_name="train", wandb_run=None, save_img=False)
-    save_experiments(cfg.env,obs,obs_next, act, rew, done)
+    env_type = str(getattr(cfg.env, "env_type", "")).lower()
+    mode = 'human' if getattr(cfg.env, "visualize", False) else None
+
+    if env_type == "crafter":
+        # Workaround for numba cache issues seen in some environments when importing crafter.
+        os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
+        env_path = getattr(cfg.env, "env_path", None)
+        crafter_cfg = getattr(cfg.env, "crafter", {})
+        stochastic = getattr(crafter_cfg, "stochastic", False) if hasattr(crafter_cfg, "stochastic") else crafter_cfg.get("stochastic", False) if isinstance(crafter_cfg, dict) else False
+        slippery_prob = getattr(crafter_cfg, "slippery_prob", 0.0) if hasattr(crafter_cfg, "slippery_prob") else crafter_cfg.get("slippery_prob", 0.0) if isinstance(crafter_cfg, dict) else 0.0
+        max_steps = getattr(cfg.env, "max_steps", 10000)
+        from domain.crafter.crafter_custom_env import CustomCrafterEnv
+        if env_path and os.path.exists(env_path):
+            env = CustomCrafterEnv(txt_file_path=env_path, max_steps=max_steps,
+                                   ai_enabled=stochastic, slippery_prob=slippery_prob)
+        else:
+            env = CustomCrafterEnv(max_steps=max_steps,
+                                   ai_enabled=stochastic, slippery_prob=slippery_prob)
+    else:
+        env_path = getattr(cfg.env, "env_path", None)
+        max_steps = getattr(cfg.env, "max_steps", 10000)
+        env = FullyObsWrapper(
+            CustomMiniGridEnv(
+                txt_file_path=env_path,
+                custom_mission="Find the key and open the door.",
+                max_steps=max_steps,
+                render_mode=mode,
+            )
+        )
+
+    collect_cfg = getattr(cfg.env, "collect", cfg.env)
+    data_type = str(getattr(collect_cfg, "data_type", "random")).lower()
+    randomize = (data_type == "uniform" and env_type == "crafter")
+    log_name = getattr(collect_cfg, "visualize_filename", "train.png").split('.')[0]
+
+    obs, obs_next, act, rew, done, info, inv, inv_next = run_env(
+        env, cfg, log_name=log_name, wandb_run=None, save_img=False, randomize_inventory=randomize
+    )
+    save_experiments(cfg.env, obs, obs_next, act, rew, done, info, inv=inv, inv_next=inv_next)
+
+    # coverage visualization
+    data_path = cfg.env.collect.data_save_path
+    if getattr(cfg.env.collect, "save_coverage_visualize", False) and os.path.exists(data_path):
+        filename = getattr(cfg.env.collect, "visualize_filename", "coverage.png")
+        vis_save_path = getattr(cfg.env.collect, "visualize_save_path", "trainer/logs/dataset_visualization")
+        os.makedirs(vis_save_path, exist_ok=True)
+        save_path = os.path.join(vis_save_path, filename)
+        data = np.load(data_path, allow_pickle=True)
+
+        collect_cfg = cfg.env.collect if hasattr(cfg.env, "collect") else cfg.env
+        dataset_type = getattr(collect_cfg, "data_type", "Random")
+        visualize_agent_coverage(
+            data,
+            save_path=save_path,
+            title=f"Agent Position Coverage ({dataset_type})"
+        )
+
     env.close()
 
 
@@ -932,6 +1094,7 @@ def data_collect_api(cfg: DictConfig, env, wandb_run, save_img, log_name, max_st
 
     # === DATA BUFFERS ===
     obs_all, obsn_all, act_all, rew_all, done_all, info_all = [], [], [], [], [], []
+    inv_all, invn_all = [], []
 
     # ------------------------------------------------------
     # CASE 1: Single-run mode (NO ITERATION)
@@ -939,13 +1102,20 @@ def data_collect_api(cfg: DictConfig, env, wandb_run, save_img, log_name, max_st
     if max_steps is None:
         print(f"[Single-run mode] Collecting {hparam.env.collect.episodes} episodes...")
 
-        if cfg.env.collect.data_type == 'uniform':
-            obs, obs_next, act, rew, done, info = uniform_collect_data_postprocess(
-                env, hparam, wandb_run, log_name,
-                policy=None, rmax_exploration=None, save_img=save_img
-            )
+        collect_cfg = cfg.env.collect if hasattr(cfg.env, "collect") else cfg.env
+        if collect_cfg.data_type.lower() == 'uniform':
+            if str(hparam.env.env_type).lower() == 'crafter':
+                obs, obs_next, act, rew, done, info, inv, inv_next = run_env(
+                    env, hparam, wandb_run, log_name, save_img=save_img, randomize_inventory=True
+                )
+            else:
+                obs, obs_next, act, rew, done, info = uniform_collect_data_postprocess(
+                    env, hparam, wandb_run, log_name,
+                    policy=None, rmax_exploration=None, save_img=save_img
+                )
+                inv, inv_next = None, None
         else:
-            obs, obs_next, act, rew, done, info = run_env(
+            obs, obs_next, act, rew, done, info, inv, inv_next = run_env(
                 env, hparam, wandb_run, log_name, save_img=save_img
             )
 
@@ -956,10 +1126,13 @@ def data_collect_api(cfg: DictConfig, env, wandb_run, save_img, log_name, max_st
         rew_all.append(rew)
         done_all.append(done)
         info_all.append(info)
+        if inv is not None:
+            inv_all.append(inv)
+            invn_all.append(inv_next)
 
         print("[Single-run] Finished collecting. Saving dataset...")
             # jump to the saving section
-        return _finalize_and_save(cfg, env, obs_all, obsn_all, act_all, rew_all, done_all, info_all)
+        return _finalize_and_save(cfg, env, obs_all, obsn_all, act_all, rew_all, done_all, info_all, inv_all, invn_all)
     
 
     # ------------------------------------------------------
@@ -969,15 +1142,20 @@ def data_collect_api(cfg: DictConfig, env, wandb_run, save_img, log_name, max_st
     round_idx = 0
 
     while total_steps < max_steps:
-        print(f"Round {round_idx+1}, collecting {hparam.env.collect.episodes} episodes...")
-
-        if cfg.env.collect.data_type == 'uniform':
-            obs, obs_next, act, rew, done, info = uniform_collect_data_postprocess(
-                env, hparam, wandb_run, log_name,
-                policy=None, rmax_exploration=None, save_img=False
-            )
+        collect_cfg = hparam.env.collect if hasattr(hparam.env, "collect") else hparam.env
+        if collect_cfg.data_type.lower() == 'uniform':
+            if str(hparam.env.env_type).lower() == 'crafter':
+                obs, obs_next, act, rew, done, info, inv, inv_next = run_env(
+                    env, hparam, wandb_run, log_name, save_img=save_img, randomize_inventory=True
+                )
+            else:
+                obs, obs_next, act, rew, done, info = uniform_collect_data_postprocess(
+                    env, hparam, wandb_run, log_name,
+                    policy=None, rmax_exploration=None, save_img=False
+                )
+                inv, inv_next = None, None
         else:
-            obs, obs_next, act, rew, done, info = run_env(
+            obs, obs_next, act, rew, done, info, inv, inv_next = run_env(
                 env, hparam, wandb_run, log_name, save_img=save_img
             )
 
@@ -987,6 +1165,9 @@ def data_collect_api(cfg: DictConfig, env, wandb_run, save_img, log_name, max_st
         rew_all.append(rew)
         done_all.append(done)
         info_all.append(info)
+        if inv is not None:
+            inv_all.append(inv)
+            invn_all.append(inv_next)
 
         total_steps += len(obs)
         print(f"Total steps collected: {total_steps}")
@@ -997,14 +1178,14 @@ def data_collect_api(cfg: DictConfig, env, wandb_run, save_img, log_name, max_st
         round_idx += 1
         save_img = False
 
-    return _finalize_and_save(cfg, env, obs_all, obsn_all, act_all, rew_all, done_all, info_all)
+    return _finalize_and_save(cfg, env, obs_all, obsn_all, act_all, rew_all, done_all, info_all, inv_all, invn_all)
 
 
 
 # ----------------------------------------------------------
 # Helper: final save + visualization
 # ----------------------------------------------------------
-def _finalize_and_save(cfg, env, obs_all, obsn_all, act_all, rew_all, done_all, info_all):
+def _finalize_and_save(cfg, env, obs_all, obsn_all, act_all, rew_all, done_all, info_all, inv_all=None, invn_all=None):
 
     # merge
     obs_all = np.concatenate(obs_all, axis=0)
@@ -1012,11 +1193,20 @@ def _finalize_and_save(cfg, env, obs_all, obsn_all, act_all, rew_all, done_all, 
     act_all = np.concatenate(act_all, axis=0)
     rew_all = np.concatenate(rew_all, axis=0)
     done_all = np.concatenate(done_all, axis=0)
-    info_all = np.concatenate(info_all, axis=0)
+    if isinstance(info_all[0], (list, np.ndarray)):
+        info_all = np.concatenate(info_all, axis=0)
+    else:
+        # Fallback if info is a list of objects but not naturally concatenatable
+        info_all = np.array(info_all, dtype=object)
+
+    inv_final, invn_final = None, None
+    if inv_all is not None and len(inv_all) > 0:
+        inv_final = np.concatenate(inv_all, axis=0)
+        invn_final = np.concatenate(invn_all, axis=0)
 
     print(f"Final data shape: {obs_all.shape}")
 
-    save_experiments(cfg.env, obs_all, obsn_all, act_all, rew_all, done_all, info_all)
+    save_experiments(cfg.env, obs_all, obsn_all, act_all, rew_all, done_all, info_all, inv=inv_final, inv_next=invn_final)
 
     # visualization
     data_path = cfg.env.collect.data_save_path
@@ -1025,10 +1215,12 @@ def _finalize_and_save(cfg, env, obs_all, obsn_all, act_all, rew_all, done_all, 
         save_path = os.path.join(cfg.env.collect.visualize_save_path, filename)
         data = np.load(data_path, allow_pickle=True)
 
+        collect_cfg = cfg.env.collect if hasattr(cfg.env, "collect") else cfg.env
+        dataset_type = getattr(collect_cfg, "data_type", "Random")
         visualize_agent_coverage(
             data,
             save_path=save_path,
-            title=f"Agent Position Coverage ({cfg.env.collect.data_type})"
+            title=f"Agent Position Coverage ({dataset_type})"
         )
 
     env.close()
@@ -1046,10 +1238,17 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
     # Step 1: 调用已有函数提取位置
     # -------------------------------
     obs_np = data['a']
-    # 如果是 (N, H, W, C) 则转换，否则保持不变
-    if obs_np.shape[1] not in [3, 4, 5]:  # 通道数异常 -> 应该是放在最后
+    raw_obs = obs_np
+    # 如果是 (N, H, W, C) 则转换，否则保持不变 (注意 Crafter 符号化是 C=2)
+    if obs_np.shape[1] not in [2, 3, 4, 5]:  # 通道数异常 -> 应该是放在最后
         obs_np = np.moveaxis(obs_np, -1, 1)
-    positions = get_agent_position(obs_np)  # (N, 2)
+        
+    # Crafter stores object IDs where player is exactly ID=10.
+    if obs_np.shape[1] == 2:
+        from domain.crafter.crafter_support import extract_player_positions
+        positions = extract_player_positions(obs_np)  # (N, 2)
+    else:
+        positions = get_agent_position(obs_np)  # (N, 2)
 
     # 自动推断地图大小
     if isinstance(obs_np, torch.Tensor):
@@ -1066,21 +1265,81 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
         if 0 <= y < H and 0 <= x < W:
             heatmap[y, x] += 1
 
+    # Heatmap is now naturally (Row, Col) which matches imshow expectation.
+
     # -------------------------------
-    # Step 3: 绘图
+    # Step 3: Handle Inventory Stats if available
     # -------------------------------
-    plt.figure(figsize=(6,6))
-    plt.imshow(heatmap, cmap="viridis", origin="upper")
-    plt.title(title)
-    plt.xlabel("X axis")
-    plt.ylabel("Y axis")
-    plt.colorbar(label="Occurrences")
+    inv_stats = None
+    if 'g' in data:
+        inv_data = data['g']
+        if len(inv_data.shape) == 2:
+            # Calculate non-zero occurrence rate (Frequency %)
+            inv_stats = np.mean(inv_data > 0, axis=0) * 100
+            inv_labels = [
+                'Health', 'Food', 'Drink', 'Energy', 
+                'Wood', 'Stone', 'Coal', 'Iron', 'Diamond', 'Sapling',
+                'Wood_Pickaxe', 'Stone_Pickaxe', 'Iron_Pickaxe', 
+                'Wood_Sword', 'Stone_Sword', 'Iron_Sword'
+            ]
+
+    # -------------------------------
+    # Step 4: 绘图
+    # -------------------------------
+    if inv_stats is not None:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+        
+        # Heatmap
+        im = ax1.imshow(heatmap, cmap="viridis", origin="upper")
+        ax1.set_title(title)
+        ax1.set_xlabel("X axis")
+        ax1.set_ylabel("Y axis")
+        fig.colorbar(im, ax=ax1, label="Occurrences")
+        
+        # Inventory Presence Frequency
+        # Define Color Groups: Stats (Blue), Materials (Green), Tools/Weapons (Red/Orange)
+        colors = ['#3498db']*4 + ['#2ecc71']*6 + ['#e74c3c']*3 + ['#f39c12']*3
+        
+        ax2.bar(inv_labels, inv_stats, color=colors, alpha=0.8, edgecolor='black', linewidth=0.5)
+        ax2.set_title("Tech-State Coverage (Items Presence %)")
+        ax2.set_ylabel("Presence Rate (%)")
+        ax2.set_ylim(0, 115) # Leave space for text
+        ax2.set_xticks(range(len(inv_labels)))
+        ax2.set_xticklabels(inv_labels, rotation=45, ha='right', fontsize=9)
+        ax2.grid(axis='y', linestyle='--', alpha=0.3)
+        
+        # Add values on top of bars with better formatting
+        for i, v in enumerate(inv_stats):
+            color = 'black' if v < 95 else 'darkred'
+            ax2.text(i, v + 2, f"{v:.1f}", ha='center', fontsize=8, fontweight='bold', color=color)
+            
+        # Add a small legend for groups
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], color='#3498db', lw=4, label='Physiological Stats'),
+            Line2D([0], [0], color='#2ecc71', lw=4, label='Basic Materials'),
+            Line2D([0], [0], color='#e74c3c', lw=4, label='Pickaxes'),
+            Line2D([0], [0], color='#f39c12', lw=4, label='Swords')
+        ]
+        ax2.legend(handles=legend_elements, loc='upper right', fontsize=8, framealpha=0.5)
+        
+        plt.tight_layout()
+    else:
+        plt.figure(figsize=(6,6))
+        plt.imshow(heatmap, cmap="viridis", origin="upper")
+        plt.title(title)
+        plt.xlabel("X axis")
+        plt.ylabel("Y axis")
+        plt.colorbar(label="Occurrences")
+        plt.tight_layout()
 
     if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        print(f"Heatmap saved to {save_path}")
+        print(f"Heatmap and Stats saved to {save_path}")
     else:
         plt.show()
+    plt.close()
 
 def visualize_saved_dataset(data_path, save_path, fig_name):
     '''

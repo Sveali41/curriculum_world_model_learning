@@ -1,0 +1,57 @@
+# Crafter Continual Learning Configuration
+attention_model:
+  env_type: crafter
+  data_type: discrete
+  model_type: Attention
+  grid_shape: [2, 0, 0]  # Crafter=2 channels (object + direction)
+  attention_mask_size: 3
+  batch_size: 256
+  n_cpu: 4
+  embed_dim: 128
+  num_heads: 1
+  # Default directory, will be overridden in the script
+  data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_minitask_01.npz
+  validation_data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_target_uniform_test.npz
+  n_epochs: 25
+  lr: 5e-4
+  wd: 1e-5
+  obs_norm_values: [10, 5, 3] # Overridden in code for crafter
+  action_norm_values: 5 
+  valid_values_obj: [1, 2, 4, 5, 8, 10]
+  valid_values_color: [0, 1, 5]
+  valid_values_state: [0, 1, 2, 3]
+  use_wandb: False
+  frame_stack: 1
+
+  # Model saving
+  freeze_weight: False
+  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_crafter_CL.ckpt
+
+  # Continual Learning / EWC Params
+  continue_learning: True
+  lambda_ewc: 500.0         
+  ewc_ratio: 0.2           
+  lambda_ema: 0.1
+  lambda_ewc_min: 10.0
+  lambda_ewc_max: 2000.0
+  scale_factor: 1.0
+  replay_frac: 0.5
+  fisher_buffer_size: 500000
+
+  # Visualization
+  visualization: True     
+  visualize_every: 50
+  save_path: ${oc.env:PROJECT_ROOT}/modelBased/visulization
+  direction_map: {0: 'right', 1: 'down', 2: 'left', 3: 'up'}
+  action_map: {0: 'left', 1: 'right', 2: 'forward', 3: 'pickup', 4: 'toggle'}
+
+env:
+  env_type: crafter
+  visualize: False
+  collect:
+    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_cl_temp.npz
+    episodes: 200 # Default episodes for collection if needed
+    data_type: uniform
+    save_coverage_visualize: False
+
+

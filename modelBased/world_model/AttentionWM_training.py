@@ -50,9 +50,32 @@ class ValidationDataModule(WMRLDataModule):
             persistent_workers=False
         )
 
-@hydra.main(version_base=None, config_path=str(TRAINER_PATH / "conf"), config_name="config_test")
+@hydra.main(version_base=None, config_path="../config", config_name="config")
 def train(cfg: DictConfig):
-    run(cfg)
+    net = AttentionWorldModel(cfg.attention_model)
+    
+    # ===== Step 1: Train on Dataset 1 =====
+    print(f"\n{'='*60}")
+    print(f"[Phase 1] TRAINING on: {cfg.attention_model.data_dir}")
+    print(f"{'='*60}\n")
+    result = run(cfg, net=net)
+
+    # ===== Step 2: Validate on Dataset 2 (if configured) =====
+    val_data_dir = getattr(cfg.attention_model, "validation_data_dir", None)
+    if val_data_dir and result["mode"] == "train":
+        print(f"\n{'='*60}")
+        print(f"[Phase 2] VALIDATING on: {val_data_dir}")
+        print(f"{'='*60}\n")
+        
+        from omegaconf import OmegaConf
+        val_cfg = OmegaConf.to_container(cfg, resolve=True)
+        val_cfg["attention_model"]["data_dir"] = val_data_dir
+        val_cfg["attention_model"]["freeze_weight"] = True
+        val_cfg = OmegaConf.create(val_cfg)
+        
+        val_result = run(val_cfg, net=result["net"])
+        val_loss = val_result.get("avg_val_loss", "N/A")
+        print(f"\n[Phase 2] Validation loss on dataset 2: {val_loss}")
 
 def compare_params(net, old_params):
     if old_params is None:
@@ -67,12 +90,20 @@ def compare_params(net, old_params):
 
 def run(
     cfg: DictConfig,
-    net: AttentionWorldModel,
+    net: AttentionWorldModel = None,
     old_params=None,
     fisher=None,
     layout=None,
     replay_data=None
 ):
+    if net is None:
+        from modelBased.world_model.AttentionWM import AttentionWorldModel
+        net = AttentionWorldModel(cfg.attention_model)
+    
+    # Ensure net is on the right device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net.to(device)
+    
     print(f'*************************Data set: {cfg.attention_model.data_dir}************************')
 
     use_wandb = cfg.attention_model.use_wandb
@@ -108,11 +139,16 @@ def run(
         verbose=True,
         mode="min"
     )
+    try:
+        tmp_dir = os.path.dirname(cfg.attention_model.model_save_path)
+    except Exception as e:
+        print("EXCEPTION AT E1:", e)
+        
     checkpoint_callback = ModelCheckpoint(
         save_top_k=1,
         monitor=metric_to_monitor,
         mode="min",
-        dirpath=os.path.dirname(cfg.attention_model.model_save_path),
+        dirpath=tmp_dir,
         filename="att-{epoch:02d}-{avg_val_loss_wm:.5f}",
         verbose=True
     )
@@ -129,6 +165,7 @@ def run(
         deterministic=False,
     )
 
+
     result = {
         "mode": None,            
         "net": net,              
@@ -137,8 +174,8 @@ def run(
         "avg_val_loss": None,
     }
 
-    # consolidation
-    net.set_consolidation(old_params, fisher, load_weights=False)
+    # consolidation: Load weights if old_params are provided to continue learning
+    net.set_consolidation(old_params, fisher, load_weights=(old_params is not None))
 
     if cfg.attention_model.freeze_weight:
         # ===== validation =====
@@ -150,7 +187,9 @@ def run(
 
     else:
         # ===== training =====
+        print("freeze_weight is False, proceeding to trainer.fit()")
         trainer.fit(net, datamodule)
+        print("Trainer fit completed!")
 
         # 保存旧参数
         old_params = net.save_old_params()
@@ -194,7 +233,7 @@ def run(
 
 def train_api(
     cfg: DictConfig,
-    net: AttentionWorldModel,
+    net: AttentionWorldModel = None,
     old_params=None,
     fisher=None,
     env_layout=None,
@@ -202,7 +241,7 @@ def train_api(
 ):
     result = run(
         cfg,
-        net,
+        net=net,
         old_params=old_params,
         fisher=fisher,
         layout=env_layout,
@@ -219,4 +258,5 @@ def train_api(
 
 
 if __name__ == "__main__":
+    print("THIS SCRIPT IS EXECUTING!")
     train()

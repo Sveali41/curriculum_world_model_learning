@@ -1,48 +1,84 @@
-# 1. attension model
 attention_model:
-  data_type: discrete # 'norm' or 'discrete'  # 这两种类型效果都还不错 20250213
+  env_type: ${env.env_type}
+  data_type: discrete # 'norm' or 'discrete' 
   model_type: Attention       # Attention, Embedding, MLP
-  grid_shape: [3, 0, 0]  # Channel, Row, Col  # Row, Col 暂时不用，所以设为0就ok 20250213
+  grid_shape: [2, 0, 0]  # Crafter=2(obj+dir), MiniGrid=3
   attention_mask_size: 3
-  batch_size: 256  # test 64/128/256
-  n_cpu: 8
-  embed_dim: 256  # 128 64/128/256
+  batch_size: 256  # larger batch → better GPU utilization
+  n_cpu: 4  # 4 workers is enough; too many causes overhead
+  embed_dim: 128  # 128 64/128/256
   num_heads: 1   # 1 if the embed_dim is 64, num_heads should better be 1
-  data_dir: ${oc.env:TRAIN_DATASET_PATH}/gridworld_11_11_empty_1000eps.npz
-  n_epochs: 20
-  lr: 1e-4
+  data_dir: ${env.collect.data_save_path}
+  # After training on data_dir, validate on this second dataset (set to null to skip)
+  validation_data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_train_random_2.npz
+  n_epochs: 25 # 30
+  lr: 5e-4 # 1e-4 
   wd: 1e-5
-  obs_norm_values: [10, 5, 3] # object, color, state --> agent_state: 1-down 2-left 3-up 0-right 
-  action_norm_values: 6 # 0-left 1-right 2-forward 3-pickup 4-drop 5-toggle 6-done
-  valid_values_obj: [1, 2, 4, 5, 8, 10]
+  obs_norm_values: [10, 5, 3] # will be overridden in code if crafter
+  action_norm_values: 5 
+  valid_values_obj: [1, 2, 4, 5, 8, 10]                                                             
   valid_values_color: [0, 1, 5]
   valid_values_state: [0, 1, 2, 3]
   use_wandb: False
+  frame_stack: 1  # K=1 for deterministic Crafter (no need for temporal context)
 
   # freeze weights
-  freeze_weight: False # 置true 会加载权重，不会训练模型，用于验证
-  # model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model.ckpt   # 这是整个模型的保存路径 20250213
-  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/att-epoch=07-avg_val_loss_wm=0.00007.ckpt
-  # model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/att-wm.ckpt
-  # weight_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/attention_weight.ckpt  # 这个是只保存模型的权重 20250213
+  freeze_weight: False  # 置true 会加载权重，不会训练模型，用于验证
+  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_${env.env_type}.ckpt
 
+  # resume training
+  resume_training: False  # 是否继续训练
+  resume_path: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_${env.env_type}_old.ckpt
+  fisher_buffer_size: 500000
 
   # plot
-  visualization: True      
-  visualize_every: 5
+  visualization: True     
+  visualize_every: 50
   save_path: ${oc.env:PROJECT_ROOT}/modelBased/visulization
   direction_map: {0: 'right', 1: 'down', 2: 'left', 3: 'up'}
-  action_map: {0: 'left', 1: 'right', 2: 'forward', 3: 'pickup', 4: 'drop', 5: 'toggle', 6: 'done'}
+  action_map: {0: 'left', 1: 'right', 2: 'forward', 3: 'pickup', 4: 'toggle'}
+  continue_learning: True
+  lambda_ewc: 100         # ← 从 1e8 改到 1.0
+  ewc_ratio: 0.2           # ← 开启“按占比自适应”，想手动就设 null
+  lambda_ema: 0.1
+  lambda_ewc_min: 10
+  lambda_ewc_max: 1.0e3
+  scale_factor: 1.0
+  drift_threshold: null     # ← 让它自动 warmup 学出来
+  warmup_steps: 100
+  drift_cooldown: 200
+  drift_hi: 1.10
+  drift_lo: 0.70
+  drift_up_step: 0.10
+  drift_down_step: 0.05
+  replay_frac: 0.5
 
 # 2. data collection
 env:
-  env_path: ${oc.env:ENV_PATH}/Grid_6_12_empty.txt
-  visualize: True # to choose whether your want to see the env during interaction or not
+  # For Crafter collection, env_path is not used by CustomCrafterEnv.
+  # Keep it for backward compatibility with MiniGrid scripts.
+  env_path: ${oc.env:TRAINER_PATH}/level/crafter/crafter_target_task_diamond.txt
+  visualize: False
+  env_type: crafter
+  # data_type: uniform (enables exhaustive inventory randomization for generalization testing)
+  data_type: uniform
+  max_steps: 10000
+  crafter:
+    stochastic: False     # False = entities frozen (zombie/cow don't move)
+    slippery_prob: 0.0     # 0.0 = fully deterministic for initial validation
   collect:
-    episodes: 1000 # number of episodes to start 
-    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/gridworld_6_12_empty_1000eps.npz # folder where to save the rollouts
+    episodes: 1000
+    mini_dataset_size: 8000
+    maximum_dataset_size: 100000  # limit to 50k for faster iteration on small map
+    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_target_task_diamond.npz #crafter_minitask_06.npz
+    save_coverage_visualize: True
+    visualize_save_path: ${oc.env:PROJECT_ROOT}/trainer/logs/dataset_visualization
+    visualize_filename: crafter_target_task_diamond_uniform_coverage.png #crafter_minitask_06_random_coverage.png
+    save_env_visualize: True
+    env_visualize_save_path: ${oc.env:PROJECT_ROOT}/trainer/logs/env_visualization
+    env_visualize_filename: crafter_target_task_diamond_uniform_env.png #crafter_minitask_06_random_env.png
 
-# 3. PPO model
+# 4. PPO model
 PPO:
   env_type: empty # empty, with obj
   has_continuous_action_space: False
@@ -95,4 +131,3 @@ data_collect:
   collect:
     data_train: ${oc.env:TRAIN_DATASET_PATH}/gridworld_Rmax.npz # folder where to save the rollouts
     visit_count: ${oc.env:TRAIN_DATASET_PATH}/visit_count_Rmax.npz # folder where to save the rollouts
-

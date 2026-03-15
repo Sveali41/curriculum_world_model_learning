@@ -170,23 +170,31 @@ def ColRowCanl_to_CanlRowCol(state):
     raise TypeError("Input must be a PyTorch tensor or a NumPy array.")
 
 
-def get_agent_position(state):
+def get_agent_position(state, player_id: int = 10):
+    """
+    Find the agent position in the observation.
+    player_id: 10 for MiniGrid, 13 for Crafter.
+    """
     if isinstance(state, torch.Tensor):
         state = state.detach().cpu().numpy()
 
+    def _find_agent_yx(obs_chw):
+        obj_map = obs_chw[0]
+        hits = np.argwhere(obj_map == player_id)
+        if len(hits) > 0:
+            return hits[0][0], hits[0][1]  # (y, x)
+        # Fallback: argmax
+        return np.unravel_index(np.argmax(obj_map), obj_map.shape)
+
     if len(state.shape) == 3:
-        _, row, col = state.shape
-        agent_position_index = np.argmax(state[0, :, :])
-        agent_position_yx = np.unravel_index(agent_position_index, (row, col))
-        return agent_position_yx
+        return _find_agent_yx(state)
 
     if len(state.shape) == 4:
-        bsz, _, row, col = state.shape
-        agent_position_index = np.argmax(state[:, 0, :, :].reshape(bsz, -1), axis=1)
-        agent_position_yx_batch = np.stack(
-            np.unravel_index(agent_position_index, (row, col)), axis=1
-        )
-        return agent_position_yx_batch
+        bsz = state.shape[0]
+        positions = np.zeros((bsz, 2), dtype=np.int64)
+        for i in range(bsz):
+            positions[i] = _find_agent_yx(state[i])
+        return positions
 
     raise ValueError("Input must be a 3D or 4D array.")
 

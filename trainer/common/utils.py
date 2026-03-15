@@ -4,10 +4,7 @@ import random
 import numpy as np
 import torch
 from modelBased.common.utils import TRAINER_PATH
-from domain.minigrid.minigrid_support import (
-    extract_unique_patches,
-    generate_minitasks_until_covered,
-)
+from domain.minigrid.minigrid_support import extract_unique_patches, generate_minitasks_until_covered
 from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
 from modelBased.data.data_collect import visualize_agent_coverage, visualize_saved_dataset
 from modelBased.common.support import Support
@@ -326,12 +323,16 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
     losses = []
 
     for v in range(VALID_TIMES):
-        val_result, _, model = AttentionWM_training.train_api(cfg, net, old_params, None)
+        # train_api in validation mode returns (avg_val_loss_list_of_dict, None, net)
+        val_res, _, model = AttentionWM_training.train_api(cfg, net, old_params, None)
         
-        if 'avg_val_loss_wm' in val_result[0]:
-             loss_val = float(val_result[0]['avg_val_loss_wm'])
+        # trainer.validate returns a list like [{'avg_val_loss_wm': 12.3}]
+        if isinstance(val_res, list) and len(val_res) > 0:
+             loss_val = float(val_res[0].get('avg_val_loss_wm', 0.0))
+        elif isinstance(val_res, dict):
+             loss_val = float(val_res.get('avg_val_loss_wm', 0.0))
         else:
-             loss_val = 0.0 # Fallback
+             loss_val = float(val_res)
         
         losses.append(loss_val)
 
@@ -446,8 +447,13 @@ def extract_loss_map_over_validations(
         else:
             sum_map += loss_map
 
-        # Record scalar loss
-        loss_val = float(val_result[0]['avg_val_loss_wm'])
+        # Record scalar loss (val_result can be float, dict, or list of dict)
+        if isinstance(val_result, list) and len(val_result) > 0:
+             loss_val = float(val_result[0].get('avg_val_loss_wm', 0.0))
+        elif isinstance(val_result, dict):
+             loss_val = float(val_result.get('avg_val_loss_wm', 0.0))
+        else:
+             loss_val = float(val_result)
         loss_list.append(loss_val)
 
         # Cleanup
@@ -481,12 +487,13 @@ def convert_trajectories_to_batch(trajectories):
         obs_list = []
         act_list = []
         next_obs_list = []
+        rew_list = []
+        done_list = []
         info_list = []
         
         has_info = 'info' in trajectories[0] and trajectories[0]['info'] is not None
 
         for traj in trajectories:
-            # Helper to convert tensor/array to numpy
             def to_numpy(x):
                 if isinstance(x, torch.Tensor):
                     return x.detach().cpu().numpy()
@@ -495,19 +502,22 @@ def convert_trajectories_to_batch(trajectories):
             obs_list.append(to_numpy(traj['obs']))
             act_list.append(to_numpy(traj['act']))
             next_obs_list.append(to_numpy(traj['obs_next']))
+            if 'rew' in traj: rew_list.append(to_numpy(traj['rew']))
+            if 'done' in traj: done_list.append(to_numpy(traj['done']))
             if has_info:
                 info_list.append(to_numpy(traj['info']))
 
-        # Concatenate along the first dimension (batch/time dimension)
         return {
             'obs': np.concatenate(obs_list, axis=0),
             'obs_next': np.concatenate(next_obs_list, axis=0),
             'act': np.concatenate(act_list, axis=0),
+            'rew': np.concatenate(rew_list, axis=0) if rew_list else None,
+            'done': np.concatenate(done_list, axis=0) if done_list else None,
             'info': np.concatenate(info_list, axis=0) if has_info else None
         }
 
     # 2. Legacy Format: List of Lists of Tuples
-    obs_list, act_list, next_obs_list = [], [], []
+    obs_list, act_list, next_obs_list, rew_list, done_list = [], [], [], [], []
     
     for traj in trajectories:
         for step in traj:
@@ -515,10 +525,14 @@ def convert_trajectories_to_batch(trajectories):
             obs_list.append(np.array(state))
             act_list.append(np.array(action))
             next_obs_list.append(np.array(next_state))
+            rew_list.append(reward)
+            done_list.append(done)
             
     return {
         'obs': np.array(obs_list),     
         'obs_next': np.array(next_obs_list), 
         'act': np.array(act_list),
+        'rew': np.array(rew_list),
+        'done': np.array(done_list),
         'info': None      
     }

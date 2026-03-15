@@ -1,3 +1,4 @@
+import os
 import torch
 from torch import nn
 import pytorch_lightning as pl
@@ -7,6 +8,11 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from typing import List, Dict, Union
 from modelBased.common import utils
 from domain.minigrid import minigrid_support as minigrid_utils
+from domain.crafter.crafter_support import (
+    crafter_classification_loss,
+    crafter_reconstruct_from_logits,
+    visualize_crafter_wm,
+)
 from . import AttentionWM_support
 from . import Embedding_support
 from . import MLP_support
@@ -42,6 +48,7 @@ class AttentionWorldModel(pl.LightningModule):
         self.fisher = 0
         self.old_params = None
         self.env_type = hparams.env_type
+        self.frame_stack = getattr(hparams, "frame_stack", 1)
         MODEL_MAPPING = {
             'attention': AttentionWM_support.AttentionModule,
             'embedding': Embedding_support.EmbeddingModule,
@@ -55,7 +62,9 @@ class AttentionWorldModel(pl.LightningModule):
                 hparams.grid_shape, 
                 hparams.attention_mask_size, 
                 hparams.embed_dim, 
-                hparams.num_heads
+                hparams.num_heads,
+                env_type=self.env_type,
+                frame_stack=self.frame_stack
             )
         else:
             print(f"Model type: {hparams.model_type} not supported")
@@ -241,12 +250,16 @@ class AttentionWorldModel(pl.LightningModule):
                 break
             
             # 1. Preprocess batch
-            obs, act, obs_next, info, obs_masked, _ = self.preprocess_batch(batch)
+            obs, act, obs_next, info, obs_masked, _, inv, inv_next = self.preprocess_batch(batch)
             obs = obs.to(device, dtype=torch.float32)
             act = act.to(device)
             obs_next = obs_next.to(device, dtype=torch.float32)
             if obs_masked is not None:
                 obs_masked = obs_masked.to(device)
+            if inv is not None:
+                inv = inv.to(device)
+            if inv_next is not None:
+                inv_next = inv_next.to(device)
             
             # 2. Iterate over samples in the batch
             batch_size = obs.shape[0]
@@ -262,12 +275,24 @@ class AttentionWorldModel(pl.LightningModule):
                 s_info = {k: v[b:b+1] for k, v in info.items()} if info is not None else None
                 s_obs_next = obs_next[b:b+1]
                 s_obs_masked = obs_masked[b:b+1] if obs_masked is not None else None
+                s_inv = inv[b:b+1] if inv is not None else None
+                s_inv_next = inv_next[b:b+1] if inv_next is not None else None
 
                 # Forward & Backward (fp32)
                 with torch.cuda.amp.autocast(enabled=False):
-                    pred, _ = self(s_obs, s_act, s_info)
-                    loss_dict = self.loss_function_weight(pred, s_obs_next, s_obs_masked)
+                    pred, _, s_inv_pred = self(s_obs, s_act, s_info, inv=s_inv)
+                    loss_dict = self.loss_function_weight(pred, s_obs_next, s_obs_masked, obs_prev=s_obs)
                     loss_sample = loss_dict['loss_obs']
+                    
+                    if self.env_type == 'crafter' and s_inv_pred is not None and s_inv_next is not None:
+                        if s_inv is not None:
+                            inv_diff = torch.abs(s_inv_next - s_inv).float()
+                            # If an inventory element changes, hit it with x100 magnitude
+                            inv_w = 1.0 + (inv_diff > 1e-5).float() * 100.0
+                            loss_inv = (F.mse_loss(s_inv_pred, s_inv_next.float(), reduction='none') * inv_w).mean()
+                        else:
+                            loss_inv = F.mse_loss(s_inv_pred, s_inv_next.float())
+                        loss_sample = loss_sample + 10.0 * loss_inv
                 
                 loss_sample.backward()
 
@@ -456,28 +481,31 @@ class AttentionWorldModel(pl.LightningModule):
                     self.loss_accumulator[global_y][global_x].append(value)
 
     def compute_cell_loss(self, next_pred, next_true):
-        """
-        Compute per-cell MSE loss.
-        Args:
-            next_pred: Tensor (B, C, H, W)
-            next_true: Tensor (B, C, H, W)
-        Returns:
-            loss_map: Tensor (B, H, W) - mean squared error per cell
-        """
-        # 计算每个位置的误差 (B, C, H, W)
-        error = torch.abs(next_pred - next_true)
-        
-        # 在通道维度求平均 => (B, H, W)
-        loss_map = error.mean(dim=1)
+        # 计算每个位置的误差
+        if self.env_type == 'crafter':
+            # Classification loss per cell (with target clamping)
+            loss_map = crafter_classification_loss(
+                next_pred, next_true, reduction='none'
+            )  # (B, H, W)
+        else:
+            # Standard Regression error
+            error = torch.abs(next_pred - next_true)
+            loss_map = error.mean(dim=1)  # (B, H, W)
 
         return loss_map
 
 
 
-    def forward(self, state, action, info):
-        next_state_pred, attentionWeight = self.model(state, action, info)
-        
-        return next_state_pred, attentionWeight
+    def forward(self, state, action, info, inv=None):
+        out = self.model(state, action, info, inv=inv)
+        if len(out) == 3:
+            next_state_pred, attentionWeight, inv_pred = out
+            return next_state_pred, attentionWeight, inv_pred
+        else:
+            # Fallback for MLP or older models that only return 2 items
+            next_state_pred, attentionWeight = out
+            return next_state_pred, attentionWeight, None
+
 
     def loss_function(self, next_observations_predict, next_observations_true):
         loss_obs = self.loss(next_observations_predict.flatten(1), next_observations_true.flatten(1))
@@ -494,24 +522,39 @@ class AttentionWorldModel(pl.LightningModule):
         """
         device = next_observations_predict.device 
         
-        # 1. Raw MSE (Flat)
-        # pred [B, C, H, W], true [B, C, H, W]
-        raw_sq_error = (next_observations_predict - next_observations_true) ** 2
+        # 1. Base Loss (MSE for MiniGrid, CrossEntropy for Crafter)
+        if self.env_type == 'crafter':
+            # Classification loss from crafter_support (with target clamping)
+            raw_error_map = crafter_classification_loss(
+                next_observations_predict, next_observations_true, reduction='none'
+            )  # (B, H, W)
+        else:
+            # MiniGrid: Standard Regression
+            raw_sq_error = (next_observations_predict - next_observations_true) ** 2
+            raw_error_map = raw_sq_error.mean(dim=1)  # (B, H, W)
 
-        # 2. Change Mask (Any change)
+             # 2. Change Mask (Any change)
         if obs_prev is not None:
              # Ensure types match
              if obs_prev.dtype != next_observations_true.dtype:
                  obs_prev = obs_prev.float() 
              
+             # If stacked, only compare against the latest frame in the stack
+             C_target = next_observations_true.size(1)
+             C_prev = obs_prev.size(1)
+             obs_prev_latest = obs_prev[:, -C_target:] if C_prev > C_target else obs_prev
+             
              # General Diff (Sum of all channels)
-             diff = torch.abs(next_observations_true - obs_prev).sum(dim=1, keepdim=True)
+             diff = torch.abs(next_observations_true - obs_prev_latest).sum(dim=1, keepdim=True)
              change_mask = (diff > 1e-5).float()
              
              # 3. State Channel Diff (Channel 2 is State: 0=Open, 1=Closed, 2=Locked)
-             # Focus strictly on channel 2
-             state_diff = torch.abs(next_observations_true[:, 2:3, :, :] - obs_prev[:, 2:3, :, :])
-             state_change_mask = (state_diff > 1e-5).float()
+             if C_target > 2:
+                  # Focus strictly on channel 2 of the most recent frame
+                  state_diff = torch.abs(next_observations_true[:, 2:3, :, :] - obs_prev_latest[:, 2:3, :, :])
+                  state_change_mask = (state_diff > 1e-5).float()
+             else:
+                  state_change_mask = torch.zeros_like(change_mask)
              
         else:
              # Fallback if no prev frame (rare)
@@ -522,26 +565,30 @@ class AttentionWorldModel(pl.LightningModule):
         # Base=1.0, Move=+10, Interaction=+100 -> Total 111.0 for Opening Door
         weights = 1.0 + (change_mask * 10.0) + (state_change_mask * 100.0)
         
-        # [MODIFIED] Interaction Weighting (Dynamic)
-        # Logic: If a pixel changed (`change_mask`) AND it is a Critical Element (`obs_masked`),
-        # it means an INTERACTION happened (Stepped on Lava, Picked Key, Opened Door).
-        # We boost this specific event to +100.0.
         if obs_masked is not None:
-             # obs_masked is (B, H, W) -> Unsqueeze to match weights (B, 1, H, W)
              if obs_masked.ndim == 3:
                  static_mask = obs_masked.unsqueeze(1).float()
              else:
                  static_mask = obs_masked.float()
-             
+                 
              # INTERACTION = CHANGE * ELEMENT
-             # Even for Lava, when agent steps on it, the pixel changes (Agent covers Lava).
-             # This change happens AT the Lava location.
              interaction_mask = change_mask * static_mask
              
-             weights = weights + (interaction_mask * 100.0)
+             if self.env_type == 'crafter':
+                 # For Crafter, these elements are stochastic entities (zombies, animals).
+                 # We want to learn them but not let them dominate the loss due to random jitter.
+                 stochastic_weight = 5.0
+                 weights = weights + (interaction_mask * stochastic_weight)
+             else:
+                 # Original MiniGrid behavior: boost critical interactions like keys/doors
+                 weights = weights + (interaction_mask * 100.0)
 
         # 5. Weighted Mean
-        loss = (raw_sq_error * weights).mean()
+        # Ensure raw_error_map and weights have matching dimensions
+        if weights.ndim > raw_error_map.ndim:
+             weights = weights.squeeze(1) # [B, 1, H, W] -> [B, H, W]
+        
+        loss = (raw_error_map * weights).mean()
         
         return {"loss_obs": loss}
 
@@ -574,31 +621,56 @@ class AttentionWorldModel(pl.LightningModule):
         else:
             info = None
         
+        inv = batch.get('inv', None)
+        inv_next = batch.get('inv_next', None)
 
-        agent_postion_yx_batch = minigrid_utils.get_agent_position(obs)
+        player_id = 13 if self.env_type == 'crafter' else 10
+        agent_postion_yx_batch = minigrid_utils.get_agent_position(obs, player_id=player_id)
         obs_masked = minigrid_utils.extract_masked_state(obs, self.mask_size, agent_postion_yx_batch)
         obs_next_masked = minigrid_utils.extract_masked_state(obs_next, self.mask_size, agent_postion_yx_batch)
 
-        # extract positions where objects are located
-        object_map = obs_masked[:, 0]  # 取第0通道 (B,H,W)
-        key_mask = (object_map == 5)
-        door_mask = (object_map == 4)
-        lava_mask = (object_map == 9)
-        elements_mask = key_mask | door_mask | lava_mask  # (B,H,W)
+        # extract positions where objects are located (use the most recent frame if stacked)
+        C_base = 2 if self.env_type == 'crafter' else 3
+        curr_obj_idx = (self.frame_stack - 1) * C_base
+        object_map = obs_masked[:, curr_obj_idx]  # 取最后一帧的第0通道 (B,H,W)
+        if self.env_type == 'crafter':
+            # Interactive elements in Crafter: cow(11), zombie(12), skeleton(13), arrow(14), plant(15)
+            elements_mask = (object_map >= 11) & (object_map <= 15)
+        else:
+            key_mask = (object_map == 5)
+            door_mask = (object_map == 4)
+            lava_mask = (object_map == 9)
+            elements_mask = key_mask | door_mask | lava_mask  # (B,H,W)
         
-        ## visualization
+        ## visualization is now moved to training_step/validation_step for logits access
         self.step_counter += 1
-        if self.visualizationFlag and self.step_counter % self.visualize_every == 0 and training:
-            next_masked = obs_next_masked + obs_masked 
-            obs_next_all = obs + obs_next
-            self.visual_func.visualize_data(obs, obs_next_all, act, obs_masked, next_masked, info, self.step_counter, agent_postion_yx_batch)
-        return obs_masked, act, obs_next_masked, info, elements_mask, agent_postion_yx_batch
+        return obs_masked, act, obs_next_masked, info, elements_mask, agent_postion_yx_batch, inv, inv_next
 
 
     def training_step(self, batch, batch_idx):
         # —— 前向 & 主损失 —— #
-        obs, act, obs_next, info, elements_mask, _ = self.preprocess_batch(batch, True)
-        obs_pred, attentionWeight = self(obs, act, info)
+        obs, act, obs_next, info, elements_mask, agent_pos, inv, inv_next = self.preprocess_batch(batch, True)
+        obs_pred, attentionWeight, inv_pred = self(obs, act, info, inv=inv)
+
+        # [NEW] Crafter WM Visualization (Only in LAST EPOCH to save time)
+        is_last_epoch = False
+        try:
+            is_last_epoch = (self.current_epoch == self.trainer.max_epochs - 1)
+        except:
+            pass
+            
+        if self.visualizationFlag and is_last_epoch and (self.step_counter % self.visualize_every == 0):
+            if self.env_type == 'crafter':
+                visualize_crafter_wm(obs, obs_next, obs_pred, int(act[0].item()), self.step_counter, 
+                                     save_dir=os.path.join("modelBased/log", "wm_visual/train"),
+                                     full_map_size=batch['obs'].shape[-2:],
+                                     agent_pos=agent_pos[0],
+                                     inv=inv[0].cpu().numpy() if inv is not None else None,
+                                     inv_next=inv_next[0].cpu().numpy() if inv_next is not None else None)
+            else:
+                # Fallback to legacy visualize_data for MiniGrid (requires whole map)
+                # Note: this part needs whole map, which we have in 'batch'
+                self.visual_func.visualize_data(batch['obs'], batch['obs'] + batch['obs_next'], act, obs, obs_next, info, self.step_counter, agent_pos)
 
         if obs_next.dtype != obs_pred.dtype:
             obs_next = obs_next.float()
@@ -611,9 +683,16 @@ class AttentionWorldModel(pl.LightningModule):
         loss_dict = self.loss_function_weight(obs_pred, obs_next, elements_mask, obs_prev=obs)
         weighted_obs_loss = loss_dict['loss_obs']
         
-        # [LOGGING] Pure Raw MSE for Scientific Reporting
-        # This is what will be written to CSV and plots as "Gen_Real_Loss" / "WM_Val_Loss"
-        raw_mse = F.mse_loss(obs_pred, obs_next)
+        # [LOGGING] Metrics for Scientific Reporting
+        if self.env_type == 'crafter':
+            obs_pred_reconst = crafter_reconstruct_from_logits(obs_pred)
+            raw_mse = F.mse_loss(obs_pred_reconst, obs_next)
+            # Raw (unweighted) CE loss — the true training signal for Crafter
+            from domain.crafter.crafter_support import crafter_classification_loss
+            raw_ce = crafter_classification_loss(obs_pred, obs_next, reduction='mean')
+        else:
+            raw_mse = F.mse_loss(obs_pred, obs_next)
+            raw_ce = None
         
         # —— raw EWC（未乘 λ）—— #
         ewc_raw = self.ewc_loss()
@@ -624,10 +703,26 @@ class AttentionWorldModel(pl.LightningModule):
         # —— 合成总损失 —— #
         ewc_term = self.lambda_ewc * ewc_raw
         loss_total = weighted_obs_loss + ewc_term
+        
+        # Add inventory MSE loss dynamically if applicable
+        if self.env_type == 'crafter' and inv_pred is not None and inv_next is not None:
+            if inv is not None:
+                inv_diff = torch.abs(inv_next - inv).float()
+                inv_weights = 1.0 + (inv_diff > 1e-5).float() * 100.0
+                inv_loss = (F.mse_loss(inv_pred, inv_next.float(), reduction='none') * inv_weights).mean()
+            else:
+                inv_loss = F.mse_loss(inv_pred, inv_next.float())
+                
+            loss_total = loss_total + 10.0 * inv_loss
+            self.log("train/inv_loss", inv_loss, prog_bar=True, on_step=True, on_epoch=True)
 
         # —— 统一日志 —— #
-        # Critical: Log Raw MSE as 'loss_obs' so it aligns with standard metrics
-        self.log("loss_obs", raw_mse, prog_bar=True, on_step=True, on_epoch=True) 
+        # Log raw_mse as 'loss_obs' for compatibility
+        self.log("loss_obs", raw_mse, prog_bar=True, on_step=True, on_epoch=True)
+        
+        if raw_ce is not None:
+            # Crafter: also log raw CE separately for clear monitoring
+            self.log("train/ce_loss", raw_ce, prog_bar=True, on_step=True, on_epoch=True)
         
         # Log weighted loss separately for debugging
         self.log("train/loss_weighted", weighted_obs_loss, on_step=True, on_epoch=True)
@@ -639,9 +734,11 @@ class AttentionWorldModel(pl.LightningModule):
         self.log("train/loss_total", loss_total.detach(), on_step=True, on_epoch=True)
 
         if self.global_step % 1000 == 0:
+            ce_str = f", CE: {raw_ce.item():.6f}" if raw_ce is not None else ""
             print(f"[Step {self.global_step}] "
                 f"Raw MSE: {raw_mse.item():.6f}, "
-                f"Weighted Loss: {weighted_obs_loss.item():.6f}, "
+                f"Weighted Loss: {weighted_obs_loss.item():.6f}"
+                f"{ce_str}, "
                 f"EWC: {ewc_raw.item():.6f}, "
                 f"Total: {loss_total.item():.6f}")
 
@@ -650,8 +747,8 @@ class AttentionWorldModel(pl.LightningModule):
     
    
     def validation_step(self, batch, batch_idx):
-        obs, act, obs_next, info, elements_mask, agent_position = self.preprocess_batch(batch)
-        obs_pred, attention_weight = self(obs, act, info)
+        obs, act, obs_next, info, elements_mask, agent_position, inv, inv_next = self.preprocess_batch(batch)
+        obs_pred, attention_weight, inv_pred = self(obs, act, info, inv=inv)
         # if self.hparams.freeze_weight:
         #     diff = torch.abs(obs_pred - obs_next)  # (128, 3, 3, 3)
         #     max_diff_per_group, max_indices = diff.reshape(diff.shape[0], -1).max(dim=1)  
@@ -675,38 +772,40 @@ class AttentionWorldModel(pl.LightningModule):
         if obs_next.dtype != obs_pred.dtype:
             obs_next = obs_next.float()
         
+        # [NEW] Crafter WM Visualization for Validation (Dataset 2)
+        if self.visualizationFlag and batch_idx == 0:
+            if self.env_type == 'crafter':
+                visualize_crafter_wm(obs, obs_next, obs_pred, int(act[0].item()), self.step_counter, 
+                                     save_dir=os.path.join("modelBased/log", "wm_visual/val"),
+                                     full_map_size=batch['obs'].shape[-2:],
+                                     agent_pos=agent_position[0],
+                                     inv=batch['inv'][0].cpu().numpy() if 'inv' in batch else None,
+                                     inv_next=batch['inv_next'][0].cpu().numpy() if 'inv_next' in batch else None)
+
         # Ensure obs is float for diff calculation
         if obs.dtype != obs_pred.dtype:
             obs = obs.float()
 
-        # [TRAINING LOGIC (Kept for consistency)] 
-        # But for Validation Logging, we want Pure MSE.
-        
-        # 1. Pure Raw MSE (The scientific metric)
-        raw_mse = F.mse_loss(obs_pred, obs_next)
-        
-        # 2. Weighted (Just for debug print if needed, or consistency check)
-        # loss_dict = self.loss_function_weight(obs_pred, obs_next, elements_mask, obs_prev=obs)
-        
-        loss = raw_mse
-        
-        # print(torch.round(obs_pred))
-        self.log_dict({"val_loss": loss})
-        ## visualization
-        # self.step_counter += 1
-        # if self.visualizationFlag and self.step_counter % self.visualize_every == 0:
-        #     next = obs_next + obs 
-        #     pre = obs_pred + obs
-        #     self.visual_func.visualize_attention(obs, act, attention_weight, next, pre, self.step_counter, info)
-        # return {"batch_idx": batch_idx, "val_loss": loss['loss_obs']}
-        # [MODIFIED] Validation Metric Switch
-        loss_val = raw_mse
-        if getattr(self.hparams, "validation_metric", "mse") == "weighted":
-             loss_dict = self.loss_function_weight(obs_pred, obs_next, elements_mask, obs_prev=obs)
-             loss_val = loss_dict['loss_obs']
+        # [VALIDATION METRIC]
+        # Crafter → CE is the correct metric (discrete IDs, not numeric)
+        # MiniGrid → MSE as before
+        if self.env_type == 'crafter':
+            from domain.crafter.crafter_support import crafter_classification_loss
+            val_ce = crafter_classification_loss(obs_pred, obs_next, reduction='mean')
+            loss_val = val_ce
+            
+            if inv_pred is not None and inv_next is not None:
+                val_inv_loss = F.mse_loss(inv_pred, inv_next.float())
+                loss_val = loss_val + val_inv_loss
+                self.log("val/inv_loss", val_inv_loss, on_step=False, on_epoch=True)
 
-        self.log_dict({"val_loss": loss_val})
-        
+            self.log("val/ce_loss", val_ce, on_step=False, on_epoch=True)
+        else:
+            raw_mse = F.mse_loss(obs_pred, obs_next)
+            loss_val = raw_mse
+
+        self.log("val_loss", loss_val, prog_bar=True)
+
         return {
             "loss_wm_val": loss_val,             
         }
@@ -765,15 +864,23 @@ class AttentionWorldModel(pl.LightningModule):
         if self.env_type != 'with_obj':
              batch['info'] = None
 
-        obs_masked, act, obs_next_masked, info, elements_mask, _ = self.preprocess_batch(batch, training=False)
+        obs_masked, act, obs_next_masked, info, elements_mask, _, inv, inv_next = self.preprocess_batch(batch, training=False)
         
-        obs_pred, _ = self(obs_masked, act, info)
+        obs_pred, _, _ = self(obs_masked, act, info, inv=inv)
         
         if obs_next_masked.dtype != obs_pred.dtype:
             obs_next_masked = obs_next_masked.float()
             
         loss_dict = self.loss_function_weight(obs_pred, obs_next_masked, elements_mask)
-        return loss_dict['loss_obs']
+        return loss_dict
+
+    def on_train_end(self):
+        """Save a final visualization at the end of training."""
+        if self.visualizationFlag and self.env_type == 'crafter':
+            # We don't easily have the last batch here, but we can signal or just rely on the last training_step/val_step
+            # For now, we prints a message to confirm.
+            print(f"[WM] Training ended. Final visualizations saved in modelBased/log/wm_visual/")
+
 
 
 

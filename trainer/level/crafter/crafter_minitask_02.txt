@@ -1,0 +1,6 @@
+GGGGGG
+GGAGGG
+GGGGGG
+
+# --- Initial Stats ---
+wood: 6  

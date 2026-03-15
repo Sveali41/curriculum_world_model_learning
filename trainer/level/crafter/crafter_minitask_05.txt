@@ -1,0 +1,7 @@
+GGIGIG
+GGAGGG
+GGIGIG
+
+# --- Minitask 05: Iron Ore ---
+health: 9
+stone_pickaxe: 1

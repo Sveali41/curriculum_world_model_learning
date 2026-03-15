@@ -359,7 +359,8 @@ class GeneratorInterface:
         old_episodes = self.support.cfg.env.collect.episodes
         try:
             save_name = f'UED_temp_iter{iteration}_b{batch_idx}'
-            self.support.cfg.env.collect.episodes = 1 
+            # Respect configurable episodes per env, default to 1 for UED efficiency
+            self.support.cfg.env.collect.episodes = getattr(self.cfg.generator_agent, "episodes_per_env", 1)
             save_path = collect_data_general(self.support.cfg, env_source=env_str, save_name=save_name, max_steps=1000, recollect_data=True)
             
             if os.path.exists(save_path):
@@ -373,7 +374,10 @@ class GeneratorInterface:
             scalar_loss = np.mean(loss_list) if loss_list else 0.0
             scaled_h = np.log(avg_loss_map + 1e-8)
             heat = torch.tensor(scaled_h, device=self.device).unsqueeze(0).unsqueeze(0)
-        except:
+        except Exception as e:
+            import traceback
+            print(f"[Generator] Rollout failed for batch {batch_idx}: {e}")
+            traceback.print_exc()
             traj_data, heat, scalar_loss, solved = {}, torch.zeros((1, 1, self.map_height, self.map_width), device=self.device), 0.0, False
         finally:
             self.support.cfg.env.collect.episodes = old_episodes

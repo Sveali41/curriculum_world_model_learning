@@ -14,20 +14,21 @@ from gym import spaces
 # ---------------------------------------------------------------------
 # 1. Object / Tile IDs
 # ---------------------------------------------------------------------
-
-TILE_ID = {
-    0: 0, 1: 1, 2: 2, 3: 3, 4: 4,
-    5: 5, 6: 6, 7: 7, 8: 8,
-}
+# Materials (tile IDs 0-12), matching original Crafter engine._mat_ids:
+# 0=None/empty, 1=water, 2=grass, 3=stone, 4=path, 5=sand, 6=tree,
+# 7=lava, 8=coal, 9=iron, 10=diamond, 11=table, 12=furnace
+# Entities (IDs 13-19), starting after materials:
+# 13=Player, 14=Cow, 15=Zombie, 16=Skeleton, 17=Arrow, 18=Plant, 19=Fence
+# Total object classes = 20 (0-19)
 
 ENTITY_ID = {
-    "player": 10,
-    "cow": 11,
-    "zombie": 12,
-    "skeleton": 13,
-    "arrow": 14,
-    "plant": 15,
-    "fence": 16,
+    "player":   13,
+    "cow":      14,
+    "zombie":   15,
+    "skeleton": 16,
+    "arrow":    17,
+    "plant":    18,
+    "fence":    19,
 }
 
 DIR_TO_ID = {
@@ -69,30 +70,34 @@ def get_engine(env):
 
 def extract_tensor_grid(env):
     engine = get_engine(env)
-    H, W = engine.world_shape
-    grid = np.zeros((H, W, 2), dtype=np.int32)
+    # Crafter engine returns (Width, Height) i.e. (Col, Row)
+    W, H = engine.world_shape
+    # Return (Col, Row, Chan) to satisfy ColRowCanl_to_CanlRowCol expectations
+    grid = np.zeros((W, H, 2), dtype=np.int32)
 
     mat_map = engine.tile_map
-    for y in range(H):
-        for x in range(W):
+    for x in range(W):
+        for y in range(H):
+            # mat_map is indexed (x, y) where x=col, y=row
             tile_val = int(mat_map[x, y]) if x < mat_map.shape[0] and y < mat_map.shape[1] else 0
-            grid[y, x, 0] = TILE_ID.get(tile_val, 0)
+            grid[x, y, 0] = max(0, min(tile_val, 12))
 
     for ent in getattr(engine, "entities", []):
         ex, ey = int(ent.pos[0]), int(ent.pos[1])
         if not (0 <= ex < W and 0 <= ey < H):
             continue
         kind = type(ent).__name__.lower()
-        grid[ey, ex, 0] = ENTITY_ID.get(kind, 0)
+        # grid[col, row] -> grid[ex, ey]
+        grid[ex, ey, 0] = ENTITY_ID.get(kind, 0)
         if hasattr(ent, "facing"):
             dir_id = DIR_TO_ID.get(tuple(int(v) for v in ent.facing), 0)
-            grid[ey, ex, 1] = dir_id
+            grid[ex, ey, 1] = dir_id
 
     px, py = map(int, engine.player.pos)
-    grid[py, px, 0] = ENTITY_ID["player"]
+    grid[px, py, 0] = ENTITY_ID["player"]
     if hasattr(engine.player, "facing"):
         dir_id = DIR_TO_ID.get(tuple(int(v) for v in engine.player.facing), 0)
-        grid[py, px, 1] = dir_id
+        grid[px, py, 1] = dir_id
 
     return grid
 
@@ -118,7 +123,7 @@ class CrafterSymbolicEnv(gym.Env):
         H, W = engine.world_shape
 
         self.observation_space = spaces.Dict({
-            "grid": spaces.Box(low=0, high=20, shape=(H, W, 2), dtype=np.int32),
+            "grid": spaces.Box(low=0, high=20, shape=(H, W, 2), dtype=np.int32),  # max ID=19
             "rgb": spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8),
             "info": spaces.Dict({
                 "health": spaces.Box(0, 10, shape=(), dtype=np.float32),
@@ -222,14 +227,15 @@ def make_world_from_chars(char_grid, seed=0):
     # e.g. {None: 0, 'water': 1, 'grass': 2, 'stone': 3, ...}
 
     # ---- 2. Create the actual world with the same structure ----
-    world = World(area=(H, W), materials=list(constants.materials), chunk_size=(12, 12))
+    # area should be (Width, Height) -> (Cols, Rows)
+    world = World(area=(W, H), materials=list(constants.materials), chunk_size=(12, 12))
     world.daylight = 1.0
 
     # ---- 3. Fill the material map from character layout ----
-    for y in range(H):
-        for x in range(W):
+    for y in range(H):    # Row index
+        for x in range(W): # Column index
             ch = char_grid[y, x]
-            mat_name = CHAR_TO_TILE.get(ch, 'grass')  # Default to grass if unknown
+            mat_name = CHAR_TO_TILE.get(ch, 'grass')
             mat_id = MATERIAL_NAME_TO_ID.get(mat_name, MATERIAL_NAME_TO_ID['grass'])
             world._mat_map[x, y] = mat_id
 
@@ -286,6 +292,8 @@ class CustomCrafterEnv(gym.Env):
             custom_mission="Explore and craft.",
             max_steps=None,
             seed=0,
+            ai_enabled=False,
+            slippery_prob=0.0,   # Probability that the agent's action is replaced by a random movement
             **kwargs,
     ):
         super().__init__()
@@ -298,12 +306,23 @@ class CustomCrafterEnv(gym.Env):
         self.layout_str = layout_str
         self.max_steps = max_steps or 10000
         self.current_step = 0
+        self.initial_inventory = kwargs.get('initial_inventory', {}) or {}
         
         # ========== Alignment: Parse Layout Input ==========
         if self.txt_file_path:
             with open(self.txt_file_path, 'r') as file:
-                sections = file.read().split('\n\n')
+                sections = file.read().strip().split('\n\n')
                 self.layout_str = sections[0].strip()
+                # Parse initial inventory if a second block is provided
+                if len(sections) > 1:
+                    inv_lines = sections[1].strip().split('\n')
+                    for line in inv_lines:
+                        line = line.strip()
+                        if not line or line.startswith('#'): continue
+                        if ':' in line or '=' in line:
+                            sep = ':' if ':' in line else '='
+                            key, val = line.split(sep, 1)
+                            self.initial_inventory[key.strip().lower()] = float(val.strip())
         elif not self.layout_str:
             # Fallback tiny map if nothing is provided
             self.layout_str = "GGGGGGG\nGGGGGGG\nGGGPGGG\nGGGGGGG\nGGGGGGG"
@@ -326,7 +345,11 @@ class CustomCrafterEnv(gym.Env):
             "image": spaces.Box(low=0, high=255, shape=(64, 64, 2), dtype=np.int32),
             "inventory": spaces.Box(low=0.0, high=100.0, shape=(16,), dtype=np.float32)
         })
-        self.ai_enabled = False
+        self.ai_enabled = ai_enabled
+        # Slippery: with this probability, a movement action (1-4) is replaced by a random movement
+        self.slippery_prob = float(slippery_prob)
+        # Crafter movement action IDs: 1=move_left, 2=move_right, 3=move_up, 4=move_down
+        self._move_actions = [1, 2, 3, 4]
 
     def _extract_obs(self):
         # 替换 RGB Image，直接调用原生符号化提取 (H, W, 2)
@@ -388,6 +411,15 @@ class CustomCrafterEnv(gym.Env):
         )
 
         self.current_step = 0
+        
+        # Inject custom initial inventory
+        if hasattr(self, 'initial_inventory') and self.initial_inventory:
+            for item, amount in self.initial_inventory.items():
+                if item in ['health', 'food', 'drink', 'energy']:
+                    setattr(self.env._player, item, max(0, min(9, amount)))
+                else:
+                    self.env._player.inventory[item] = amount
+
         return self._extract_obs(), {}
 
     def step(self, action):
@@ -399,13 +431,19 @@ class CustomCrafterEnv(gym.Env):
 
         from crafter import constants
 
-        # --- 1. Apply player action ---
+        # --- 1. Apply slippery (only for movement actions) ---
+        if self.slippery_prob > 0.0 and action in self._move_actions:
+            if np.random.random() < self.slippery_prob:
+                # Replace with a random movement action (could be same or different)
+                action = np.random.choice(self._move_actions)
+
+        # --- 2. Apply player action ---
         # Map the discrete action ID to the Crafter action constant
         # and update the player’s state accordingly.
         self.env._player.action = constants.actions[action]
         self.env._player.update()
 
-        # --- 2. Optionally update other entities (if AI is enabled) ---
+        # --- 3. Optionally update other entities (if AI is enabled) ---
         # This allows switching between deterministic and full simulation modes.
         if self.ai_enabled:
             for obj in self.env._world.objects:
@@ -434,6 +472,36 @@ class CustomCrafterEnv(gym.Env):
     def render(self, mode="rgb_array"):
         return self.env.render(size=(128, 128))
 
+    def render_global(self, unit=64):
+        """
+        Renders the entire Crafter map globally instead of just the agent-centric local view.
+        Returns a full RGB frame.
+        """
+        from crafter import engine
+        world = self.env._world
+        textures = self.env._textures
+        
+        W, H = world.area
+        canvas = np.zeros((W * unit, H * unit, 3), np.uint8) + 127
+        
+        # 1. Render all tiles
+        for x in range(W):
+            for y in range(H):
+                material, _ = world[(x, y)]
+                if material is not None:
+                    texture = textures.get(material, (unit, unit))
+                    engine._draw(canvas, np.array([x, y]) * unit, texture)
+                    
+        # 2. Render all objects on top
+        for obj in world.objects:
+            pos = obj.pos
+            texture = textures.get(obj.texture, (unit, unit))
+            engine._draw_alpha(canvas, pos * unit, texture)
+            
+        # Optional: time-of-day lighting
+        # For a clean full map view, we just return the daylight canvas
+        return canvas.transpose((1, 0, 2))
+
     def close(self):
         self.env.close()
 
@@ -459,7 +527,7 @@ if __name__ == "__main__":
 
     # --- 1. Create a custom environment from the layout string ---
     base_env = CustomCrafterEnv(layout_str=layout_str, seed=0)
-    base_env.ai_enabled = False  # keep deterministic (disable Cow/Zombie auto-movement)
+    base_env.ai_enabled = True  # keep deterministic (disable Cow/Zombie auto-movement)
 
     # --- 2. Reset the environment ---
     obs, _ = base_env.reset()
@@ -490,7 +558,7 @@ if __name__ == "__main__":
         action_names = list(constants.actions)
 
     plt.ion()
-    for i in range(5):
+    for i in range(100):
         # --- Execute a random action ---
         action_id = base_env.action_space.sample()
         action_name = action_names[action_id] if action_id < len(action_names) else str(action_id)

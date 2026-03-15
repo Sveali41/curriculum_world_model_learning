@@ -163,15 +163,28 @@ class CustomTransformerEncoderLayer(nn.Module):
 
 
 class AttentionModule(nn.Module):
-    def __init__(self, data_type, grid_shape, mask_size, embed_dim, num_heads):
+    def __init__(self, data_type, grid_shape, mask_size, embed_dim, num_heads, env_type="minigrid", frame_stack=1):
         super().__init__()
         self.data_type = data_type
+        self.env_type = env_type
+        self.frame_stack = frame_stack
         if data_type == 'discrete':
-            self.input_channel = 21
-            self.action_embedding = nn.Embedding(5, embed_dim)
+            if env_type == 'crafter':
+                # 20 object classes (0-19) + 5 direction classes = 25 channels per frame
+                self.input_channel = (20 + 5) * frame_stack
+                self.action_embedding = nn.Embedding(17, embed_dim) # 17 actions in crafter
+                self.inv_fc = nn.Linear(16, embed_dim)
+                self.inv_head = nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim),
+                    nn.ReLU(),
+                    nn.Linear(embed_dim, 16)
+                )
+            else:
+                self.input_channel = (11 + 6 + 4) * frame_stack
+                self.action_embedding = nn.Embedding(7, embed_dim)
             self.key_embedding = nn.Embedding(2, embed_dim)
         else:
-            self.input_channel = grid_shape[0]
+            self.input_channel = grid_shape[0] * frame_stack
             self.action_fc = nn.Linear(1, embed_dim)
 
         self.mask_size = mask_size
@@ -195,26 +208,48 @@ class AttentionModule(nn.Module):
             CustomTransformerEncoderLayer(d_model=embed_dim, nhead=num_heads)
             for _ in range(2)
         ])
-        self.fc = nn.Linear(embed_dim, 3)
+        
+        if env_type == 'crafter':
+            self.out_channel = 20 + 5  # 20 obj classes (0-19) + 5 dir classes
+        else:
+            self.out_channel = 3
+        self.fc = nn.Linear(embed_dim, self.out_channel)
+        
         self.dropout_conv = nn.Dropout(p=0.1)
 
 
-    def forward(self, state, action, info):
+    def forward(self, state, action, info, inv=None):
         orginal_dim = state.ndim
         if orginal_dim == 3:  # 单个样本
             state = state.unsqueeze(0)
             action = torch.tensor([action]).to(state.device)
-        B, C, H, W = state.size()
+        B, TotalC, H, W = state.size()
+        K = self.frame_stack
+        C_base = TotalC // K
 
         # ==== 状态编码 ====
         if self.data_type == 'discrete':
-            obj = state[:, 0, :, :]
-            color = state[:, 1, :, :]
-            dir = state[:, 2, :, :]
-            obj = F.one_hot(obj.reshape(B, -1).long(), num_classes=11)
-            color = F.one_hot(color.reshape(B, -1).long(), num_classes=6)
-            dir = F.one_hot(dir.reshape(B, -1).long(), num_classes=4)
-            state_emb = torch.cat([obj, color, dir], dim=-1).float()
+            all_frames_emb = []
+            for k in range(K):
+                frame = state[:, k*C_base:(k+1)*C_base]
+                if self.env_type == 'crafter':
+                    obj = frame[:, 0]
+                    dir_id = frame[:, 1]
+                    obj_oh = F.one_hot(obj.reshape(B, -1).long(), num_classes=20)  # IDs 0-19
+                    dir_oh = F.one_hot(dir_id.reshape(B, -1).long(), num_classes=5)
+                    frame_emb = torch.cat([obj_oh, dir_oh], dim=-1).float()
+                else:
+                    obj = frame[:, 0]
+                    color = frame[:, 1]
+                    dir_id = frame[:, 2]
+                    obj_oh = F.one_hot(obj.reshape(B, -1).long(), num_classes=11)
+                    color_oh = F.one_hot(color.reshape(B, -1).long(), num_classes=6)
+                    dir_oh = F.one_hot(dir_id.reshape(B, -1).long(), num_classes=4)
+                    frame_emb = torch.cat([obj_oh, color_oh, dir_oh], dim=-1).float()
+                all_frames_emb.append(frame_emb)
+            
+            # Combine all stacked frames' embeddings
+            state_emb = torch.cat(all_frames_emb, dim=-1)
             state_emb = state_emb.transpose(1, 2).reshape(B, self.input_channel, H, W)
         else:
             state_emb = state
@@ -234,23 +269,31 @@ class AttentionModule(nn.Module):
 
         action_emb = action_emb.unsqueeze(1).expand(-1, x.size(1), -1)  # (B, N, D)
 
-        # ==== 携带钥匙信息嵌入并广播 ====
-        if info is not None and 'carrying_key' in info:
-            has_key = info['carrying_key']
-            if not torch.is_tensor(has_key):
-                has_key = torch.tensor(has_key, device=state.device)
+        # ==== 携带上下文信息（钥匙/背包）嵌入并广播 ====
+        if self.env_type == 'crafter':
+            if inv is not None:
+                context_emb = self.inv_fc(inv)  # (B, D)
             else:
-                has_key = has_key.to(state.device)
-            key_emb = self.key_embedding(has_key.long())  # (B, D)
-            if key_emb.ndim == 1:
-                key_emb = key_emb.unsqueeze(0)
+                context_emb = torch.zeros_like(action_emb[:, 0, :])
+            if context_emb.ndim == 1:
+                context_emb = context_emb.unsqueeze(0)
         else:
-            key_emb = torch.zeros_like(action_emb[:, 0, :])  # (B, D)
+            if info is not None and 'carrying_key' in info:
+                has_key = info['carrying_key']
+                if not torch.is_tensor(has_key):
+                    has_key = torch.tensor(has_key, device=state.device)
+                else:
+                    has_key = has_key.to(state.device)
+                context_emb = self.key_embedding(has_key.long())  # (B, D)
+                if context_emb.ndim == 1:
+                    context_emb = context_emb.unsqueeze(0)
+            else:
+                context_emb = torch.zeros_like(action_emb[:, 0, :])  # (B, D)
 
-        key_emb = key_emb.unsqueeze(1).expand(-1, x.size(1), -1)  # (B, N, D)
+        context_emb = context_emb.unsqueeze(1).expand(-1, x.size(1), -1)  # (B, N, D)
 
-        # ==== 融合三个信息：patch + action + key ====
-        fused = torch.cat([x, action_emb, key_emb], dim=-1)  # (B, N, 3D)
+        # ==== 融合三个信息：patch + action + context ====
+        fused = torch.cat([x, action_emb, context_emb], dim=-1)  # (B, N, 3D)
         x = self.fuse_fc(fused)  # (B, N, D)
 
         # ==== Transformer ====
@@ -262,9 +305,18 @@ class AttentionModule(nn.Module):
         x = self.res_mlp(x)  # shape: (B, N, D)
 
         # ==== 输出层 ====
-        x = self.fc(x)
-        x = x.transpose(1, 2).reshape(B, C, H, W)
+        x_out = self.fc(x)
+        x_out = x_out.transpose(1, 2).reshape(B, self.out_channel, H, W)
+
+        if self.env_type == 'crafter':
+            # Mean pool over spatial patches to predict inventory
+            x_pooled = x.mean(dim=1)  # (B, D)
+            inv_pred = self.inv_head(x_pooled) # (B, 16)
+        else:
+            inv_pred = None
 
         if orginal_dim == 3:
-            x = x.squeeze(0)
-        return x, attn_weights
+            x_out = x_out.squeeze(0)
+            if inv_pred is not None:
+                inv_pred = inv_pred.squeeze(0)
+        return x_out, attn_weights, inv_pred

@@ -1,0 +1,11 @@
+GTGRRRR
+GTTTTTG
+GGAGOGG
+GIGGGGG
+GIWWMCC
+
+# --- Default Stats ---
+health: 9
+food: 9
+drink: 9
+energy: 9
