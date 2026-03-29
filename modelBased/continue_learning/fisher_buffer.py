@@ -175,9 +175,9 @@ class FisherReplayBuffer:
             # ID=13 for Crafter player, ID=10 for MiniGrid player
             if (obj_map[b] == 13).any():
                 player_id = 13
-                # Crafter interactive: Tree(6), Stone(3/4), Coal(8), Iron(9), Diamond(10), Table(11), Furnace(12), Cow(14), Zombie(15), Skeleton(16), Plant(18)
+                # Crafter interactive: Water(1), Tree(6), Stone(3/4), Coal(8), Iron(9), Diamond(10), Table(11), Furnace(12), Cow(14), Plant(18)
                 # Note: ID 3/4 are Stone/Path in Crafter, ID 13 is Player
-                interactive_ids = [3, 4, 6, 8, 9, 10, 11, 12, 14, 15, 16, 18]
+                interactive_ids = [1, 3, 4, 6, 8, 9, 10, 11, 12, 14, 18]
             else:
                 player_id = 10
                 # MiniGrid interactive: door(4), key(5), lava(9)
@@ -347,6 +347,46 @@ class FisherReplayBuffer:
             print(f"[FisherBuffer] Added samples from {os.path.basename(path)}. Buffer size: {len(self.buffer)}")
         except Exception as e:
             print(f"[FisherBuffer] Error loading {path}: {e}")
+
+    def add_from_batch(
+        self,
+        batch: Dict,
+        current_sample_ratio=0.05,
+        fisher_buffer_elements_ratio=0.5,
+        target_shape=None
+    ):
+        """
+        Compatibility wrapper used by trainer baselines.
+        Accepts either canonical keys (obs/obs_next/act/...) or legacy short keys (a/b/c/...).
+        """
+        if batch is None:
+            return
+
+        key_map = {
+            "a": "obs",
+            "b": "obs_next",
+            "c": "act",
+            "d": "rew",
+            "e": "done",
+            "f": "info",
+            "g": "inv",
+            "h": "inv_next",
+        }
+        samples = {}
+        for k, v in batch.items():
+            samples[key_map.get(k, k)] = v
+
+        required = ("obs", "obs_next", "act")
+        if any(k not in samples for k in required):
+            missing = [k for k in required if k not in samples]
+            raise KeyError(f"add_from_batch missing required keys: {missing}")
+
+        self.update_combined(
+            samples,
+            current_sample_ratio=current_sample_ratio,
+            fisher_buffer_elements_ratio=fisher_buffer_elements_ratio,
+            target_shape=target_shape,
+        )
 
 
 

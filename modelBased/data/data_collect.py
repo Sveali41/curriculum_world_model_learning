@@ -288,7 +288,7 @@ def run_env_multiprocess(cfg, wandb_run, policy=None, rmax_exploration=None, sav
         np.concatenate(info_np),
     )
 
-def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_exploration=None, save_img=False, randomize_inventory=False):
+def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_exploration=None, save_img=False, randomize_inventory=False, intrinsic_reward_fn=None):
     device = torch.device('cpu')
     if torch.cuda.is_available():
         device = torch.device('cuda:0')
@@ -309,16 +309,32 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     data_type = str(getattr(collect_cfg, "data_type", "")).lower()
     maximum_dataset_size = getattr(collect_cfg, "maximum_dataset_size", None)
 
-    # --- Initial Reset with optional spatial randomization ---
-    reset_kwargs = {}
+    # --- 1. Exhaustive Shuffled Queue for 100% Coverage ---
+    ground_tiles_queue = []
     if randomize_inventory and is_crafter:
         cg = env.unwrapped.char_grid
         h_grid, w_grid = cg.shape
-        # Sample from safe background tiles only: Grass(G), Sand(S), Path(P)
-        # Avoid entity tiles like Cow(M), Zombie(Z) or Player(A) to prevent world.move collisions.
-        valid_reset_tiles = [(c, r) for r in range(h_grid) for c in range(w_grid) if cg[r,c] in "GSP"]
-        if valid_reset_tiles:
-            reset_kwargs['agent_pos'] = valid_reset_tiles[np.random.randint(len(valid_reset_tiles))]
+        # Collect all non-water tiles
+        all_terrestrial = [(c, r) for r in range(h_grid) for c in range(w_grid) if cg[r,c] != 'W']
+        np.random.shuffle(all_terrestrial)
+        ground_tiles_queue = all_terrestrial
+        print(f"[RunEnv] Exhaustive Queue initialized with {len(ground_tiles_queue)} unique spawn points.")
+
+    def get_next_spawn_point():
+        nonlocal ground_tiles_queue
+        if not ground_tiles_queue:
+            return None
+        # Use simple cycling: pop from start
+        pt = ground_tiles_queue.pop(0)
+        # Re-append to end to keep it infinite but exhaustive
+        ground_tiles_queue.append(pt)
+        return pt
+
+    # --- Initial Reset ---
+    reset_kwargs = {}
+    if randomize_inventory and is_crafter:
+        sp = get_next_spawn_point()
+        if sp: reset_kwargs['agent_pos'] = sp
     
     obs = env.reset(**reset_kwargs)[0]
 
@@ -345,7 +361,9 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     # Visit count for RMax or exploration tracking
     visit_count = {}
 
-    if getattr(collect_cfg, "save_env_visualize", False):
+    # Check both collect_cfg and cfg.env for save flags to support older configs
+    should_save_vis = getattr(collect_cfg, "save_env_visualize", False) or getattr(cfg.env, "save_visualized_img", False)
+    if should_save_vis:
         try:
             try:
                 img = env.get_frame()
@@ -363,7 +381,7 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
                     img = env.render()
         
         # --- save locally ---
-        env_vis_path = getattr(collect_cfg, "env_visualize_save_path", "trainer/logs/env_visualization")
+        env_vis_path = getattr(collect_cfg, "env_visualize_save_path", getattr(cfg.env, "visualize_save_path", "trainer/logs/env_visualization"))
         os.makedirs(env_vis_path, exist_ok=True)
         img_filename = getattr(collect_cfg, "env_visualize_filename", f"{log_name}_env.png")
         save_path = os.path.join(env_vis_path, img_filename)
@@ -410,6 +428,18 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     # Use tqdm for progress tracking
     target_episodes = collect_cfg.episodes
     mini_dataset_size = getattr(collect_cfg, "mini_dataset_size", 0)
+    obs_norm_values = getattr(getattr(cfg, "attention_model", None), "obs_norm_values", None)
+
+    def _build_policy_state(obs_img):
+        obs_np = np.asarray(obs_img)
+        if obs_np.ndim == 3:
+            # HWC -> CHW
+            obs_chw = np.transpose(obs_np, (2, 0, 1))
+        else:
+            obs_chw = obs_np
+        if obs_norm_values is not None:
+            obs_chw = normalize_obs(obs_chw, obs_norm_values)
+        return torch.tensor(obs_chw, dtype=torch.float32, device=device)
 
     with tqdm(total=target_episodes, desc="Collecting Episodes") as pbar:
         info_list.append([{'carrying_key': False}])  
@@ -450,20 +480,53 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
 
             # Action Selection
             if is_crafter:
-                action_probs = np.ones(len(meaningful_actions), dtype=np.float32)
-                action_probs /= action_probs.sum()
+                if randomize_inventory:
+                    # --- DRILL-DOWN EXPERT: Boost 'do' action if facing a resource ---
+                    player = env.unwrapped.env._player
+                    world = env.unwrapped.env._world
+                    tx, ty = int(player.pos[0] + player.facing[0]), int(player.pos[1] + player.facing[1])
+                    target_material = None
+                    if 0 <= tx < world.area[0] and 0 <= ty < world.area[1]:
+                        mat_id = world._mat_map[tx, ty]
+                        mat_names = [None, 'water', 'grass', 'stone', 'path', 'sand', 'tree', 'lava', 'coal', 'iron', 'diamond', 'table', 'furnace']
+                        if 0 <= mat_id < len(mat_names):
+                            target_material = mat_names[mat_id]
+                    resources = ['tree', 'stone', 'coal', 'iron', 'diamond', 'table', 'furnace']
+                    if target_material in resources and np.random.random() < 0.9:
+                        act = 5 # 'do' action in Crafter
+                    else:
+                        act = np.random.choice(meaningful_actions)
+                elif policy is not None:
+                    # P2E / PPO policy injection for Crafter
+                    if hasattr(policy, "expects_raw_obs") and policy.expects_raw_obs:
+                        act = policy.select_action(obs_image)
+                    else:
+                        state_norm = _build_policy_state(obs_image)
+                        act = policy.select_action(state_norm)
+                else:
+                    action_probs = np.ones(len(meaningful_actions), dtype=np.float32)
+                    action_probs /= action_probs.sum()
+                    act = np.random.choice(meaningful_actions, p=action_probs)
             else:
                 action_probs = [0.2, 0.2, 0.2, 0.2, 0.2] # simplified for demo
-            
-            if policy is None:
-                act = np.random.choice(meaningful_actions, p=action_probs)
-            else:
-                state_norm = normalize_obs(obs_image).to(device)
-                act = policy.select_action(state_norm)
+                if policy is None:
+                    act = np.random.choice(meaningful_actions, p=action_probs)
+                else:
+                    if hasattr(policy, "expects_raw_obs") and policy.expects_raw_obs:
+                        act = policy.select_action(obs_image)
+                    else:
+                        state_norm = _build_policy_state(obs_image)
+                        act = policy.select_action(state_norm)
 
             # --- 3. Step in Environment ---
             obs_next, reward, done, trunc, info = env.step(act)
 
+            # --- P2E: Override reward with intrinsic if provided ---
+            if intrinsic_reward_fn is not None:
+                obs_next_image = obs_next['image'] if isinstance(obs_next, dict) else obs_next
+                reward = intrinsic_reward_fn(obs_image, act, obs_next_image)
+                if policy is not None and hasattr(policy, "record_transition"):
+                    policy.record_transition(float(reward), bool(done))
 
             if not is_crafter and hasattr(env, "env") and getattr(env.env, "carrying", None) is not None:
                 info['carrying_key'] = (env.env.carrying.type == 'key')
@@ -507,8 +570,9 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
             done_list.append([done])
             info_list.append([info])
 
-            # --- CRITICAL FIX: Force Reset every X steps in Uniform mode to increase variety ---
-            uniform_reset_steps = getattr(collect_cfg, "uniform_reset_steps", 300)
+            # For Crafter uniform interaction, we use a balanced interval (e.g. 50 steps)
+            # enough to interact but frequent enough for variety.
+            uniform_reset_steps = getattr(collect_cfg, "uniform_reset_steps", 50 if is_crafter else 300)
             if randomize_inventory and step_in_episode >= uniform_reset_steps:
                 done = True
 
@@ -526,7 +590,7 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
                 rmax_exploration.update_visit_count(obs_image, act)
 
             # Visualize if needed
-            if cfg.env.visualize:
+            if getattr(cfg.env, "visualize", False):
                 env.render()
                 # time.sleep(0.1)
 
@@ -535,12 +599,17 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
                 info_list.pop()
                 episodes += 1
                 pbar.update(1)
-                obs = env.reset()[0]
-                # --- BOOST 2: Inject for subsequent episodes (Safety First) ---
+                
+                # --- BOOST 2: Exhaustive Spawning (Cycling through all tiles) ---
                 reset_kwargs = {}
                 if randomize_inventory and is_crafter:
+                    sp = get_next_spawn_point()
+                    if sp: reset_kwargs['agent_pos'] = sp
+
+                obs = env.reset(**reset_kwargs)[0]
+                
+                if randomize_inventory and is_crafter:
                     player = env.unwrapped.env._player
-                    # 仅随机化物资，位置交给 env.reset() 自动生成
                     for stat in ['health', 'food', 'drink', 'energy']:
                         setattr(player, stat, float(np.random.randint(1, 10)))
                     materials = ['wood', 'stone', 'coal', 'iron', 'diamond', 'sapling']
@@ -551,16 +620,7 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
                     sel = np.random.choice(tools, num_tools, replace=False)
                     for t in tools: player.inventory[t] = 1.0 if t in sel else 0.0
                     
-                    # 空间随机化：从合法的纯地形格点随机挑选起点，避开实体防止碰撞
-                    cg = env.unwrapped.char_grid
-                    h_grid, w_grid = cg.shape
-                    valid_reset_tiles = [(c, r) for r in range(h_grid) for c in range(w_grid) if cg[r,c] in "GSP"]
-                    if valid_reset_tiles:
-                        reset_kwargs['agent_pos'] = valid_reset_tiles[np.random.randint(len(valid_reset_tiles))]
-
-                obs = env.reset(**reset_kwargs)[0]
-                if randomize_inventory and is_crafter:
-                    # Sync observation after inventory injection
+                    # Sync observation after injection
                     obs = env.unwrapped._extract_obs()
 
                 info_list.append([{'carrying_key': False}])  
@@ -880,8 +940,16 @@ def uniform_collect_data_postprocess(env, cfg, wandb_run, log_name, policy=None,
 
 
 def save_experiments(cfg: DictConfig, obs, obs_next, act, rew, done, info=None, inv=None, inv_next=None):
-    obs = ColRowCanl_to_CanlRowCol(obs)
-    obs_next = ColRowCanl_to_CanlRowCol(obs_next)
+    # Detect environment type from channel dimension
+    # Crafter symbolic grid has C=2, MiniGrid has C=3
+    if obs.shape[-1] == 2:
+        # Crafter: (N, H, W, C) -> (N, C, H, W) without swapping spatial H and W
+        obs = np.moveaxis(obs, -1, 1)
+        obs_next = np.moveaxis(obs_next, -1, 1)
+    else:
+        # MiniGrid: (N, Col, Row, Canl) -> (N, Canl, Row, Col) i.e. (0, 3, 2, 1)
+        obs = ColRowCanl_to_CanlRowCol(obs)
+        obs_next = ColRowCanl_to_CanlRowCol(obs_next)
     save_path = cfg.collect.data_save_path
     save_dir = os.path.dirname(save_path)
     if save_dir:
@@ -1327,7 +1395,8 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
     # -------------------------------
     heatmap = np.zeros((H, W))
     for (y, x) in positions:
-        if 0 <= y < H and 0 <= x < W:
+        # Ignore boundary water (outermost row/column) for cleaner visualization
+        if 1 <= y < H - 1 and 1 <= x < W - 1:
             heatmap[y, x] += 1
 
     # Heatmap is now naturally (Row, Col) which matches imshow expectation.

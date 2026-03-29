@@ -121,7 +121,11 @@ class ActorCritic(nn.Module):
             action_probs = self.actor(state)
 
             # Normalize action probabilities
-            action_probs = action_probs / action_probs.sum()
+            denom = action_probs.sum()
+            if torch.abs(denom) < 1e-12:
+                action_probs = torch.ones_like(action_probs) / action_probs.numel()
+            else:
+                action_probs = action_probs / denom
 
             # Move action_probs to GPU
             action_probs = action_probs.to(device)
@@ -137,9 +141,13 @@ class ActorCritic(nn.Module):
                 forward_action_index = 2  # Assuming 2 represents "forward" in MiniGrid
 
                 # Create an exploration probability distribution (fully on GPU)
-                explore_probs = torch.ones(num_actions, device=device) * ((1 - forward_bias) / (num_actions - 1))
-                explore_probs[forward_action_index] = forward_bias
-                explore_probs = explore_probs / explore_probs.sum()  # Normalize
+                if num_actions <= 1:
+                    explore_probs = torch.ones(num_actions, device=device)
+                else:
+                    explore_probs = torch.ones(num_actions, device=device) * ((1 - forward_bias) / (num_actions - 1))
+                    if forward_action_index < num_actions:
+                        explore_probs[forward_action_index] = forward_bias
+                    explore_probs = explore_probs / explore_probs.sum().clamp_min(1e-12)  # Normalize
 
                 # Sample a random action (EXPLORATION) - Now using `torch.multinomial()`
                 action = torch.multinomial(explore_probs, 1).squeeze(0)  # Sample directly on GPU
@@ -244,10 +252,19 @@ class PPO:
             return action.item(), state, action, action_logprob, state_val
 
     def save_buffer(self, state=None, action=None, logprob=None, state_value=None, reward=None, is_terminal=None):
+        def _ensure_1d_tensor(x):
+            if torch.is_tensor(x):
+                x = x.detach()
+            else:
+                x = torch.as_tensor(x)
+            if x.ndim == 0:
+                x = x.unsqueeze(0)
+            return x
+
         self.buffer.states.append(state)
-        self.buffer.actions.append(action)
-        self.buffer.logprobs.append(logprob)
-        self.buffer.state_values.append(state_value)
+        self.buffer.actions.append(_ensure_1d_tensor(action))
+        self.buffer.logprobs.append(_ensure_1d_tensor(logprob))
+        self.buffer.state_values.append(_ensure_1d_tensor(state_value))
         self.buffer.rewards.append(reward)
         self.buffer.is_terminals.append(is_terminal)
         
@@ -315,5 +332,3 @@ class PPO:
 def preprocess_observation(obs):
     obs = obs / np.array([10, 5, 2])
     return torch.from_numpy(obs.flatten()).float().to(device)
-
-

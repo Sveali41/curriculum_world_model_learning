@@ -201,7 +201,9 @@ def get_agent_position(state, player_id: int = 10):
 
 def extract_masked_state(state, mask_size, agent_position_yx):
     tensor_flag = False
+    tensor_device = None
     if isinstance(state, torch.Tensor):
+        tensor_device = state.device
         state = state.detach().cpu().numpy()
         tensor_flag = True
 
@@ -225,8 +227,9 @@ def extract_masked_state(state, mask_size, agent_position_yx):
         raise ValueError("Input must be a 3D or 4D array.")
 
     if tensor_flag:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        state_masked = torch.from_numpy(state_masked).to(device)
+        if tensor_device is None:
+            tensor_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        state_masked = torch.from_numpy(state_masked).to(tensor_device)
     return state_masked
 
 

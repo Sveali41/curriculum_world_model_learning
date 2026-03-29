@@ -327,13 +327,33 @@ class CustomCrafterEnv(gym.Env):
                             sep = ':' if ':' in line else '='
                             key, val = line.split(sep, 1)
                             self.initial_inventory[key.strip().lower()] = float(val.strip())
+        elif self.layout_str:
+            # Parsing from a direct string input containing \n\n
+            if '\n\n' in self.layout_str:
+                sections = self.layout_str.strip().split('\n\n')
+                self.layout_str = sections[0].strip()
+                if len(sections) > 1:
+                    inv_lines = sections[1].strip().split('\n')
+                    for line in inv_lines:
+                        line = line.strip()
+                        if not line or line.startswith('#'): continue
+                        if ':' in line or '=' in line:
+                            sep = ':' if ':' in line else '='
+                            key, val = line.split(sep, 1)
+                            self.initial_inventory[key.strip().lower()] = float(val.strip())
+                print(f"[CrafterCustomEnv] Parsed initial inventory: {self.initial_inventory}")
         elif not self.layout_str:
             # Fallback tiny map if nothing is provided
             self.layout_str = "GGGGGGG\nGGGGGGG\nGGGPGGG\nGGGGGGG\nGGGGGGG"
             
-        self.char_grid = np.array(
-            [list(line.strip()) for line in self.layout_str.strip().split("\n") if line.strip()]
-        )
+        # Filter lines to strictly include only map characters, exclude stats lines (e.g., 'health: 9')
+        map_lines = []
+        for line in self.layout_str.strip().split("\n"):
+            s = line.strip()
+            if not s or s.startswith('#') or ":" in s:
+                continue
+            map_lines.append(list(s))
+        self.char_grid = np.array(map_lines)
 
         # Initialize native Crafter environment
         self.env = crafter.Env(reward=False, seed=seed)
@@ -405,6 +425,16 @@ class CustomCrafterEnv(gym.Env):
         target_dir = kwargs.get('agent_dir', None)
         
         if target_pos is not None:
+             tx, ty = int(target_pos[0]), int(target_pos[1])
+             # Robust material ID lookup would be better, but based on Crafter constants:
+             # 2=grass, 3=stone, 4=path, 6=tree, 8=coal, 9=iron, 10=diamond
+             if 0 <= tx < world.area[0] and 0 <= ty < world.area[1]:
+                 current_mat = world._mat_map[tx, ty] # x,y indexing
+                 if current_mat == 6: # Tree -> Grass
+                     world._mat_map[tx, ty] = 2
+                 elif current_mat in [3, 8, 9, 10]: # Stone, Coal, Iron, Diamond -> Path
+                     world._mat_map[tx, ty] = 4
+             
              # Use engine-native move to handle chunking and object tracking
              try:
                  world.move(player, np.array(target_pos, dtype=np.int32))
@@ -506,6 +536,7 @@ class CustomCrafterEnv(gym.Env):
         textures = self.env._textures
         
         W, H = world.area
+        # Create buffer with (Width, Height) to match engine._draw column-first indexing
         canvas = np.zeros((W * unit, H * unit, 3), np.uint8) + 127
         
         # 1. Render all tiles
@@ -575,7 +606,6 @@ if __name__ == "__main__":
     # 14: make_wood_sword
     # 15: make_stone_sword
     # 16: make_iron_sword
-
     if isinstance(constants.actions, dict):
         action_names = list(constants.actions.keys())
     else:

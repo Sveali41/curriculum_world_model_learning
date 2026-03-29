@@ -94,7 +94,8 @@ def run(
     old_params=None,
     fisher=None,
     layout=None,
-    replay_data=None
+    replay_data=None,
+    direct_data=None
 ):
     if net is None:
         from modelBased.world_model.AttentionWM import AttentionWorldModel
@@ -114,11 +115,11 @@ def run(
     
     if should_use_validation_mode:
         # User requested "Validation Only" mode (100% data, no split check)
-        datamodule = ValidationDataModule(hparams=cfg.attention_model, replay_data=None)
+        datamodule = ValidationDataModule(hparams=cfg.attention_model, data=direct_data, replay_data=None)
     elif cfg.attention_model.continue_learning:
-        datamodule = WMRLDataModule(hparams=cfg.attention_model, replay_data=replay_data)
+        datamodule = WMRLDataModule(hparams=cfg.attention_model, data=direct_data, replay_data=replay_data)
     else:
-        datamodule = WMRLDataModule(hparams=cfg.attention_model, replay_data=None)
+        datamodule = WMRLDataModule(hparams=cfg.attention_model, data=direct_data, replay_data=None)
 
     # logger
     wandb_logger = None
@@ -229,6 +230,12 @@ def run(
         best_score = trainer.checkpoint_callback.best_model_score
         result["best_loss"] = best_score.item() if best_score is not None else 0.0
         
+        # Capture all final metrics for logging (e.g. ce_loss, inv_loss, ewc_term)
+        for k, v in trainer.callback_metrics.items():
+             # Strip 'train/' prefix if present for uniform UED logging
+             clean_k = k.replace("train/", "")
+             result[clean_k] = v.item() if hasattr(v, 'item') else v
+
         return result
 
 
@@ -238,7 +245,8 @@ def train_api(
     old_params=None,
     fisher=None,
     env_layout=None,
-    replay_data=None
+    replay_data=None,
+    direct_data=None
 ):
     result = run(
         cfg,
@@ -246,10 +254,11 @@ def train_api(
         old_params=old_params,
         fisher=fisher,
         layout=env_layout,
-        replay_data=replay_data
+        replay_data=replay_data,
+        direct_data=direct_data
     )
 
-    return result  # Return the full dictionary for more flexibility
+    return result, result.get("fisher"), net  # Return 3-tuple for compatibility with older unpacking logic
 
 
 

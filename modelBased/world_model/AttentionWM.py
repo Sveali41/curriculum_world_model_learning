@@ -251,16 +251,6 @@ class AttentionWorldModel(pl.LightningModule):
             
             # 1. Preprocess batch
             obs, act, obs_next, info, obs_masked, _, inv, inv_next = self.preprocess_batch(batch)
-            obs = obs.to(device, dtype=torch.float32)
-            act = act.to(device)
-            obs_next = obs_next.to(device, dtype=torch.float32)
-            if obs_masked is not None:
-                obs_masked = obs_masked.to(device)
-            if inv is not None:
-                inv = inv.to(device)
-            if inv_next is not None:
-                inv_next = inv_next.to(device)
-            
             # 2. Iterate over samples in the batch
             batch_size = obs.shape[0]
             for b in range(batch_size):
@@ -270,13 +260,13 @@ class AttentionWorldModel(pl.LightningModule):
                 self.zero_grad(set_to_none=True)
 
                 # Extract single sample (keep dim 0 for model compatibility)
-                s_obs = obs[b:b+1]
-                s_act = act[b:b+1]
+                s_obs = obs[b:b+1].to(device, dtype=torch.float32)
+                s_act = act[b:b+1].to(device)
                 s_info = {k: v[b:b+1] for k, v in info.items()} if info is not None else None
-                s_obs_next = obs_next[b:b+1]
-                s_obs_masked = obs_masked[b:b+1] if obs_masked is not None else None
-                s_inv = inv[b:b+1] if inv is not None else None
-                s_inv_next = inv_next[b:b+1] if inv_next is not None else None
+                s_obs_next = obs_next[b:b+1].to(device, dtype=torch.float32)
+                s_obs_masked = obs_masked[b:b+1].to(device) if obs_masked is not None else None
+                s_inv = inv[b:b+1].to(device) if inv is not None else None
+                s_inv_next = inv_next[b:b+1].to(device) if inv_next is not None else None
 
                 # Forward & Backward (fp32)
                 with torch.cuda.amp.autocast(enabled=False):
@@ -374,27 +364,21 @@ class AttentionWorldModel(pl.LightningModule):
             self.old_params = {k: v.detach().cpu().float() for k, v in old_params.items()}
 
             if load_weights:
-                # 尝试将旧参数加载进当前模型
-                current_state = self.state_dict()
-                updated_state = {}
+                # [FIX] Clear all hooks that might cause ReferenceError in state_dict() or weight loading
+                if hasattr(self, "_state_dict_hooks"):
+                    self._state_dict_hooks.clear()
+                if hasattr(self, "_parameters"):
+                    for p_name, p in self._parameters.items():
+                        if p is not None and hasattr(p, "_hooks"):
+                            p._hooks.clear()
 
-                loaded_keys, skipped_keys = [], []
-                for k, v in old_params.items():
-                    if k in current_state and current_state[k].shape == v.shape:
-                        updated_state[k] = v.clone().detach()
-                        loaded_keys.append(k)
-                    else:
-                        skipped_keys.append(k)
-
-                # 执行加载（严格性关闭以防形状不匹配）
-                current_state.update(updated_state)
-                self.load_state_dict(current_state, strict=False)
-
-                print(f"[EWC] Loaded {len(loaded_keys)} parameters from previous task "
-                    f"(skipped {len(skipped_keys)} mismatched keys).")
+                # Directly load without the complex state_dict() dance to avoid hooks
+                # strict=False allows missing or mismatched keys without crashing
+                self.load_state_dict(old_params, strict=False)
+                
+                print(f"[EWC] Attempted to load weights from previous task (strict=False).")
             else:
                 print("[EWC] old_params received but model weights not loaded (load_weights=False).")
-
         else:
             self.old_params = None
             print("[EWC] No old_params provided — starting from scratch.")
@@ -499,6 +483,61 @@ class AttentionWorldModel(pl.LightningModule):
 
 
 
+    def encode(self, state, inv=None):
+        """
+        Extract latent feature representations from observations.
+        Used by P2E Ensemble to compute epistemic uncertainty (disagreement).
+        
+        Args:
+            state: (B, C, H, W) raw observation tensor
+            inv: optional inventory tensor for Crafter
+        Returns:
+            feat: (B, N, embed_dim) spatial token features after conv+positional encoding
+        """
+        if not hasattr(self.model, 'conv1'):
+            # Fallback: flatten the obs as a simple feature
+            B = state.shape[0]
+            return state.view(B, -1, 1).float()
+
+        with torch.no_grad() if not self.training else torch.enable_grad():
+            B = state.shape[0]
+            K = getattr(self.model, 'frame_stack', 1)
+            TotalC = state.shape[1]
+            C_base = TotalC // K
+            H, W = state.shape[2], state.shape[3]
+
+            import torch.nn.functional as F_local
+            if self.model.data_type == 'discrete':
+                all_frames_emb = []
+                for k in range(K):
+                    frame = state[:, k*C_base:(k+1)*C_base]
+                    if self.env_type == 'crafter':
+                        obj = frame[:, 0]
+                        dir_id = frame[:, 1]
+                        obj_oh = F_local.one_hot(obj.reshape(B, -1).long(), num_classes=20).float()
+                        dir_oh = F_local.one_hot(dir_id.reshape(B, -1).long(), num_classes=5).float()
+                        frame_emb = torch.cat([obj_oh, dir_oh], dim=-1)
+                    else:
+                        obj = frame[:, 0]
+                        color = frame[:, 1]
+                        dir_id = frame[:, 2]
+                        obj_oh = F_local.one_hot(obj.reshape(B, -1).long(), num_classes=11).float()
+                        color_oh = F_local.one_hot(color.reshape(B, -1).long(), num_classes=6).float()
+                        dir_oh = F_local.one_hot(dir_id.reshape(B, -1).long(), num_classes=4).float()
+                        frame_emb = torch.cat([obj_oh, color_oh, dir_oh], dim=-1)
+                    all_frames_emb.append(frame_emb)
+                state_emb = torch.cat(all_frames_emb, dim=-1)
+                state_emb = state_emb.transpose(1, 2).reshape(B, self.model.input_channel, H, W)
+            else:
+                state_emb = state.float()
+
+            # Conv embedding
+            x = self.model.relu(self.model.bn1(self.model.conv1(state_emb)))
+            x = self.model.relu(self.model.bn2(self.model.conv2(x)))
+            x = self.model.flatten(x).transpose(1, 2)  # (B, N, D)
+            x = x + self.model.pos_embedding               # add position encoding
+        return x  # (B, N, embed_dim)
+
     def forward(self, state, action, info, inv=None):
         out = self.model(state, action, info, inv=inv)
         if len(out) == 3:
@@ -519,77 +558,61 @@ class AttentionWorldModel(pl.LightningModule):
     def loss_function_weight(self, next_observations_predict, next_observations_true, obs_masked=None, obs_prev=None):
         """
         Custom Loss with tiered aggressive weighting:
-        - Static: 1.0
-        - Movement: +10.0
-        - State Change (Door/Key Interaction): +100.0! (Critical for UED)
+        - If use_weighted_loss is True:
+          - Base=1.0, Move=+10, Interaction=+50 (MiniGrid)
+          - Tiered CE (Crafter)
+        - Else: 1.0 (Standard CE/MSE)
         """
         device = next_observations_predict.device 
+        use_weighted_loss = getattr(self.hparams, "use_weighted_loss", False)
         
         # 1. Base Loss (MSE for MiniGrid, CrossEntropy for Crafter)
         if self.env_type == 'crafter':
-            # Classification loss from crafter_support (with target clamping)
+            # Classification loss from crafter_support (with optional tiered weighting)
             raw_error_map = crafter_classification_loss(
-                next_observations_predict, next_observations_true, reduction='none'
+                next_observations_predict, next_observations_true, reduction='none', weighted=use_weighted_loss
             )  # (B, H, W)
+            weights = 1.0 # Tiered weights are already inside crafter_classification_loss
         else:
             # MiniGrid: Standard Regression
             raw_sq_error = (next_observations_predict - next_observations_true) ** 2
             raw_error_map = raw_sq_error.mean(dim=1)  # (B, H, W)
+            weights = 1.0
 
-             # 2. Change Mask (Any change)
-        if obs_prev is not None:
-             # Ensure types match
-             if obs_prev.dtype != next_observations_true.dtype:
-                 obs_prev = obs_prev.float() 
-             
-             # If stacked, only compare against the latest frame in the stack
-             C_target = next_observations_true.size(1)
-             C_prev = obs_prev.size(1)
-             obs_prev_latest = obs_prev[:, -C_target:] if C_prev > C_target else obs_prev
-             
-             # General Diff (Sum of all channels)
-             diff = torch.abs(next_observations_true - obs_prev_latest).sum(dim=1, keepdim=True)
-             change_mask = (diff > 1e-5).float()
-             
-             # 3. State Channel Diff (Channel 2 is State: 0=Open, 1=Closed, 2=Locked)
-             if C_target > 2:
-                  # Focus strictly on channel 2 of the most recent frame
-                  state_diff = torch.abs(next_observations_true[:, 2:3, :, :] - obs_prev_latest[:, 2:3, :, :])
-                  state_change_mask = (state_diff > 1e-5).float()
-             else:
-                  state_change_mask = torch.zeros_like(change_mask)
-             
-        else:
-             # Fallback if no prev frame (rare)
-             change_mask = (next_observations_true.abs() > 1e-6).any(dim=1, keepdim=True).float()
-             state_change_mask = torch.zeros_like(change_mask)
-
-        # 4. Combine Weights
-        # Base=1.0, Move=+10, Interaction=+50 -> Total 61.0 for Opening Door (Reduced from 111.0 to improve stability)
-        weights = 1.0 + (change_mask * 10.0) + (state_change_mask * 50.0)
-        
-        if obs_masked is not None:
-             if obs_masked.ndim == 3:
-                 static_mask = obs_masked.unsqueeze(1).float()
-             else:
-                 static_mask = obs_masked.float()
+        # 2. Aggressive Spatial/Change Weighting (Only if use_weighted_loss is True and NOT handled by CE)
+        if use_weighted_loss and self.env_type != 'crafter':
+            if obs_prev is not None:
+                 if obs_prev.dtype != next_observations_true.dtype:
+                     obs_prev = obs_prev.float() 
                  
-             # INTERACTION = CHANGE * ELEMENT
-             interaction_mask = change_mask * static_mask
-             
-             if self.env_type == 'crafter':
-                 # For Crafter: restrict influence of stochastic jitter (zombies/cows)
-                 # and normalize weight map average to 1.0 to prevent total loss explosion.
-                 stochastic_weight = 2.0
-                 weights = weights + (interaction_mask * stochastic_weight)
-                 weights = weights / weights.mean()
-             else:
-                 # Original MiniGrid behavior: boost critical interactions like keys/doors
+                 C_target = next_observations_true.size(1)
+                 C_prev = obs_prev.size(1)
+                 obs_prev_latest = obs_prev[:, -C_target:] if C_prev > C_target else obs_prev
+                 
+                 diff = torch.abs(next_observations_true - obs_prev_latest).sum(dim=1, keepdim=True)
+                 change_mask = (diff > 1e-5).float()
+                 
+                 if C_target > 2:
+                      state_diff = torch.abs(next_observations_true[:, 2:3, :, :] - obs_prev_latest[:, 2:3, :, :])
+                      state_change_mask = (state_diff > 1e-5).float()
+                 else:
+                      state_change_mask = torch.zeros_like(change_mask)
+            else:
+                 change_mask = (next_observations_true.abs() > 1e-6).any(dim=1, keepdim=True).float()
+                 state_change_mask = torch.zeros_like(change_mask)
+
+            weights = 1.0 + (change_mask * 10.0) + (state_change_mask * 50.0)
+            
+            if obs_masked is not None:
+                 if obs_masked.ndim == 3:
+                     static_mask = obs_masked.unsqueeze(1).float()
+                 else:
+                     static_mask = obs_masked.float()
+                 interaction_mask = change_mask * static_mask
                  weights = weights + (interaction_mask * 100.0)
 
         # 5. Weighted Mean
-        # Ensure raw_error_map and weights have matching dimensions
-        if weights.ndim > raw_error_map.ndim:
+        if torch.is_tensor(weights) and weights.ndim > raw_error_map.ndim:
              weights = weights.squeeze(1) # [B, 1, H, W] -> [B, H, W]
         
         loss = (raw_error_map * weights).mean()
@@ -906,5 +929,4 @@ class AttentionWorldModel(pl.LightningModule):
 
 
    
-
 

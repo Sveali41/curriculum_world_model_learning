@@ -135,22 +135,36 @@ def collect_data_general(
     
     save_name: file prefix to save data, e.g. "lava_minitask"
     """
-    cfg.env.collect.maximum_dataset_size = maximum_dataset_size
+    if maximum_dataset_size is not None:
+        cfg.env.collect.maximum_dataset_size = maximum_dataset_size
     support = Support(cfg)
 
     # -----------------------------
+    # 0. Print environment info (Optional but helpful for debugging)
+    # -----------------------------
+    is_crafter = (getattr(cfg.attention_model, "env_type", "") == "crafter")
+    
+    # -----------------------------
     # 1. Build environment
     # -----------------------------
-    if isinstance(env_source, (str, os.PathLike)) and str(env_source).endswith(".txt"):
-        # From text file
+    if is_crafter and isinstance(env_source, str):
+        if env_source.endswith(".txt"):
+            # From text file path
+            env = support.wrap_env_from_text(env_source, max_steps=max_steps)
+        else:
+            # Multi-line string with layout + stats
+            print(f"\n[Environment] Generating Crafter Task:\n{env_source}")
+            from domain.crafter.crafter_custom_env import CustomCrafterEnv as CrafterEnv
+            env = CrafterEnv(layout_str=env_source, max_steps=max_steps)
+
+    elif not is_crafter and isinstance(env_source, (str, os.PathLike)) and str(env_source).endswith(".txt"):
+        # MiniGrid from text file
         env = support.wrap_env_from_text(env_source, max_steps=max_steps)
 
     elif isinstance(env_source, tuple) and len(env_source) == 2:
-        # From minitask strings
+        # MiniGrid from minitask strings (layout_str, color_str)
         layout_str, color_str = env_source
-
-        render_mode = "human" if cfg.env.visualize else None
-
+        render_mode = "human" if getattr(cfg.env, "visualize", False) else None
         env = FullyObsWrapper(CustomMiniGridEnv(
             layout_str=layout_str,
             color_str=color_str,
@@ -159,17 +173,29 @@ def collect_data_general(
             max_steps=max_steps,
         ))
     else:
+        # Fallback for other cases (e.g. direct env objects if supported later)
+        if is_crafter:
+             raise ValueError("For Crafter UED, env_source must be a .txt path or a layout string.")
         raise ValueError("env_source must be a .txt filepath or (layout_str, color_str) tuple")
 
     # -----------------------------
     # 2. Set dataset save paths
     # -----------------------------
-    data_save_dir = TRAINER_PATH / "data"
+    import os
+    from pathlib import Path
+    
+    data_save_dir = Path(getattr(cfg.env.collect, "data_folder", str(TRAINER_PATH / "data")))
+    os.makedirs(data_save_dir, exist_ok=True)
+    
     explore_type = cfg.env.collect.data_type  # random / uniform
     save_path = data_save_dir / f"{save_name}_test_{explore_type}.npz"
 
     cfg.env.collect.data_save_path = str(save_path)
-    cfg.env.collect.visualize_save_path = TRAINER_PATH / "logs" / "dataset_visualization"
+    
+    vis_dir = Path(getattr(cfg.env.collect, "visualize_save_path", str(TRAINER_PATH / "logs" / "dataset_visualization")))
+    os.makedirs(vis_dir, exist_ok=True)
+    cfg.env.collect.visualize_save_path = str(vis_dir)
+    
     cfg.env.collect.visualize_filename = f"{save_name}_{explore_type}.png"
     if not recollect_data and os.path.exists(save_path):
         print(f"[Data Collection] Skipped: {save_name} already exists → {save_path}")
@@ -186,7 +212,7 @@ def collect_data_general(
         env=env,
         wandb_run=None,
         validate=False,
-        save_img=False,
+        save_img=cfg.env.get('save_visualized_img', False),
         log_name=f"collect_{save_name}",
         max_steps=None,  # already set in env
     )
@@ -204,6 +230,8 @@ def create_data_subsets(dataset_npz, interval_size):
     next_all = dataset_npz["b"]
     act_all = dataset_npz["c"]
     info_all = dataset_npz["f"] if "f" in dataset_npz else None
+    inv_all = dataset_npz["g"] if "g" in dataset_npz else None
+    inv_next_all = dataset_npz["h"] if "h" in dataset_npz else None
 
     total = len(obs_all)
     if interval_size is None:
@@ -212,6 +240,8 @@ def create_data_subsets(dataset_npz, interval_size):
             "b": next_all,
             "c": act_all,
             "f": info_all,
+            "g": inv_all,
+            "h": inv_next_all,
         }]
 
     # ---- Shuffle ----
@@ -223,6 +253,10 @@ def create_data_subsets(dataset_npz, interval_size):
     act_all = act_all[indices]
     if info_all is not None:
         info_all = info_all[indices]
+    if inv_all is not None:
+        inv_all = inv_all[indices]
+    if inv_next_all is not None:
+        inv_next_all = inv_next_all[indices]
 
     # ---- Split into subsets ----
     subsets = []
@@ -237,6 +271,8 @@ def create_data_subsets(dataset_npz, interval_size):
             "b": next_all[start:end],
             "c": act_all[start:end],
             "f": info_all[start:end] if info_all is not None else None,
+            "g": inv_all[start:end] if inv_all is not None else None,
+            "h": inv_next_all[start:end] if inv_next_all is not None else None,
         }
 
         subsets.append(subset)
@@ -298,7 +334,9 @@ def train_wm_with_subsets(
             'obs': subset['a'],
             'obs_next': subset['b'],
             'act': subset['c'],
-            'info': subset['f']
+            'info': subset['f'],
+            'inv': subset['g'],
+            'inv_next': subset['h']
         }
 
         fisher_buffer.update_combined(samples, current_sample_ratio, fisher_buffer_elements_ratio)
@@ -310,40 +348,60 @@ def train_wm_with_subsets(
 
     return net, old_params, fisher, phase_transitions_used    
 
-def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, phase_name, VALID_TIMES=1):
+def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, phase_name="validation", VALID_TIMES=1):
     """
     Run WM validation on the fixed target task, return avg loss.
     Returns: (avg_mse_loss, avg_weighted_loss)
     """
+
+    prev_freeze_weight = cfg.attention_model.freeze_weight
+    prev_keep_cell_loss = cfg.attention_model.keep_cell_loss
+    prev_data_dir = cfg.attention_model.data_dir
 
     cfg.attention_model.freeze_weight = True
     cfg.attention_model.keep_cell_loss = True
     cfg.attention_model.data_dir = os.path.join(data_save_dir, target_file)
 
     losses = []
+    inv_losses = []
+    terrain_losses = []
 
-    for v in range(VALID_TIMES):
-        # train_api in validation mode returns (avg_val_loss_list_of_dict, None, net)
-        val_res, _, model = AttentionWM_training.train_api(cfg, net, old_params, None)
-        
-        # trainer.validate returns a list like [{'avg_val_loss_wm': 12.3}]
-        if isinstance(val_res, list) and len(val_res) > 0:
-             loss_val = float(val_res[0].get('avg_val_loss_wm', 0.0))
-        elif isinstance(val_res, dict):
-             loss_val = float(val_res.get('avg_val_loss_wm', 0.0))
-        else:
-             loss_val = float(val_res)
-        
-        losses.append(loss_val)
+    try:
+        for v in range(VALID_TIMES):
+            # train_api in validation mode returns a dict where "avg_val_loss" holds the Lightning metrics
+            val_res, _, model = AttentionWM_training.train_api(cfg, net, old_params, None)
+            
+            actual_val_out = val_res.get("avg_val_loss", {})
+            
+            if isinstance(actual_val_out, list) and len(actual_val_out) > 0:
+                 metrics = actual_val_out[0]
+            elif isinstance(actual_val_out, dict):
+                 metrics = actual_val_out
+            else:
+                 metrics = {}
 
-        del model
-        torch.cuda.empty_cache()
-        gc.collect()
+            # Map Crafter-specific classification CE metrics
+            main_loss = float(metrics.get('avg_val_loss_wm', metrics.get('best_loss', 0.0)))
+            t_loss = float(metrics.get('val/terrain_loss', metrics.get('val/ce_loss', main_loss)))
+            i_loss = float(metrics.get('val/inventory_loss', metrics.get('val/inv_loss', 0.0)))
+            
+            losses.append(main_loss)
+            terrain_losses.append(t_loss)
+            inv_losses.append(i_loss)
 
-    cfg.attention_model.keep_cell_loss = False
+            del model
+            torch.cuda.empty_cache()
+            gc.collect()
+    finally:
+        cfg.attention_model.freeze_weight = prev_freeze_weight
+        cfg.attention_model.keep_cell_loss = prev_keep_cell_loss
+        cfg.attention_model.data_dir = prev_data_dir
 
-    avg_loss = float(np.mean(losses))
-    return avg_loss
+    return {
+        'avg_val_loss_wm': float(np.mean(losses)),
+        'terrain_loss': float(np.mean(terrain_losses)),
+        'inventory_loss': float(np.mean(inv_losses))
+    }
 
 
 def plot_loss_heatmap(
@@ -428,47 +486,48 @@ def extract_loss_map_over_validations(
     import torch
     from modelBased.world_model import AttentionWM_training
 
-    # Set WM to validation mode
+    # 开启WM的验证模式、保留热图模式
     cfg.attention_model.freeze_weight = True
     cfg.attention_model.keep_cell_loss = True
     cfg.attention_model.data_dir = data_dir
 
     sum_map = None
     loss_list = []
+    terrain_loss_list = []
+    inv_loss_list = []
+
+    is_crafter = (getattr(cfg.attention_model, "env_type", "") == "crafter")
 
     for _ in range(valid_times):
-        # Run one validation
+        # 执行一轮验证
         val_result, _, model = AttentionWM_training.train_api(cfg, net, old_params, None)
         loss_map = model.loss_map_result  # (H,W) array
 
-        # Accumulate map
-        if getattr(cfg.attention_model, "env_type", "") == "crafter":
-            # 提取标量的背包损失并在最底端铺满一整行，作为第 H 行的误差
-            loss_inv = 0.0
-            if isinstance(val_result, list) and len(val_result) > 0:
-                loss_inv = float(val_result[0].get('val/inv_loss', 0.0))
-            elif isinstance(val_result, dict):
-                loss_inv = float(val_result.get('val/inv_loss', 0.0))
-            
-            # 把背包误差拼接到地形误差下方，还原出 (H+1) x W 的完整画布误差
-            inv_row_error = np.full((1, loss_map.shape[1]), loss_inv, dtype=np.float32)
-            final_loss_map_for_this_step = np.vstack([loss_map, inv_row_error])
-        else:
-            final_loss_map_for_this_step = loss_map
-            
         if sum_map is None:
-            sum_map = np.array(final_loss_map_for_this_step, dtype=np.float32)
+            sum_map = np.array(loss_map, dtype=np.float32)
         else:
-            sum_map += final_loss_map_for_this_step
+            sum_map += loss_map
 
-        # Record scalar loss (val_result can be float, dict, or list of dict)
-        if isinstance(val_result, list) and len(val_result) > 0:
-             loss_val = float(val_result[0].get('avg_val_loss_wm', 0.0))
-        elif isinstance(val_result, dict):
-             loss_val = float(val_result.get('avg_val_loss_wm', 0.0))
+        # train_api returns a dict with "avg_val_loss" containing the actual lightning output
+        # e.g., result["avg_val_loss"] = [{'avg_val_loss_wm': 1.2, 'val/terrain_loss': 0.8...}]
+        actual_val_out = val_result.get("avg_val_loss", {})
+        
+        # Robust result parsing for both list and dict formats from Lightning's trainer.validate
+        if isinstance(actual_val_out, list) and len(actual_val_out) > 0:
+             metrics = actual_val_out[0]
+        elif isinstance(actual_val_out, dict):
+             metrics = actual_val_out
         else:
-             loss_val = float(val_result)
-        loss_list.append(loss_val)
+             metrics = {}
+        
+        # Primary metrics: Classification cross-entropy
+        total_l = float(metrics.get('avg_val_loss_wm', metrics.get('best_loss', 0.0)))
+        t_l = float(metrics.get('val/terrain_loss', metrics.get('val/ce_loss', total_l)))
+        i_l = float(metrics.get('val/inventory_loss', metrics.get('val/inv_loss', 0.0)))
+        
+        loss_list.append(total_l)
+        terrain_loss_list.append(t_l)
+        inv_loss_list.append(i_l)
 
         # Cleanup
         del model
@@ -478,10 +537,17 @@ def extract_loss_map_over_validations(
     # Disable special val mode
     cfg.attention_model.keep_cell_loss = False
 
-    # Compute average loss map
+    # 计算均值
     avg_loss_map = sum_map / valid_times
 
-    return avg_loss_map, loss_list
+    if is_crafter:
+        # 对物资误差进行“重归一化”，使其与地形误差量级匹配 (for generator Reward map)
+        avg_inv_total = np.mean(inv_loss_list)
+        inventory_pattern = np.full(16, avg_inv_total / 10.0, dtype=np.float32)
+        
+        return {"terrain": avg_loss_map, "inventory": inventory_pattern}, loss_list, terrain_loss_list, inv_loss_list
+    
+    return avg_loss_map, loss_list, [], []
 
 def convert_trajectories_to_batch(trajectories):
     """
@@ -504,8 +570,12 @@ def convert_trajectories_to_batch(trajectories):
         rew_list = []
         done_list = []
         info_list = []
+        inv_list = []
+        inv_next_list = []
         
         has_info = 'info' in trajectories[0] and trajectories[0]['info'] is not None
+        has_inv = 'inv' in trajectories[0] and trajectories[0]['inv'] is not None
+        has_inv_next = 'inv_next' in trajectories[0] and trajectories[0]['inv_next'] is not None
 
         for traj in trajectories:
             def to_numpy(x):
@@ -520,6 +590,10 @@ def convert_trajectories_to_batch(trajectories):
             if 'done' in traj: done_list.append(to_numpy(traj['done']))
             if has_info:
                 info_list.append(to_numpy(traj['info']))
+            if has_inv:
+                inv_list.append(to_numpy(traj['inv']))
+            if has_inv_next:
+                inv_next_list.append(to_numpy(traj['inv_next']))
 
         return {
             'obs': np.concatenate(obs_list, axis=0),
@@ -527,7 +601,9 @@ def convert_trajectories_to_batch(trajectories):
             'act': np.concatenate(act_list, axis=0),
             'rew': np.concatenate(rew_list, axis=0) if rew_list else None,
             'done': np.concatenate(done_list, axis=0) if done_list else None,
-            'info': np.concatenate(info_list, axis=0) if has_info else None
+            'info': np.concatenate(info_list, axis=0) if has_info else None,
+            'inv': np.concatenate(inv_list, axis=0) if has_inv else None,
+            'inv_next': np.concatenate(inv_next_list, axis=0) if has_inv_next else None
         }
 
     # 2. Legacy Format: List of Lists of Tuples

@@ -96,38 +96,49 @@ def check_solvability(grid_obj_np):
 # 2. 多样性打分 (Diversity - RND + Archive)
 # ==========================================
 class DiversityModule(nn.Module):
-    def __init__(self, input_h=15, input_w=15, k=10, max_archive_size=1000, device=None):
+    def __init__(self, input_h=15, input_w=15, k=10, max_archive_size=1000, device=None, env_type='minigrid'):
         super().__init__()
         self.k = k
         self.max_size = max_archive_size
         self.archive = [] 
+        self.env_type = env_type
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(device)
         
-        # === 1. 定义 One-Hot 的类别数 ===
-        # Minigrid 通常 Object ID 最大约 11-13，Color ID 最大约 6
-        # 根据你的 tensor 数据，至少要有 11 (因为看到了 ID 10)
-        self.num_obj_types = 11 
-        self.num_colors = 6
-        
-        # 输入通道数 = 物体类别数 + 颜色类别数
+        # === 1. 类数定义与特征头 ===
+        if self.env_type == 'crafter':
+            self.num_obj_types = 25 # Crafter map elements (up to 16, leaving room)
+            self.num_colors = 5    # Crafter player directions (0..4)
+            self.inv_size = 16     # Crafter inventory stats
+            # Inventory Encoder (Stats Path)
+            self.inv_encoder = nn.Sequential(
+                nn.Linear(self.inv_size, 16),
+                nn.ReLU()
+            ).to(self.device)
+            # Joint Embedding Dim: 64 (Map) + 16 (Inv) = 80
+            self.joint_dim = 64 + 16
+        else:
+            # MiniGrid
+            self.num_obj_types = 11 
+            self.num_colors = 6
+            self.inv_encoder = None
+            self.joint_dim = 64
+
+        # 输入通道数 = 物体类别数 + 颜色/方向数
         input_channels = self.num_obj_types + self.num_colors 
         
-        # === 2. 定义编码器 CNN ===
+        # === 2. 地图编码器 CNN ===
         self.encoder = nn.Sequential(
-            # 输入: [1, 17, H, W]
             nn.Conv2d(input_channels, 16, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Flatten(),
-            # 展平后维度: 32 * H * W
             nn.Linear(32 * input_h * input_w, 64) 
         ).to(self.device)
 
-        # [NEW] Orthogonal Initialization for better feature extraction sensitivity
         for m in self.encoder:
             if isinstance(m, (nn.Conv2d, nn.Linear)):
                 nn.init.orthogonal_(m.weight, gain=1.0)
@@ -136,71 +147,66 @@ class DiversityModule(nn.Module):
 
     def _preprocess(self, map_tensor):
         """
-        将 [2, H, W] 的 ID 地图转换为 [1, 17, H, W] 的 One-Hot 特征图
+        [1, 2, H, W] -> [1, Oh_Obj+Oh_Col, H, W]
         """
-        # 1. 增加 Batch 维度: [2, H, W] -> [1, 2, H, W]
         x = map_tensor 
+        obj_ids = x[:, 0, :, :].long()
+        col_ids = x[:, 1, :, :].long()
         
-        # 2. 分离通道
-        obj_ids = x[:, 0, :, :].long() # [1, H, W]
-        col_ids = x[:, 1, :, :].long() # [1, H, W]
-        
-        # 3. One-Hot 编码
-        # [FIX] Mask out Agent (ID=10) to Empty/Floor (ID=1)
-        # Avoid calculating diversity based on random agent spawn position
+        # Mask Agent to avoid calculating diversity based on random spawn position
         obj_ids_clean = obj_ids.clone()
-        obj_ids_clean[obj_ids_clean == 10] = 1
+        if self.env_type == 'crafter':
+            obj_ids_clean[obj_ids_clean == 9] = 0 # Crafter Agent (9) -> Grass (0)
+        else:
+            obj_ids_clean[obj_ids_clean == 10] = 1 # MiniGrid Agent (10) -> Empty (1)
 
-        # obj_ids -> [1, H, W, 11] -> permute -> [1, 11, H, W]
+        # One-Hot 编码 (注意: F.one_hot 第一个维是 B，输出是 [B, H, W, N])
         obj_oh = F.one_hot(obj_ids_clean, num_classes=self.num_obj_types).permute(0, 3, 1, 2).float()
-        
-        # col_ids -> [1, H, W, 6] -> permute -> [1, 6, H, W]
         col_oh = F.one_hot(col_ids, num_classes=self.num_colors).permute(0, 3, 1, 2).float()
         
-        # 4. 拼接: [1, 11+6, H, W]
         return torch.cat([obj_oh, col_oh], dim=1)
 
-    def get_reward(self, map_vec_tensor):
+    def get_reward(self, map_vec_tensor, inventory_vec=None):
         """
-        输入: map_vec_tensor [2, H, W] (单个地图)
-        输出: float (标量奖励)
+        输入: 
+            map_vec_tensor: [1, 2, H, W] 
+            inventory_vec: [1, 16] (Numpy or Tensor)
+        输出: float
         """
-        # 确保数据在正确的设备上
         map_vec_tensor = map_vec_tensor.to(self.device)
         
         with torch.no_grad():
-            # 1. 预处理 (One-Hot + Unsqueeze)
-            x = self._preprocess(map_vec_tensor) # [1, 17, H, W]
+            # 1. 地图特征 [1, 64]
+            x = self._preprocess(map_vec_tensor)
+            emb_map = self.encoder(x) # [1, 64]
             
-            # 2. 编码提取特征
-            emb_raw = self.encoder(x) # [1, 64]
-            # [NEW] Feature Normalization (Unit Norm)
-            # This ensures Euclidean distance is bounded [0, 2] and highly sensitive to direction
+            # 2. 背包特征 [1, 16] (可选)
+            if self.env_type == 'crafter' and inventory_vec is not None:
+                if not isinstance(inventory_vec, torch.Tensor):
+                    inventory_vec = torch.from_numpy(inventory_vec).float().to(self.device)
+                if inventory_vec.dim() == 1:
+                    inventory_vec = inventory_vec.unsqueeze(0)
+                emb_inv = self.inv_encoder(inventory_vec) # [1, 16]
+                emb_raw = torch.cat([emb_map, emb_inv], dim=1) # [1, 80]
+            else:
+                emb_raw = emb_map # [1, 64]
+            
+            # 3. 联合指纹归一化 (Unit Norm on Hypersphere)
             norm = torch.norm(emb_raw, p=2, dim=1, keepdim=True)
-            emb = (emb_raw / (norm + 1e-8)).cpu().numpy().flatten() # [64]
+            emb = (emb_raw / (norm + 1e-8)).cpu().numpy().flatten()
             
-        # 3. KNN 距离计算 (新颖性)
+        # 4. KNN 距离计算 (新颖性)
         if len(self.archive) == 0:
-             # Archive is empty (first step), so no novelty can be computed relative to history.
-             # Return 0.0. The archive will be populated immediately after this.
              reward = 0.0
         else:
             archive_matrix = np.stack(self.archive)
-            # 计算当前 emb 与 archive 中所有点的欧氏距离
             dists = np.linalg.norm(archive_matrix - emb, axis=1)
-            
-            # Use dynamic K if archive is small
-            # This solves the "Cold Start" problem where first K samples got 0 reward
             current_k = min(len(self.archive), self.k)
-            
-            # 取最近的 k 个
             dists.sort()
             nearest_k = dists[:current_k]
-            
-            # 平均距离越大，说明越新颖
             reward = np.mean(nearest_k)
             
-        # 4. 更新档案 (FIFO)
+        # 5. 更新档案 (FIFO)
         self.archive.append(emb)
         if len(self.archive) > self.max_size:
             self.archive.pop(0)

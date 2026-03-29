@@ -70,6 +70,21 @@ class WMRLDataset(Dataset):
         self.act_norm_values = hparams.action_norm_values
         self.data = self.make_data(loaded, replay_data)
 
+    @staticmethod
+    def _to_crafter_nchw(arr):
+        """
+        Normalize Crafter observations to (N, C, H, W).
+        Accepts either (N, H, W, 2) or already-canonical (N, 2, H, W).
+        """
+        if arr is None:
+            return None
+        if arr.ndim != 4:
+            return arr
+        # Raw rollout data from run_env is often (N, H, W, 2).
+        if arr.shape[-1] == 2 and arr.shape[1] != 2:
+            return np.moveaxis(arr, -1, 1)
+        return arr
+
     def state_batch_preprocess(self, state):
         obs = np.zeros((state.shape[0], 3, 3, state.shape[-1])) # The mask will extract a 3x3 square around the agent
         for i in range(state.shape[0]):  # Loop over the last dimension (channels)
@@ -105,6 +120,10 @@ class WMRLDataset(Dataset):
         inv     = loaded.get('g', None) if env_type == 'crafter' else None
         inv_next = loaded.get('h', None) if env_type == 'crafter' else None
 
+        if env_type == 'crafter':
+            obs = self._to_crafter_nchw(obs)
+            obs_next = self._to_crafter_nchw(obs_next)
+
         current_n = len(obs)
         assert current_n == len(obs_next) == len(act), "[BUG] Current lengths inconsistent!"
 
@@ -124,26 +143,6 @@ class WMRLDataset(Dataset):
         # [NEW] Check for empty current and replay datasets immediately
         if current_n == 0 and (replay_data is None or len(replay_data.get('obs', [])) == 0):
             return {'obs': np.array([]), 'obs_next': np.array([]), 'act': np.array([])}
-
-        # [NEW] For Crafter: Pad any smaller maps to a consistent 6x8 shape (matches target task)
-        # Using pad value 2 (Grass) for objects and 0 for directions.
-        if env_type == 'crafter':
-            h_tgt, w_tgt = 17, 23
-            # Standardize all Crafter task observations to 17x23 using Grass(2) padding
-            def pad_crafter(data):
-                # data shape: (N, 2, H, W)
-                B, C, H, W = data.shape
-                padded = np.zeros((B, C, h_tgt, w_tgt), dtype=data.dtype)
-                padded[:, 0, :, :] = 2 # Object channel: Default to Grass (ID 2)
-                # Slicing safely: crop if input is somehow larger than tgt, pad if smaller
-                h_max = min(H, h_tgt)
-                w_max = min(W, w_tgt)
-                padded[:, :, :h_max, :w_max] = data[:, :, :h_max, :w_max]
-                return padded
-            
-            obs = pad_crafter(obs)
-            obs_next = pad_crafter(obs_next)
-            print(f"[DataModule] Standardized Crafter shape to ({h_tgt},{w_tgt}) using Grass(2) padding.")
 
         # ===== (0.5) Frame Stacking (If enabled for new data) =====
         frame_stack = int(getattr(self.hparams, "frame_stack", 1))
@@ -215,6 +214,10 @@ class WMRLDataset(Dataset):
                 if r_inv_next is None and inv_next is not None:
                     inv_dim = inv_next.shape[-1]
                     r_inv_next = np.zeros((len(r_obs), inv_dim), dtype=np.float32)
+
+            if env_type == 'crafter':
+                r_obs = self._to_crafter_nchw(r_obs)
+                r_obs_next = self._to_crafter_nchw(r_obs_next)
 
             # 拼接 (Note: r_obs must have same shape as obs, i.e. already stacked if frame_stack > 1)
             if r_obs.shape[1:] == obs.shape[1:]:

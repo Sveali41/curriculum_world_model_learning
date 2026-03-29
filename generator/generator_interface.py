@@ -35,387 +35,404 @@ class GeneratorInterface:
         self.wm = world_model
         self.use_elites = getattr(hparams, "use_elites", True)
         
+        # Check if environment is Crafter
+        self.is_crafter = (getattr(cfg.attention_model, "env_type", "") == "crafter")
+
+        if self.is_crafter:
+            # Crafter: use custom seeder, actions, and map sizes
+            # NOTE: map_height now ONLY includes the physical layout (No more +1 hack!)
+            self.map_height = hparams.map_height
+            self.map_width = hparams.map_width
+            self.seeder = CrafterPCGSeeder(height=self.map_height, width=self.map_width)
+            self.ACTION_TABLE = {
+                0: None, 
+                1: CRAFTER_OBJ_MAP['grass'],     # allows erasing
+                2: CRAFTER_OBJ_MAP['tree'], 
+                3: CRAFTER_OBJ_MAP['stone'], 
+                4: CRAFTER_OBJ_MAP['coal'], 
+                5: CRAFTER_OBJ_MAP['iron'], 
+                6: CRAFTER_OBJ_MAP['diamond'],
+                7: CRAFTER_OBJ_MAP['water'], 
+                8: CRAFTER_OBJ_MAP['table'], 
+                9: CRAFTER_OBJ_MAP['furnace'],
+                10: CRAFTER_OBJ_MAP['plant']
+            }
+        else:
+            # MiniGrid: use standard seeder
+            self.map_height = hparams.map_height
+            self.map_width = hparams.map_width
+            self.seeder = MinigridPCGSeeder(height=self.map_height, width=self.map_width)
+            self.ACTION_TABLE = ACTION_TABLE_MINIGRID
+
         if agent_type == 'random':
-            print("[Generator] Using Random Agent")
-            self.ppo = RandomGeneratorAgent(num_actions=len(ACTION_TABLE), device=device)
+            self.ppo = RandomGeneratorAgent(num_actions=len(self.ACTION_TABLE), device=device)
         else:
             self.ppo = GeneratorPPO(
                 context_dim=hparams.context_dim,
-                num_actions=len(ACTION_TABLE),
+                num_actions=len(self.ACTION_TABLE),
                 his_emb_dim=hparams.his_emb_dim,
                 top_k_features=hparams.ctx_top_k_features,
                 ablation_type=self.cfg.ablation.type 
             )
         
-        self.map_height = hparams.map_height
-        self.map_width = hparams.map_width
         self.div_k = hparams.div_k
-        self.diversity = DiversityModule(self.map_height, self.map_width, self.div_k)
-        self.max_edits = hparams.max_edits
-        self.seeder = PCGSeeder(height=self.map_height, width=self.map_width)
+        self.diversity = DiversityModule(
+            self.map_height, self.map_width, self.div_k, 
+            env_type=('crafter' if self.is_crafter else 'minigrid')
+        )
+        self.max_edits_layout = hparams.max_edits_layout
+        self.max_edits_inventory = hparams.max_edits_inventory
         
-        self.OBJ_START = OBJECT_TO_IDX["agent"]
-        self.OBJ_GOAL = OBJECT_TO_IDX["goal"]
-        self.OBJ_EMPTY = OBJECT_TO_IDX["empty"]
+        self.OBJ_START = OBJECT_TO_IDX["agent"] if not self.is_crafter else CRAFTER_OBJ_MAP['agent']
+        self.OBJ_GOAL = OBJECT_TO_IDX["goal"] if not self.is_crafter else 999 # No goal in Crafter
+        self.OBJ_EMPTY = OBJECT_TO_IDX["empty"] if not self.is_crafter else CRAFTER_OBJ_MAP['grass']
 
         self.elite_buffer = [] 
         self.max_elites = max(1, self.batch_size // 2)
         self.prev_data = None
 
     def sync_world_model(self, state_dict):
-        self.wm.load_state_dict(state_dict)
+        """Update the internal world model instance with new weights while clearing stale Hooks."""
+        if state_dict is not None:
+             # Critical: Clear hooks to prevent ReferenceError in state_dict()
+             if hasattr(self.wm, "_state_dict_hooks"):
+                 self.wm._state_dict_hooks.clear()
+             if hasattr(self.wm, "_parameters"):
+                 for p_name, p in self.wm._parameters.items():
+                     if p is not None and hasattr(p, "_hooks"):
+                         p._hooks.clear()
+             
+             self.wm.load_state_dict(state_dict)
 
-    def step(self, iteration=0):
-        # 1. Prepare Base Maps & Aligned Context (Adversarial Inheritance)
+    def _zero_context(self, B, H, W):
+        # (Map features, Inventory Heatmap)
+        # Spatial heat map: [B, 1, H, W]
+        # Stats heat map: [B, 16] - We now handle this separately for Crafter
+        map_h = torch.zeros((B, 1, H, W), device=self.device)
+        if self.is_crafter:
+            stats_h = torch.zeros((B, 16), device=self.device)
+        else:
+            stats_h = None
+        return (torch.zeros((B, 3, H, W), device=self.device), map_h, stats_h)
+
+    def step(self, old_params, iteration=0):
+        # 1. Prepare Base Maps & Stats & Context
         base_maps = []
-        context_maps = []
-        context_heats = []
+        base_stats = []
+        context_maps, context_heats_terrain, context_heats_stats = [], [], []
         
         warmup_iters = self.cfg.generator_agent.get("warmup_iterations", 0)
         is_warmup = (iteration < warmup_iters)
 
         num_elites = 0
-        if (
-            self.use_elites
-            and (not is_warmup)
-            and len(self.elite_buffer) > 0
-        ):
+        if self.use_elites and (not is_warmup) and len(self.elite_buffer) > 0:
             num_elites = min(len(self.elite_buffer), self.max_elites)
-
         
         num_random = self.batch_size - num_elites
 
-        # A) Load Elites
+        # A) Load Elites (Legacy supporting map only for now)
         for i in range(num_elites):
-            obj_map_np, h_tensor, _ = self.elite_buffer[i]
+            obj_map_np, h_dict, stats_np = self.elite_buffer[i]
             base_maps.append(obj_map_np)
+            base_stats.append(stats_np)
             
-            zm, zh = self._zero_context(1, self.map_height, self.map_width)
+            zm, zh, zhs = self._zero_context(1, self.map_height, self.map_width)
             m_3ch = zm.clone()
             m_3ch[0, 0] = torch.tensor(obj_map_np, device=self.device)
             context_maps.append(m_3ch)
-            context_heats.append(h_tensor.to(self.device))
+            context_heats_terrain.append(torch.tensor(h_dict['terrain']).to(self.device))
+            context_heats_stats.append(torch.tensor(h_dict['inventory']).to(self.device).reshape(1, 16))
         
         # B) Load PCG
         for _ in range(num_random):
-            z = np.random.randint(0, 1e6)
-            
-            # [RESTORE DIVERSITY] Randomly choose between pure_random and blob
-            struct_mode = random.choice(["pure_random", "blob"])
-            self.seeder.structure_mode = struct_mode
-            
-            grid = self.seeder.generate(z=z)
-            if not self.is_crafter:
-                min_dim = min(self.map_height, self.map_width)
-                adaptive_ratio = 0.85 if min_dim <= 10 else 0.4
-                grid, _ = minigrid_task_placer(grid, min_dist_ratio=adaptive_ratio)
-            
+            grid = self.seeder.generate()
             base_maps.append(grid)
-            zm, zh = self._zero_context(1, self.map_height, self.map_width)
+            default_stats = np.zeros(16)
+            default_stats[0] = 9.0 # health
+            default_stats[1] = 9.0 # food
+            default_stats[2] = 9.0 # drink
+            default_stats[3] = 9.0 # energy
+            base_stats.append(default_stats)
+            
+            zm, zh, zhs = self._zero_context(1, self.map_height, self.map_width)
             context_maps.append(zm)
-            context_heats.append(zh)
+            context_heats_terrain.append(zh)
+            context_heats_stats.append(torch.zeros((1, 16), device=self.device))
 
         # 2. Finalize Input Tensors
         base_ids = torch.from_numpy(np.stack(base_maps)).to(self.device).long()
         B, H, W = base_ids.shape
-        zeros = torch.zeros((B, H, W), device=self.device, dtype=torch.long)
-        curr_map = torch.stack([base_ids, zeros, zeros], dim=1).float() 
+        zeros = torch.zeros((B, H, W), device=self.device, dtype=torch.float32)
         
-        mask = self._immutable_mask(base_ids)
-        ppo_input_context = (torch.cat(context_maps), torch.cat(context_heats))
-
-        if hasattr(self.cfg, 'ablation') and self.cfg.ablation.type == 'no_history':
-            ppo_input_context = self._zero_context(B, H, W)
-
-        # 3. select actions
-        actions, logp, values, topk_action_mask, _ = self.ppo.select_action(
-            curr_map, ppo_input_context, mask, max_edits=self.max_edits
+        # Context packing
+        # For Crafter, we pass Map and Stats heat independently
+        ppo_input_context = (
+            torch.cat(context_maps), 
+            torch.cat(context_heats_terrain), 
+            torch.cat(context_heats_stats) if self.is_crafter else None
         )
 
-        # 4. Rollout & Reward Collection
-        next_maps, next_heats = [], []
-        valid_trajs, raw_scalar_losses, div_rewards, bfs_stats = [], [], [], []
-        clutter_counts = []
+        # Inject Terrain Error Heatmap DIRECTLY into the spatial CNN channels!
+        # Channel 0: Structural Layout
+        # Channel 1: Terrain Error Heatmap (Spatially aligns with features!)
+        # Channel 2: Blank (Padding to 3 channels)
+        heat_terrain_spatial = ppo_input_context[1].squeeze(1).float() # [B, H, W]
+        curr_map = torch.stack([base_ids.float(), heat_terrain_spatial, zeros], dim=1) 
+        
+        mask = self._immutable_mask(base_ids)
 
+
+        # 3. select dual actions
+        actions, stats_actions, logp, values, topk_action_mask, _ = self.ppo.select_action(
+            curr_map, ppo_input_context, mask, self.max_edits_layout, self.max_edits_inventory
+        )
+
+        # 2. Sequential Evaluation for Rewards
+        valid_trajs = []
+        next_maps, next_heats_terrain, next_heats_stats = [], [], []
+        raw_scalar_losses, div_rewards = [], []
+        raw_ce_losses, raw_inv_losses = [], []
+        solved_count = 0
+        total_bfs_dist = 0.0
+        
+        # np versions for easy access
         base_ids_np = base_ids.detach().cpu().numpy()
         actions_np = actions.detach().cpu().numpy()
-        solvable_count = 0
+        stats_actions_np = stats_actions.detach().cpu().numpy() if stats_actions is not None else None
+        base_stats_np = np.stack(base_stats)
 
         for i in range(self.batch_size):
-            obj_map, color_map = self._apply_action(base_ids_np[i], actions_np[i])
-            final_map = np.stack([obj_map, color_map], axis=0)
+            # Apply Terrain Actions
+            final_map_obj, _ = self._apply_action(base_ids_np[i], actions_np[i], mask=mask[i, 0].cpu().numpy())
+            # Apply Stats Actions (32 Piano Keys: 16 Slots * 2 Action Rows)
+            # Row 0 (0-15): Increment by 1
+            # Row 1 (16-31): Increment by 5
+            final_stats = base_stats_np[i].copy()
             
-            is_solvable, bfs_dist = check_solvability(obj_map)
-            if is_solvable:
-                solvable_count += 1
-                bfs_stats.append(bfs_dist) 
+            # --- [NEW] Check for Randomized Stats Actions ---
+            # If enabled, replace PPO's output with a random bitmask (e.g. 15% probability of a button being pressed)
+            if self.is_crafter and getattr(self.cfg.generator_agent, "random_stats_actions", False):
+                # Sample 32 bits from Bernoulli(p=0.15)
+                current_stats_act = (np.random.rand(32) < 0.15).astype(np.int64)
             else:
-                bfs_stats.append(0)
+                current_stats_act = stats_actions_np[i] if stats_actions_np is not None else None
+
+            if self.is_crafter and current_stats_act is not None:
+                # current_stats_act is [32] bits
+                for k_idx in range(32):
+                    if current_stats_act[k_idx] == 1:
+                        slot = k_idx % 16
+                        if k_idx < 16:
+                             final_stats[slot] += 1
+                        else:
+                             final_stats[slot] += 5
             
-            traj, heat, raw_loss_val, solved = self._rollout_env(final_map, iteration=iteration, batch_idx=i)
+            # Prepare for rollout
+            final_map_2ch = np.stack([final_map_obj, np.zeros_like(final_map_obj)], axis=0)
+            res_rollout = self._rollout_combined(final_map_obj, final_stats, iteration, i, old_params=old_params)
+            traj, errors, raw_loss_val, solved = res_rollout[0], res_rollout[1], res_rollout[2], res_rollout[3]
             
-            # [MOVED] Calculate diversity BEFORE checking validity, so we log it even for failed envs
-            r_div = self.diversity.get_reward(torch.tensor(final_map).unsqueeze(0).to(self.device))
-            r_div_val = r_div.item() if hasattr(r_div, 'item') else r_div
-            div_rewards.append(r_div_val)
+            # Extract sub-losses if available (for 6-column CSV)
+            t_loss_batch = res_rollout[4] if len(res_rollout) > 4 else raw_loss_val
+            i_loss_batch = res_rollout[5] if len(res_rollout) > 5 else 0.0
+            # [NEW] Extract Inventory Transition Diversity
+            inv_changed_slots = res_rollout[6] if len(res_rollout) > 6 else 0
+
+            # --- Crafter Specific Solvability Logic ---
+            # Basically, check if player is not blocked by water walls. Use the seeder's BFS.
+            if self.is_crafter:
+                 is_connected, conn_stats = self.seeder.check_connectivity(final_map_obj)
+                 if is_connected: 
+                     solved_count += 1
+                     total_bfs_dist += conn_stats.get('max_dist', 0)
+            else:
+                 if solved: 
+                     solved_count += 1
+                     total_bfs_dist += 1.0 # Minigrid placeholder
             
-            # [ABLATION]
-            r_div_weight_factor = 1.0
-            if hasattr(self.cfg, 'ablation') and self.cfg.ablation.type == 'no_diversity':
-                r_div_weight_factor = 0.0
+            # Reward Logic
+            # For Crafter, 'solved' is redefined as 'is_connected' (BFS reachability)
+            is_connected_final = is_connected if self.is_crafter else solved
+            r_div = self.diversity.get_reward(torch.tensor(final_map_2ch).unsqueeze(0).to(self.device), inventory_vec=final_stats)
+            div_rewards.append(r_div)
+            reward = self._calculate_reward(raw_loss_val, r_div, is_connected_final, is_warmup, inv_diversity=inv_changed_slots)
             
             if not traj or 'obs' not in traj:
-                fail_reward = -5.0 if not is_solvable else -1.0
-                fail_reward = -5.0 if not is_solvable else -1.0
-                self.ppo.save_buffer(
-                    curr_map[i:i+1],
-                    (ppo_input_context[0][i:i+1], ppo_input_context[1][i:i+1]),
-                    mask[i:i+1],
-                    actions[i:i+1],
-                    logp[i:i+1],
-                    values[i:i+1],
-                    fail_reward,
-                    topk_action_mask[i:i+1]
-                )
-                continue
-
-            valid_trajs.append(traj)
-            next_maps.append(self._map_to_tensor(final_map))
-            next_heats.append(heat)
+                reward = -5.0 # Basic failure penalty
             
-
-
-            # [DEBUG]
-            if iteration % 1 == 0:
-                 print(f"[DEBUG] Iter {iteration} Batch {i}: ArchiveSize={len(self.diversity.archive)}, r_div_val={r_div_val:.6f}")
-
-            scalar_loss = raw_loss_val
-            if scalar_loss <= 0.5:
-                reward_loss = np.exp(scalar_loss * 10.0) * 10.0 
-            else:
-                reward_loss = 1480.0 + (scalar_loss - 0.5) * 1000.0
+            # Provide the correct error pattern context slices instead of None!
+            # Otherwise PPO update computes gradients on ZERO context!
+            cm = ppo_input_context[0][i:i+1]
+            cht = ppo_input_context[1][i:i+1]
+            chs = ppo_input_context[2][i:i+1] if self.is_crafter else torch.zeros((1, 16), device=self.device)
+            prev_data_i = (cm, cht, chs)
             
-            # [CRITICAL] Cap the reward. We don't want 20,000 pts 
-            # overwhelming our density penalty.
-            reward_loss = min(1000.0, reward_loss)
-            
-            if hasattr(self.cfg, 'ablation') and self.cfg.ablation.type == 'no_learning_progress':
-                reward_loss = 0.0
-            
-            r_len = bfs_dist * 0.5 
-            
-            # [FIX] Compute object density
-            clutter_mask = np.isin(final_map[0], [4, 5, 9])
-            clutter_count = np.sum(clutter_mask)
-            clutter_counts.append(clutter_count)
-
-            # [REBALANCED] Link clutter threshold to the actual max_edits in config.
-            edit_ratio = getattr(self.cfg.generator_agent, "max_edits", 0.06)
-            clutter_threshold = int(self.map_height * self.map_width * edit_ratio)
-            
-            # [REBALANCED] Penalty: -50.0 per excess item.
-            r_density = -50.0 * max(0, clutter_count - clutter_threshold)
-
-            if not is_solvable:
-                reward = -5.0 + r_density
-            elif solved:
-                reward = reward_loss + 5.0 * r_div_val * r_div_weight_factor + r_len + 0.01 + r_density
-            else:
-                reward = (reward_loss * 0.8) + 2.5 * r_div_val * r_div_weight_factor + r_len + 0.005 + r_density
-
-            # [FIX] Apply density penalty to warmup too! 
-            # Otherwise generator learns "flooding" as a good strategy for diversity/BFS.
-            if iteration < warmup_iters:
-                reward = 1.0 + (bfs_dist * 0.2) + (r_div_val * 5.0 * r_div_weight_factor) + r_density
-
-            raw_scalar_losses.append(raw_loss_val) 
+            raw_scalar_losses.append(raw_loss_val)
+            raw_ce_losses.append(t_loss_batch)
+            raw_inv_losses.append(i_loss_batch)
             self.ppo.save_buffer(
                 curr_map[i:i+1],
-                (ppo_input_context[0][i:i+1], ppo_input_context[1][i:i+1]),
+                prev_data_i,
                 mask[i:i+1],
                 actions[i:i+1],
+                stats_actions[i:i+1] if self.is_crafter else torch.zeros((1, 16), device=self.device),
                 logp[i:i+1],
                 values[i:i+1],
                 reward,
                 topk_action_mask[i:i+1]
             )
+            
+            if traj and 'obs' in traj:
+                valid_trajs.append(traj)
+                next_maps.append(self._map_to_tensor(final_map_2ch))
+                next_heats_terrain.append(torch.tensor(errors['terrain']).unsqueeze(0).unsqueeze(0))
+                next_heats_stats.append(torch.tensor(errors['inventory']).unsqueeze(0))
 
+        # Update Memory
         if len(next_maps) > 0:
-            self.prev_data = (torch.cat(next_maps), torch.cat(next_heats))
-            if not is_warmup:
-                elite_candidates = []
-                for i in range(len(next_maps)):
-                    map_np = next_maps[i][0, 0].cpu().numpy()
-                    heat_i = next_heats[i].detach().cpu()
-                    loss_i = raw_scalar_losses[i]
-                    clutter_i = clutter_counts[i]   
+            self.prev_data = (torch.cat(next_maps), torch.cat(next_heats_terrain), torch.cat(next_heats_stats))
 
-                    edit_ratio = getattr(self.cfg.generator_agent, "max_edits", 0.06)
-                    threshold = int(self.map_height * self.map_width * edit_ratio)
+        # Return real count; avg_bfs is derived from BFS max depth
+        avg_bfs = total_bfs_dist / max(1, solved_count) if solved_count > 0 else 0.0
+        
+        # Clean up NaNs
+        mean_raw_loss = np.mean(raw_scalar_losses) if len(raw_scalar_losses) > 0 else 0.0
+        mean_ce_loss = np.mean(raw_ce_losses) if len(raw_ce_losses) > 0 else 0.0
+        mean_inv_loss = np.mean(raw_inv_losses) if len(raw_inv_losses) > 0 else 0.0
+        mean_div_reward = np.mean(div_rewards) if len(div_rewards) > 0 else 0.0
 
-                    if clutter_i <= threshold:
-                        elite_candidates.append(
-                            (map_np, heat_i, loss_i)
-                        )
-                    else:
-                        # If the champion is too cluttered, it's not a champion, it's a bug.
-                        pass
+        return None, None, mean_raw_loss, mean_ce_loss, mean_inv_loss, mean_div_reward, valid_trajs, solved_count, avg_bfs
 
-                elite_candidates.sort(key=lambda x: x[2], reverse=True)
-                self.elite_buffer = elite_candidates[:self.max_elites]
-                if len(self.elite_buffer) > 0:
-                    print(f"[Generator] Evolution Memory Updated ({num_elites} inherited, Top Sparse Loss: {self.elite_buffer[0][2]:.4f})")
+    def _rollout_combined(self, map_np, stats_np, iter, idx, old_params=None):
+        try:
+             # Use the modernized support.interpret_env
+             # Note: For MiniGrid, stats_np is ignored by its version of support/interpret
+             env_source, _ = self.support.interpret_env(map_np, self.cfg, inventory_vec=stats_np)
+             save_name = f'UED_Dual_iter{iter}_b{idx}'
+             save_path = collect_data_general(self.support.cfg, env_source=env_source, save_name=save_name, recollect_data=True)
+             
+             if not os.path.exists(save_path): return {}, {}, 0.0, False
+             
+             # Extract Dual-Head Error Signal
+             v_times = getattr(self.cfg.attention_model, "valid_times", 1)
+             res_eval = extract_loss_map_over_validations(self.cfg, self.wm, old_params, save_path, valid_times=v_times)
+             error_dict, loss_list = res_eval[0], res_eval[1]
+             terrain_losses, inv_losses = res_eval[2], res_eval[3]
 
-        mean_raw_loss = np.mean(raw_scalar_losses) if raw_scalar_losses else 0.0
-        mean_div_score = np.mean(div_rewards) * 5.0 if div_rewards else 0.0
-        avg_bfs_dist = np.mean(bfs_stats) if bfs_stats else 0.0
+             # Load trajectory (a=obs, b=obs_next, c=act, f=info)
+             task_npz = np.load(save_path, allow_pickle=True)
+             traj = {
+                 'obs': torch.tensor(task_npz['a'], device=self.device),
+                 'obs_next': torch.tensor(task_npz['b'], device=self.device),
+                 'act': torch.tensor(task_npz['c'], device=self.device),
+                 'info': task_npz['f'] if 'f' in task_npz else None,
+                 'inv': torch.tensor(task_npz['g'], device=self.device) if 'g' in task_npz else None,
+                 'inv_next': torch.tensor(task_npz['h'], device=self.device) if 'h' in task_npz else None
+             }
+             solved = np.any((task_npz['e']) & (task_npz['d'] > 0))
+             
+             # [NEW] Compute Inventory Transition Diversity
+             # Count how many distinct inventory slots changed at least once during the rollout
+             inv_changed_slots = 0
+             if 'g' in task_npz and 'h' in task_npz:
+                 inv_arr      = task_npz['g'].astype(np.float32)  # [T, 16]
+                 inv_next_arr = task_npz['h'].astype(np.float32)  # [T, 16]
+                 delta = inv_next_arr - inv_arr
+                 inv_changed_slots = int(np.any(delta != 0, axis=0).sum())  # 0-16
+             
+             return traj, error_dict, np.mean(loss_list), solved, np.mean(terrain_losses), np.mean(inv_losses), inv_changed_slots
+        except Exception as e:
+             print(f"[GeneratorInterface] Rollout failed: {e}")
+             return {}, {"terrain": np.zeros((self.map_height, self.map_width)), "inventory": np.zeros(16)}, 0.0, False, 0.0, 0.0, 0
 
-        return (
-            None, # next_maps placeholder
-            None, # next_heats placeholder
-            mean_raw_loss,
-            mean_div_score,
-            valid_trajs,
-            solvable_count,
-            avg_bfs_dist
-        )
+    def _apply_action(self, base_map, act, mask=None):
+        # Local terrain modification logic (Spatial Head)
+        obj = base_map.copy()
+        H, W = obj.shape
+        
+        # Track limits for restricted items
+        restricted_limits = {}
+        counts = {}
+        if self.is_crafter:
+            restricted_limits = {
+                CRAFTER_OBJ_MAP['diamond']: 1,
+                CRAFTER_OBJ_MAP['table']: 1,
+                CRAFTER_OBJ_MAP['furnace']: 1
+            }
+            # Initialize counts with existing items on base map
+            for r_id in restricted_limits:
+                counts[r_id] = np.sum(obj == r_id)
 
-    def update(self):
-        loss, entropy = self.ppo.update()
-        return loss, entropy, self.ppo.last_mean_reward
+        for i in range(H):
+            for j in range(W):
+                # Skip if immutable (mask is 1.0 for boundaries)
+                if mask is not None and mask[i, j] > 0:
+                    continue
+                a = act[i, j]
+                if a == 0: continue
+                val = self.ACTION_TABLE.get(a)
+                
+                if val is not None: 
+                    # Enforce restriction limits
+                    if self.is_crafter and val in restricted_limits:
+                        if counts[val] >= restricted_limits[val]:
+                            continue # Ignore this action, limit reached
+                        counts[val] += 1
+                    
+                    obj[i, j] = val
+        
+        # Mandatory Agent Placement Fallback (Ensures environment can always start)
+        if not np.any(obj == self.OBJ_START):
+            candidate_positions = []
+            grass_positions = []
+            for r in range(H):
+                for c in range(W):
+                    if mask is not None and mask[r, c] > 0: continue
+                    candidate_positions.append((r, c))
+                    if obj[r, c] == self.OBJ_EMPTY: # self.OBJ_EMPTY is 'grass' for Crafter
+                        grass_positions.append((r, c))
+            
+            # Prioritize grass, fallback to any non-boundary tile
+            pick_list = grass_positions if len(grass_positions) > 0 else candidate_positions
+            if len(pick_list) > 0:
+                spawn_r, spawn_c = random.choice(pick_list)
+                obj[spawn_r, spawn_c] = self.OBJ_START
+                
+        return obj, np.zeros_like(obj)
+
+    def _calculate_reward(self, raw_loss, div_score, solved, is_warmup, inv_diversity=0):
+        if is_warmup: return 1.0 + div_score * 5.0
+        
+        # Crafter: No BFS, Pure adversarial reward loop. 
+        # Any environment is a valid challenge for the World Model.
+        if self.is_crafter:
+            # [MODIFIED] Only provide bonus if stats actions are NOT randomized
+            # This allows PPO to focus 100% on challenging terrain (raw_loss) during randomized experiments.
+            
+            print(f"[Reward] raw_loss={raw_loss:.3f} | div={div_score:.3f} | inv_slots_changed={inv_diversity}")
+            return raw_loss * 5.0 + 3.0 * div_score + 2.0
+            
+        # Minigrid: Strict solvability required (Walls are immutable obstacles).
+        # Regret-based reward for curricular difficulty
+        # If not connected/solved, penalize heavily to avoid exploiting "stuck" states
+        if not solved: return -5.0 + 2.0 * div_score
+        
+        # PPO requires smooth advantage curves.
+        reward_loss = raw_loss * 10.0
+        return reward_loss + 2.0 * div_score + 10.0 # Solved bonus is implicit
 
     def _immutable_mask(self, ids):
-        # 0.0 means mutable, 1.0 means immutable
-        # [FIX] Allow editing EVERYTHING except Start/Goal/Outer Walls.
-        # This gives the agent the power to "Delete" or "Change" existing objects in Elites.
         mask = torch.zeros_like(ids, dtype=torch.float32)
-        
-        # 1. Start and Goal are immutable
+        # 1. Protect Boundary Water
+        mask[:, 0, :] = 1.0; mask[:, -1, :] = 1.0; mask[:, :, 0] = 1.0; mask[:, :, -1] = 1.0
+        # 2. Protect Agent's Position (Don't erase/move the player once placed)
         mask[ids == self.OBJ_START] = 1.0
-        mask[ids == self.OBJ_GOAL] = 1.0
-        
-        # 2. Outer walls (boundary) are immutable 
-        # Detect boundary positions [B, H, W]
-        H, W = ids.shape[-2:]
-        mask[:, 0, :] = 1.0
-        if self.is_crafter:
-            mask[:, -2, :] = 1.0 # Protect physical map bottom border (H-2)
-            # The row -1 is the inventory. We do NOT mask it because we WANT generator to edit it!
-            # But we mask the corners of inventory to save computing
-            mask[:, -1, 0] = 1.0
-            mask[:, -1, -1] = 1.0
-        else:
-            mask[:, -1, :] = 1.0
-        mask[:, :, 0] = 1.0
-        mask[:, :, -1] = 1.0
-        
-        # 3. Existing Walls inside remain immutable to keep connectivity stable?
-        # Actually, let's allow editing walls inside too, to allow "Digging".
-        # But we'll keep the boundary strictly closed.
-
         return mask.unsqueeze(1)
 
-    def _apply_action(self, base_obj_map, act):
-        if self.is_crafter:
-            H, W = base_obj_map.shape
-            obj = base_obj_map.copy()
-            # Crafter doesn't use color map from generator, just return zeros to keep API compatible
-            color = np.zeros_like(obj)
-            immutable = (obj == self.OBJ_START) | (obj == self.OBJ_GOAL)
-            
-            for i in range(H):
-                for j in range(W):
-                    if immutable[i, j]: continue
-                    a = act[i, j]
-                    if a == 0: continue
-                    
-                    if a in self.ACTION_TABLE:
-                        act_val = self.ACTION_TABLE[a]
-                        # 拦截针对最后一行(Inventory Row)的操作和普通操作
-                        if isinstance(act_val, str) and i == H - 1:
-                            if act_val == "inventory_add_1":
-                                obj[i, j] += 1
-                            elif act_val == "inventory_add_2":
-                                obj[i, j] += 5
-                        elif not isinstance(act_val, str) and i < H - 1:
-                            # 正常的地形修改
-                            obj[i, j] = act_val
-                            
-            return obj, color
-            
-        else:
-            H, W = base_obj_map.shape
-            obj = base_obj_map.copy()
-            
-            MAX_OBJ_ID = max(OBJECT_TO_IDX.values())
-            default_color_map = np.zeros(MAX_OBJ_ID + 1, dtype=np.int64)
-            default_color_map[OBJECT_TO_IDX["wall"]] = COLOR_TO_IDX["grey"]
-            default_color_map[OBJECT_TO_IDX["door"]] = COLOR_TO_IDX["yellow"]
-            default_color_map[OBJECT_TO_IDX["key"]] = COLOR_TO_IDX["yellow"]
-            default_color_map[OBJECT_TO_IDX["ball"]] = COLOR_TO_IDX["red"]
-            default_color_map[OBJECT_TO_IDX["box"]] = COLOR_TO_IDX["yellow"]
-            default_color_map[OBJECT_TO_IDX["goal"]] = COLOR_TO_IDX["green"]
-            default_color_map[OBJECT_TO_IDX["lava"]] = COLOR_TO_IDX["red"]
-            
-            color = default_color_map[np.clip(obj, 0, MAX_OBJ_ID)]
-            immutable = (obj == self.OBJ_START) | (obj == self.OBJ_GOAL)
-
-            for i in range(H):
-                for j in range(W):
-                    if immutable[i, j]: continue
-                    a = act[i, j]
-                    if a == 0: continue
-                    obj_type, color_name = self.ACTION_TABLE[a]
-                    if obj_type == "key":
-                        obj[i, j] = OBJECT_TO_IDX["key"]; color[i, j] = COLOR_TO_IDX[color_name]
-                    elif obj_type == "door":
-                        obj[i, j] = OBJECT_TO_IDX["door"]; color[i, j] = COLOR_TO_IDX[color_name]
-                    elif obj_type == "lava":
-                        obj[i, j] = OBJECT_TO_IDX["lava"]
-                    elif obj_type == "empty":
-                        obj[i, j] = OBJECT_TO_IDX["empty"]; color[i, j] = 0
-            return obj, color
-
-    def _zero_context(self, B, H, W):
-        return (torch.zeros((B, 3, H, W), device=self.device), torch.zeros((B, 1, H, W), device=self.device))
-
     def _map_to_tensor(self, m):
-        t = torch.tensor(m, device=self.device).float()
-        state_channel = torch.zeros_like(t[0:1])
-        return torch.cat([t, state_channel], dim=0).unsqueeze(0)
+        return torch.tensor(m, device=self.device).float().unsqueeze(0)
 
-    def _rollout_env(self, map_obj, iteration=0, batch_idx=0):
-        obj_map, color_map = map_obj
-        map_tensor = torch.tensor(obj_map, dtype=torch.long, device=self.device)
-        color_tensor = torch.tensor(color_map, dtype=torch.long, device=self.device)
-        try:
-            obj_str, color_str = self.support.interpret_env(map_tensor.cpu(), color_array=color_tensor.cpu())
-            env_str = (obj_str, color_str)
-        except: return {}, None, 0.0, False
+    def update(self):
+        loss, ent = self.ppo.update()
+        return loss, ent, self.ppo.last_mean_reward
 
-        old_episodes = self.support.cfg.env.collect.episodes
-        try:
-            save_name = f'UED_temp_iter{iteration}_b{batch_idx}'
-            # Respect configurable episodes per env, default to 1 for UED efficiency
-            self.support.cfg.env.collect.episodes = getattr(self.cfg.generator_agent, "episodes_per_env", 1)
-            save_path = collect_data_general(self.support.cfg, env_source=env_str, save_name=save_name, max_steps=1000, recollect_data=True)
-            
-            if os.path.exists(save_path):
-                task_npz = np.load(save_path, allow_pickle=True)
-                traj_data = {'obs': torch.tensor(task_npz['a'], device=self.device), 'obs_next': torch.tensor(task_npz['b'], device=self.device),
-                             'act': torch.tensor(task_npz['c'], device=self.device), 'info': task_npz['f'] if 'f' in task_npz else None}
-                solved = np.any((task_npz['e']) & (task_npz['d'] > 0))
-            else: return {}, None, 0.0, False
-
-            avg_loss_map, loss_list = extract_loss_map_over_validations(self.cfg, net=self.wm, old_params=None, data_dir=save_path, valid_times=1)
-            scalar_loss = np.mean(loss_list) if loss_list else 0.0
-            scaled_h = np.log(avg_loss_map + 1e-8)
-            heat = torch.tensor(scaled_h, device=self.device).unsqueeze(0).unsqueeze(0)
-        except Exception as e:
-            import traceback
-            print(f"[Generator] Rollout failed for batch {batch_idx}: {e}")
-            traceback.print_exc()
-            traj_data, heat, scalar_loss, solved = {}, torch.zeros((1, 1, self.map_height, self.map_width), device=self.device), 0.0, False
-        finally:
-            self.support.cfg.env.collect.episodes = old_episodes
-        return traj_data, heat, scalar_loss, solved

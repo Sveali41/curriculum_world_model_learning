@@ -9,7 +9,8 @@ class RandomGeneratorAgent:
         # Dummy internal state to match PPO interface if needed
         self.last_mean_reward = 0.0 
     
-    def select_action(self, base_map, prev_data, mask, max_edits):
+    def select_action(self, base_map, prev_data, mask, 
+                      max_edits_layout=0.1, max_stats_edit_ratio=0.1, stats_heat=None):
         """
         Return random actions for the batch.
         Signature matches GeneratorPPO.select_action:
@@ -17,81 +18,62 @@ class RandomGeneratorAgent:
             base_map: [B, C, H, W]
             prev_data: (prev_map, prev_heat) or None
             mask: [B, 1, H, W] (immutable mask, 1.0=immutable)
-            max_edits: float ratio
+            max_edits_layout: float ratio for terrain
+            max_stats_edit_ratio: float ratio for inventory [0..1]
         
         returns:
-            action: [B, H, W]  <-- CRITICAL: Must be spatial
+            action: [B, H, W]  <-- Terrain actions
+            stats_action: [B, 32] <-- Inventory actions (32 piano keys)
             logprob: [B]
             value: [B]
             topk_mask: [B, num_actions] (dummy)
             global_ctx: [1, context_dim] (dummy)
         """
         B, C, H, W = base_map.shape
-        
-        # Random spatial actions [B, H, W]
-        # Actions are 0..7
-        action = torch.randint(0, self.num_actions, (B, H, W), device=self.device)
-        
-        # --- [MODIFIED] Enforce max_edits constraint for DR ---
-        # Select K random cells to edit
         num_cells = H * W
         
-        # [NEW] Sample edit ratio uniformly from [0, max_edits]
-        # This makes max_edits a strict UPPER BOUND, not a fixed target.
-        # k will vary per sample in the batch for diversity.
-        actual_ratio = torch.rand((B, 1), device=self.device) * max_edits
-        k_batch = (actual_ratio * num_cells).long()
+        # --- 1. Terrain Random Edits ---
+        action = torch.randint(0, self.num_actions, (B, H, W), device=self.device)
         
-        # Since topk requires a single K, we take the max K in the batch for the TopK op, 
-        # and then mask out the extras later. Or simpler: just use one random ratio for the whole batch?
-        # Let's use one random ratio for the whole batch for simplicity and efficiency.
-        random_ratio = np.random.uniform(0.0, max_edits)
-        k = int(round(random_ratio * num_cells))
-        k = max(1, k) # Ensure at least 1 edit if ratio > 0, else 0
-        k = min(k, num_cells)
+        # Randomly choose K cells to edit based on ratio
+        random_ratio = np.random.uniform(0.0, max_edits_layout)
+        k = max(1, int(round(random_ratio * num_cells)))
         
-        # Create random mask for K edits
-        # Random noise for sorting
         rand_noise = torch.rand((B, num_cells), device=self.device)
-        # Top-K indices
         _, indices = torch.topk(rand_noise, k, dim=1)
         
-        # Scatter to mask [B, H*W] -> [B, H, W]
         edit_mask = torch.zeros((B, num_cells), dtype=torch.bool, device=self.device)
         edit_mask.scatter_(1, indices, True)
         edit_mask = edit_mask.view(B, H, W)
         
-        # Apply constraint: Only edit where edit_mask is True
-        # action[~edit_mask] = 0 (assuming 0 is No-Op/Empty)
-        # Note: action 0 might change something if base is not empty. 
-        # But usually action 0 is "No-Op" or "Empty".
-        # If we want to strictly "Not Edit", we should output action=0 (if 0 is 'Keep').
-        # Actually random agent generates 'actions'. Action 0 usually means "Floor/Empty" or "No-Op".
-        # Let's assume action 0 is safe default for "Do Nothing" or "Empty".
-        action[~edit_mask] = 0
-
-        # Optional: Apply mask to set action=0 where immutable (mask=1.0)
-        # mask is [B, 1, H, W]
+        action[~edit_mask] = 0 # No-op where not selected
+        
+        # Mask immutable cells
         if mask is not None:
-             # Expand mask to [B, H, W]
-             m = mask.squeeze(1) > 0.5
-             action[m] = 0 # No-op on immutable
+             action[mask.squeeze(1) > 0.5] = 0
              
-        # Dummy logp, value
+        # --- 2. Inventory Random Edits (32 Piano Keys) ---
+        # Slots 0-15 (Key 0-15): Inc by 1
+        # Slots 0-15 (Key 16-31): Inc by 5
+        num_keys = 32
+        stats_action = torch.zeros((B, num_keys), device=self.device)
+        
+        # How many keys to press?
+        k_stats = max(1, int(round(max_stats_edit_ratio * num_keys)))
+        
+        for b in range(B):
+            # Randomly pick indices to modify
+            indices_stats = np.random.choice(num_keys, k_stats, replace=False)
+            # Binary actions (0 or 1)
+            stats_action[b, indices_stats] = 1.0
+            
+        # --- 3. Dummies ---
         logprob = torch.zeros(B, device=self.device)
         value = torch.zeros(B, device=self.device)
-        
-        # Dummy topk_mask (all valid)
         topk_mask = torch.ones((B, self.num_actions), device=self.device)
-        
-        # Dummy global_ctx
-        # Need to know context_dim? Usually 64. 
-        # But we can just return a zero tensor of shape [1, 64] 
-        # Or better, don't hardcode 64 if possible, but PPO uses self.context_dim.
-        # Let's use a safe default 64 or 1.
         global_ctx = torch.zeros((1, 64), device=self.device)
 
-        return action, logprob, value, topk_mask, global_ctx
+        return action, stats_action, logprob, value, topk_mask, global_ctx
 
     def update(self, *args, **kwargs):
         """No-op update for random agent"""

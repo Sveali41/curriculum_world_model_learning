@@ -23,9 +23,9 @@ class Support:
         env = CustomCrafterEnv(txt_file_path=file_path, max_steps=max_steps)
         return env
 
-    def interpret_env(self, env, color_array=None):
+    def interpret_env(self, env, color_array=None, inventory_vec=None):
         if self.cfg.attention_model.env_type == 'crafter':
-            return crafter_support.interpret_env(env, self.cfg)
+            return crafter_support.interpret_env(env, self.cfg, inventory_vec=inventory_vec)
         return minigrid_support.interpret_env(env, self.cfg, color_array=color_array)
 
     def collect_data_trainer(

@@ -24,7 +24,6 @@ try:
 
 except KeyboardInterrupt:
     print("User manually stopped")
-
 finally:
     # Close the window and release resources
-    env.close()
+    env.close() 

@@ -47,13 +47,14 @@ class HistoryEncoder(nn.Module):
         # 4. 池化：改用 AdaptiveMaxPool2d 能更敏锐地捕捉“局部最显著的故障特征”
         self.pool = nn.AdaptiveMaxPool2d((1, 1))
 
-        # 5. 输出映射：加入 LayerNorm 和两层 MLP
+        # 5. 输出映射：增加 16 维背包误差特征的融合空间
+        # 输入：空间特征(64) + 背包误差(16) = 80
         self.fc = nn.Sequential(
-            nn.Linear(64, 64),
-            nn.LayerNorm(64),   # 保证不同样本间特征量级可比，对后续 Max 聚合至关重要
+            nn.Linear(64 + 16, 128),
+            nn.LayerNorm(128),
             nn.ReLU(inplace=True),
-            nn.Linear(64, context_dim),
-            nn.ReLU()           # 核心：确保非负，用于 Max-Pooling 并集逻辑
+            nn.Linear(128, context_dim),
+            nn.ReLU()
         )
 
     def _add_coords(self, x):
@@ -62,20 +63,34 @@ class HistoryEncoder(nn.Module):
         xx = torch.linspace(-1, 1, W, device=x.device).view(1, 1, 1, W).expand(B, 1, H, W)
         return torch.cat([x, xx, yy], dim=1)
 
-    def forward(self, state_grid, error_heatmap):
-        # Embedding 处理
+    def forward(self, state_grid, error_heatmap, stats_error=None):
+        """
+        state_grid: [B, 3, H, W]
+        error_heatmap: [B, 1, H, W]
+        stats_error: [B, 16] (Inventory errors)
+        """
+        B, _, H, W = state_grid.shape
+        
+        # 1. Embedding 处理
         feat_obj = self.emb_object(state_grid[:, 0].long()).permute(0, 3, 1, 2)
         feat_col = self.emb_color(state_grid[:, 1].long()).permute(0, 3, 1, 2)
         feat_sta = self.emb_cell_state(state_grid[:, 2].long()).permute(0, 3, 1, 2)
 
-        # 拼接特征
+        # 2. 拼接空间特征
         x = torch.cat([feat_obj, feat_col, feat_sta, error_heatmap], dim=1)
         x = self._add_coords(x)
 
-        # 提取空间特征
+        # 3. 提取 CNN 特征并池化
         x = self.net(x)
-        x = self.pool(x).flatten(1) # [B, 64]
+        spatial_features = self.pool(x).flatten(1) # [B, 64]
 
-        # 映射到 Context 空间
-        context = self.fc(x) # [B, context_dim]
+        # 4. 融合背包误差特征
+        if stats_error is None:
+            stats_error = torch.zeros(B, 16, device=state_grid.device)
+        
+        # Concat spatial fail patterns + stats fail patterns
+        combined = torch.cat([spatial_features, stats_error], dim=1) # [B, 80]
+
+        # 5. 映射到 Global Context 空间
+        context = self.fc(combined) # [B, context_dim]
         return context

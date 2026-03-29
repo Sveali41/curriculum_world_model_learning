@@ -1,0 +1,42 @@
+# trainer/conf/config_cl.yaml
+# Unified Continual Learning (CL) Baseline Configuration
+
+defaults:
+  - config_ued                 # Inherit WM, EWC, Buffer from unified config
+  - _self_
+
+# --- Control Switch (Unified across all baselines) ---
+domain: 'crafter'              # 'crafter' or 'minigrid'
+
+# --- Domain-Specific Specifications for Sequential Phase Training ---
+domains:
+  crafter:
+    n_phases: 6
+    task_prefix: "crafter_target_task_"
+    data_path: ${oc.env:TRAIN_DATASET_PATH}/
+    train_suffix: "_random.npz"
+    val_suffix: "_uniform.npz"
+    grid_shape: [2, 31, 31]
+    obs_norm: [20, 5, 0]
+    action_norm: 17
+    start_idx: 1
+    
+  minigrid:
+    n_phases: 20
+    task_prefix: "target_task"
+    data_path: ${oc.env:TRAINER_PATH}/data/
+    train_suffix: "_test_random.npz"
+    val_suffix: "_test_uniform.npz"
+    grid_shape: [3, 0, 0]
+    obs_norm: [10, 5, 3]
+    action_norm: 7
+    start_idx: 0
+
+# Override core params for CL stability
+seed: 0
+attention_model:
+  n_epochs: 15
+  batch_size: 256
+  continue_learning: true      # Ensure EWC is active
+  lambda_ewc: 20000            # Shield knowledge from task interference
+  ewc_ratio: 0.9               # Standard buffer sampling ratio

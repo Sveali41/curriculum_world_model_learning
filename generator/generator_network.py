@@ -28,7 +28,7 @@ class MapEditorActorCritic(nn.Module):
         max_color_id=6,
         max_state_id=3,
         context_dim=64,
-        ablation_type="none",  # Options: ["none", "no_diversity", "no_history", "no_validity_reward", "no_learning_progress"]
+        ablation_type="none",
     ):
         super().__init__()
 
@@ -42,14 +42,11 @@ class MapEditorActorCritic(nn.Module):
         self.emb_state = nn.Embedding(max_state_id + 1, self.emb_dim_state)
         self.ablation_type = ablation_type
 
-        # === 2. 输入通道数 ===
-        # Embeddings + Context(context_dim) + Coords(2)
-        # === 2. 输入通道数 ===
-        base_in_channels = (self.emb_dim_obj + self.emb_dim_color + self.emb_dim_state) + 2  # + coords(2)
-
+        # === 2. Input Channels ===
+        base_in_channels = (self.emb_dim_obj + self.emb_dim_color + self.emb_dim_state) + 2  
         if self.ablation_type == "no_history":
             total_in_channels = base_in_channels 
-        else:  # "none"
+        else:
             total_in_channels = base_in_channels + context_dim
 
         # === 3. Backbone (ResNet) ===
@@ -63,14 +60,26 @@ class MapEditorActorCritic(nn.Module):
             ResBlock(hidden_dim),
         )
 
-        # === 4. Actor Head ===
+        # === 4. Dual Heads ===
+        self.num_actions = num_actions
+        # A. Terrain Head (Spatial)
         self.actor = nn.Sequential(
             nn.Conv2d(hidden_dim, hidden_dim // 2, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_dim // 2, num_actions, 1),
         )
 
-        # === 5. Critic Head (修复：不再硬编码 15*15) ===
+        # B. Stats Head (32 Buttons Config: 2 rows x 16 slots)
+        self.num_stats_slots = 32 
+        self.num_stats_actions = 2 # (0: Off, 1: On)
+        self.stats_actor = nn.Sequential(
+            nn.Linear(hidden_dim + 16, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Linear(256, self.num_stats_slots * self.num_stats_actions)
+        )
+
+        # === 5. Critic Head ===
         self.critic = nn.Sequential(
             nn.Conv2d(hidden_dim, 1, 1),
             nn.AdaptiveAvgPool2d((1, 1)),
@@ -81,21 +90,9 @@ class MapEditorActorCritic(nn.Module):
         )
 
         self.apply(self._init_weights)
-        
-        # 优化：重置 Actor 最后一层的权重为 0.01（近乎 0）
-        # 这样初始 Logits 接近 0，使得初始策略接近“均匀随机分布”
-        # 确保所有动作（门、钥匙、岩浆）在最开始都有相同的概率被采样到
-        last_layer = self.actor[-1]
-        nn.init.orthogonal_(last_layer.weight, gain=0.01)
-        nn.init.constant_(last_layer.bias, 0)
-        # Hack: Bias the "No-Op" (Action 0) to be higher initially to encourage sparsity
-        # [REVERTED] Bias back to 3.0.
-        # User Feedback: Bias=1.0 made maps too dense, limiting exploration.
-        # We need high sparsity (No-Op) initially.
-        # [REMOVED] Bias for No-Op. 
-        # User request: Cancel No-Op bias to allow equal probability for all edits initially.
-        # last_layer.bias.data[0] = 3.0
-        last_layer.bias.data[0] = 0.0
+        nn.init.orthogonal_(self.actor[-1].weight, gain=0.01)
+        nn.init.constant_(self.actor[-1].bias, 0)
+        self.actor[-1].bias.data[0] = 0.0
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):
@@ -104,206 +101,116 @@ class MapEditorActorCritic(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def get_coordinate_channels(self, batch_size: int, h: int, w: int, device):
-        """    
-        Create normalized x/y coordinate channels (CoordConv) in [-1, 1]
-        to provide explicit spatial position information to the network.
-        """
-        # shape: [B,1,H,W]
         xx = torch.arange(w, device=device).view(1, 1, 1, w).repeat(batch_size, 1, h, 1)
         yy = torch.arange(h, device=device).view(1, 1, h, 1).repeat(batch_size, 1, 1, w)
-
-        # 避免 w/h 为 1 时除零
-        w_denom = max(w - 1, 1)
-        h_denom = max(h - 1, 1)
-
-        xx = xx / w_denom * 2 - 1
-        yy = yy / h_denom * 2 - 1
-        return xx, yy
+        w_denom, h_denom = max(w - 1, 1), max(h - 1, 1)
+        return xx / w_denom * 2 - 1, yy / h_denom * 2 - 1
 
     def forward_features(self, base_map_vec, context_vec):
-        """
-  
-        Encode the base map and history-conditioned context into
-        a spatial feature map for per-cell editing decisions.
-
-        base_map_vec:     [B, NUM_CLASSES, H, W] (Long)
-        context_vec: [B, context_dim] (Float)
-        """
         B, _, H, W = base_map_vec.shape
-
-        # 1) Map embeddings
-        feat_obj = self.emb_obj(base_map_vec[:, 0].long()).permute(0, 3, 1, 2)     # [B, H, W]
-        feat_col = self.emb_color(base_map_vec[:, 1].long()).permute(0, 3, 1, 2)   # [B, H, W]
-        feat_sta = self.emb_state(base_map_vec[:, 2].long()).permute(0, 3, 1, 2)   # [B, H, W]
-
-        # 2) Coords
+        feat_obj = self.emb_obj(base_map_vec[:, 0].long()).permute(0, 3, 1, 2)
+        feat_col = self.emb_color(base_map_vec[:, 1].long()).permute(0, 3, 1, 2)
+        feat_sta = self.emb_state(base_map_vec[:, 2].long()).permute(0, 3, 1, 2)
         xx, yy = self.get_coordinate_channels(B, H, W, base_map_vec.device)
-
-        if self.ablation_type == "no_history":
+        
+        if self.ablation_type == "no_history" or context_vec is None:
             x = torch.cat([feat_obj, feat_col, feat_sta, xx, yy], dim=1)
         else:
-            # full history-as-obs
-            if context_vec is None:
-                raise ValueError("history_mode='obs' requires context_vec not None")
             context_tiled = context_vec.view(B, -1, 1, 1).expand(-1, -1, H, W)
             x = torch.cat([feat_obj, feat_col, feat_sta, context_tiled, xx, yy], dim=1)
-
-        # 5) Backbone
+        
         x = self.stem(x)
         x = self.res_blocks(x)
         return x
 
-
     def _get_topk_mask(self, logits, max_edits, action_mask=None):
-        """
-        Helper to compute the Top-K mask based on logits and max_edits ratio.
-        Shared by act() and evaluate().
-        If action_mask is provided, k is calculated based on the count of MUTABLE cells.
-        """
         probs = F.softmax(logits, dim=1)
-        prob_change = 1.0 - probs[:, 0, :, :]  # [B,H,W]
-
+        prob_change = 1.0 - probs[:, 0, :, :]
+        
+        # KEY BUG FIX: Force masked pixels (like boundary walls) to have 0 prob of change 
+        # so they don't consume the top-k budget when logits are uniformly initialized!
+        if action_mask is not None:
+             prob_change = prob_change.masked_fill(action_mask.squeeze(1) > 0.5, -1.0)
+             
         B, H, W = prob_change.shape
         flat_probs = prob_change.view(B, -1)
+        num_cells = (action_mask < 0.5).sum(dim=(1, 2, 3)).float().mean().item() if action_mask is not None else H*W
+        k = max(1, min(int(round(max_edits * num_cells)), H * W))
         
-        # [MODIFIED] Dynamic K based on empty (mutable) cells
-        if action_mask is not None:
-             # action_mask: 1.0=Immutable, 0.0=Mutable
-             # We want to count MUTABLE cells.
-             with torch.no_grad():
-                 # Count 0s. Assuming mask is [B, 1, H, W] or [B, H, W]
-                 num_mutable_per_sample = (action_mask < 0.5).sum(dim=(1, 2, 3) if action_mask.dim()==4 else (1, 2))
-                 # Use Mean count for batch stability
-                 avg_mutable = num_mutable_per_sample.float().mean().item()
-                 num_cells = max(1.0, avg_mutable)
-        else:
-             num_cells = H * W
-        
-        # Calculate k
-        k = int(max(1, round(max_edits * num_cells)))
-        # Clamp k to total cells just in case
-        k = min(k, H * W)
-        
-        # [FIX] Use indices instead of threshold to handle ties correctly.
-        # Threshold logic 'prob >= threshold' selects ALL tied cells, potentially flooding the map.
-        topk_values, topk_indices = torch.topk(flat_probs, k=k, dim=1)
-        
-        # Create a boolean mask of shape [B, H*W] using scatter
+        # When flat_probs are equal (uniform), torch.topk returns the first k elements
+        # Without the mask fill above, it always picked the top-left corner (the walls!)
+        topk_vals, topk_indices = torch.topk(flat_probs, k=k, dim=1)
         flat_mask = torch.zeros_like(flat_probs, dtype=torch.bool)
         flat_mask.scatter_(1, topk_indices, True)
+        return flat_mask.view(B, H, W)
+
+    def _get_stats_topk_mask(self, logits_stats, max_stats_edit_ratio):
+        B, N, _ = logits_stats.shape
+        prob_click = torch.softmax(logits_stats, dim=-1)[:, :, 1]
         
-        # Reshape back to [B, H, W]
-        topk_mask = flat_mask.view(B, H, W)
-        return topk_mask
+        # Calculate dynamic k from ratio (e.g. 0.1 * 32 slots = 3.2 -> 3)
+        k = max(1, min(int(round(max_stats_edit_ratio * N)), N))
+        
+        _, topk_indices = torch.topk(prob_click, k=k, dim=-1)
+        mask = torch.zeros_like(prob_click, dtype=torch.bool)
+        mask.scatter_(1, topk_indices, True)
+        return mask
 
-    @torch.no_grad()
-    def act(self, map_vec, context_vec, action_mask=None, max_edits=0.4):
-        """
-        采样动作
-        map_vec: [B, num_classes_obj, H, W] 
-        action_mask: [B, H, W] 的 bool mask，True 表示该位置不可编辑
-        """
-        # Cache max_edits for use in evaluate/update phase
-        self._cached_max_edits = max_edits
-
+    def act(self, map_vec, context_vec, action_mask=None, max_edits=0.4, max_stats_edit_ratio=0.1, stats_heat=None):
         features = self.forward_features(map_vec, context_vec)
-        logits = self.actor(features)  # [B, A, H, W]
+        B, _, H, W = map_vec.shape
 
-        # --- Stability Clamp ---
-        logits = torch.clamp(logits, min=-100, max=100)
-
-        # --- Safety Masking ---
-        if action_mask is not None:
-            action_mask = action_mask.bool() # [B,1,H,W] or [B,H,W]
-            if action_mask.dim() == 3:
-                mask_hw = action_mask
-                mask_others = action_mask.unsqueeze(1)
-            else: # dim == 4
-                mask_hw = action_mask.squeeze(1)
-                mask_others = action_mask
-
-            # 强制 No-op: 将 No-op 的 logit 设为极大
-            logits[:, 0, :, :].masked_fill_(mask_hw, 1e9)       
-            # 禁止其他动作: 将其他动作的 logit 设为极小
-            logits[:, 1:, :, :].masked_fill_(mask_others, -1e9)   
-
-        # --- Top-K edits logic ---
-        # [MODIFIED] Pass action_mask to calculate dynamic K
-        # Pass the ORIGINAL action_mask (before casting/dimensions mangling if possible, but strict float/bool is key)
-        # Note: action_mask here is a Tensor. _get_topk_mask handles standard tensor.
+        # A. Terrain Sampling
+        logits = self.actor(features)
         topk_mask = self._get_topk_mask(logits, max_edits, action_mask)
-
-        # 对非 topk 的位置：
-        # 1. 强制 No-op (logits[0] -> 1e9)
         logits[:, 0, :, :].masked_fill_(~topk_mask, 1e9)
-        # 2. 禁止修改动作 (logits[1:] -> -1e9)
-        logits[:, 1:, :, :].masked_fill_((~topk_mask).unsqueeze(1), -1e9)
+        logits[:, 1:, :, :].masked_fill_(~topk_mask.unsqueeze(1), -1e9)
+        dist = Categorical(logits=logits.permute(0, 2, 3, 1))
+        action = dist.sample()
+        action_logprob = dist.log_prob(action)
 
-        # --- Sampling ---
-        logits_hw = logits.permute(0, 2, 3, 1)  # [B,H,W,A]
-        dist = Categorical(logits=logits_hw)
+        # B. Stats (32 Piano Buttons) Sampling
+        global_vec = F.adaptive_avg_pool2d(features, (1, 1)).view(B, -1)
+        if stats_heat is None:
+            stats_heat = torch.zeros(B, 16, device=map_vec.device)
+        global_vec = torch.cat([global_vec, stats_heat], dim=1)
+        
+        logits_stats = self.stats_actor(global_vec).view(B, self.num_stats_slots, self.num_stats_actions)
+        topk_stats_mask = self._get_stats_topk_mask(logits_stats, max_stats_edit_ratio)
+        logits_stats[:, :, 0].masked_fill_(~topk_stats_mask, 1e9)
+        logits_stats[:, :, 1].masked_fill_(~topk_stats_mask, -1e9)
+        stats_dist = Categorical(logits=logits_stats)
+        stats_action = stats_dist.sample()
+        stats_logprob = stats_dist.log_prob(stats_action).sum(dim=-1)
 
-        action = dist.sample()                 # [B,H,W]
-        action_logprob = dist.log_prob(action) # [B,H,W]
-        state_val = self.critic(features)      # [B,1]
+        value = self.critic(features)
+        return action.detach(), stats_action.detach(), action_logprob.detach(), stats_logprob.detach(), value.detach(), topk_mask.detach()
 
-        return action.detach(), action_logprob.detach(), state_val.detach(), topk_mask.detach()
-
-    def evaluate(self, map_vec, context_vec, action, action_mask=None, max_edits=None, target_topk_mask=None):
-        """
-        计算 LogProb / Value / Entropy
-        target_topk_mask: [B, H, W] 的 bool mask。
-              如果提供，则强制使用该 mask（通常来自 Buffer），防止重新计算导致 Top-K 集合变化引发 NaN。
-        """
-        # Attempt to use cached max_edits from act() if available
-        if max_edits is None:
-            max_edits = getattr(self, '_cached_max_edits', 0.4)
-
+    def evaluate(self, map_vec, context_vec, action_tuple, action_mask=None, target_topk_mask=None, stats_heat=None):
+        terrain_action, stats_action = action_tuple
         features = self.forward_features(map_vec, context_vec)
-        logits = self.actor(features)  # [B, A, H, W]
+        B, _, H, W = map_vec.shape
 
-        # --- Stability Clamp ---
-        logits = torch.clamp(logits, min=-100, max=100)
-
-        # --- Safety Masking ---
-        if action_mask is not None:
-            mask_bool = action_mask.to(torch.bool)
-            if mask_bool.dim() == 3:
-                m3d = mask_bool
-                m4d = mask_bool.unsqueeze(1)
-            else:
-                m3d = mask_bool.squeeze(1)
-                m4d = mask_bool
-            
-            # 使用足够大的值进行 Mask，而不是之前的 100
-            FILL_VAL = 1e9
-            logits[:, 0, :, :].masked_fill_(m3d, FILL_VAL)
-            logits[:, 1:, :, :].masked_fill_(m4d, -FILL_VAL)
-
-        # --- Top-K edits logic ---
+        # A. Terrain Eval
+        logits = self.actor(features)
         if target_topk_mask is not None:
-            topk_mask = target_topk_mask
-        else:
-            # [MODIFIED] Pass action_mask
-            topk_mask = self._get_topk_mask(logits, max_edits, action_mask)
+             logits[:, 0, :, :].masked_fill_(~target_topk_mask, 1e9)
+             logits[:, 1:, :, :].masked_fill_(~target_topk_mask.unsqueeze(1), -1e9)
+        dist = Categorical(logits=logits.permute(0, 2, 3, 1))
+        action_logprobs = dist.log_prob(terrain_action)
+        dist_entropy = dist.entropy().mean()
 
-        # Apply Top-K Mask
-        logits[:, 0, :, :].masked_fill_(~topk_mask, 1e9)
-        logits[:, 1:, :, :].masked_fill_((~topk_mask).unsqueeze(1), -1e9)
+        # B. Stats Eval
+        global_vec = F.adaptive_avg_pool2d(features, (1, 1)).view(B, -1)
+        if stats_heat is None:
+            stats_heat = torch.zeros(B, 16, device=map_vec.device)
+        global_vec = torch.cat([global_vec, stats_heat], dim=1)
+        
+        logits_stats = self.stats_actor(global_vec).view(B, self.num_stats_slots, self.num_stats_actions)
+        stats_dist = Categorical(logits=logits_stats)
+        stats_logprobs = stats_dist.log_prob(stats_action).sum(dim=-1)
+        stats_entropy = stats_dist.entropy().mean()
 
-        # --- Distribution ---
-        logits_hw = logits.permute(0, 2, 3, 1)  # [B, H, W, A]
-        dist = Categorical(logits=logits_hw)
-
-        action_logprobs = dist.log_prob(action)
-        dist_entropy = dist.entropy()
-        state_values = self.critic(features)
-
-        # --- Safety Checks ---
-        if torch.isnan(action_logprobs).any():
-             # 兜底：如果仍有 NaN，设为 0（虽然这不应该发生）
-            action_logprobs = torch.nan_to_num(action_logprobs, 0.0)
-        if torch.isnan(dist_entropy).any():
-            dist_entropy = torch.nan_to_num(dist_entropy, 0.0)
-            
-        return action_logprobs, state_values, dist_entropy
+        value = self.critic(features)
+        total_entropy = dist_entropy + stats_entropy
+        return action_logprobs, stats_logprobs, value, total_entropy

@@ -11,32 +11,62 @@ PLAYER_ID = 13  # Updated: player ID in new CustomCrafterEnv mapping (was 10)
 
 def _to_nchw(obs: np.ndarray) -> np.ndarray:
     """Convert observations to (N, C, H, W)."""
+    if obs.ndim != 4:
+        raise ValueError(f"Expected 4D observations, got shape {obs.shape}")
 
-def interpret_env(env_tensor, cfg):
+    # Already (N, C, H, W)
+    # Check if channel is obviously dim 1 (e.g. 2 or 3 channels vs H/W > 3, or explicitly fewer channels than width)
+    if obs.shape[1] <= 3 or obs.shape[1] < obs.shape[-1]:
+        return obs
+
+    # Usually Crafter saved as (N, H, W, C)
+    if obs.shape[-1] <= 8:
+        return np.moveaxis(obs, -1, 1)
+
+    raise ValueError(f"Cannot infer channel axis for shape {obs.shape}")
+
+def interpret_env(terrain_map, cfg, inventory_vec=None):
     import torch
     import numpy as np
     from generator.crafter_env_designer import CRAFTER_OBJ_MAP
     
-    if isinstance(env_tensor, torch.Tensor):
-        env_np = env_tensor.cpu().numpy()
+    # Handle inputs
+    if isinstance(terrain_map, torch.Tensor):
+        phys_map = terrain_map.cpu().numpy()
     else:
-        env_np = env_tensor
+        phys_map = terrain_map
 
-    # Handle shape (H, W) or (C, H, W)
-    if env_np.ndim == 3:
-        env_np = env_np[0]
+    # Handle shape (C, H, W) -> (H, W)
+    if phys_map.ndim == 3:
+        phys_map = phys_map[0]
 
-    H_total, W = env_np.shape
-    H_phys = H_total - 1
+    H_phys, W = phys_map.shape
 
-    phys_map = env_np[:H_phys, :]
-    inv_row = env_np[-1, :]
+    # Handle inventory vector (16 items)
+    if inventory_vec is None:
+        inventory_vec = np.zeros(16)
+    elif isinstance(inventory_vec, torch.Tensor):
+        inventory_vec = inventory_vec.cpu().numpy().flatten()
+    
+    # Ensure inventory is long enough
+    if len(inventory_vec) < 16:
+        pad = np.zeros(16 - len(inventory_vec))
+        inventory_vec = np.concatenate([inventory_vec, pad])
 
-    inv_obj_map = {v: k for k, v in CRAFTER_OBJ_MAP.items()}
-    # Dictionary from config
+    # Define mapping directly consistent with CustomCrafterEnv (0-19)
+    # 0=None, 1=water, 2=grass, 3=stone, 4=path, 5=sand, 6=tree, 7=lava, 8=coal, 9=iron, 10=diamond, 11=table, 12=furnace, 
+    # 13=Player, 14=Cow, 15=Zombie, 16=Skeleton, 17=Arrow, 18=Plant, 19=Fence
+    inv_obj_map = {
+        0: 'none', 1: 'water', 2: 'grass', 3: 'stone', 4: 'path', 
+        5: 'sand', 6: 'tree', 7: 'lava', 8: 'coal', 9: 'iron', 
+        10: 'diamond', 11: 'table', 12: 'furnace', 13: 'agent',
+        14: 'cow', 15: 'zombie', 16: 'skeleton', 17: 'arrow', 18: 'plant', 19: 'fence'
+    }
+    
     map_elem = cfg.training_generator.get('map_element_crafter', {
         "grass": "G", "water": "W", "tree": "T", "stone": "R", "coal": "C",
-        "iron": "I", "lava": "L", "zombie": "Z", "table": "X", "furnace": "U", "agent": "A"
+        "iron": "I", "lava": "L", "zombie": "Z", "table": "X", "furnace": "U", "agent": "A", "diamond": "O",
+        "cow": "M", "skeleton": "K", "plant": "t", "fence": "F", "path": "P", "sand": "S"
     })
     
     lines = []
@@ -51,33 +81,30 @@ def interpret_env(env_tensor, cfg):
     
     layout_str = "\n".join(lines).strip()
 
-    # Dynamic parsing of the inventory row
+    # Dynamic parsing of the inventory vector (16 items)
+    # Define the 16-slot mapping
+    CRAFTER_INV_SLOTS = [
+        "health", "food", "drink", "energy",
+        "wood", "stone", "coal", "iron", "diamond", "sapling",
+        "wood_pickaxe", "stone_pickaxe", "iron_pickaxe",
+        "wood_sword", "stone_sword", "iron_sword",
+    ]
+    
     stats_str = "\n\n# --- Initial Stats ---\n"
-    stats_str += f"wood: {int(inv_row[0])}\n"
-    stats_str += f"stone: {int(inv_row[1])}\n"
-    stats_str += f"coal: {int(inv_row[2])}\n"
-    stats_str += f"wood_pickaxe: {int(inv_row[3])}\n"
-    stats_str += f"stone_pickaxe: {int(inv_row[4])}\n"
-    stats_str += f"iron_pickaxe: {int(inv_row[5])}\n"
-    stats_str += f"wood_sword: {int(inv_row[6])}\n"
-    stats_str += f"stone_sword: {int(inv_row[7])}\n"
+    for i, item_name in enumerate(CRAFTER_INV_SLOTS):
+        if i < len(inventory_vec):
+            val = int(inventory_vec[i])
+            # For tools/swords, clamp to 1 if > 0 to maintain game balance
+            if "pickaxe" in item_name or "sword" in item_name:
+                val = 1 if val > 0 else 0
+            # For health/food, if 0, default to 9
+            if item_name in ["health", "food"] and val == 0:
+                val = 9
+            stats_str += f"{item_name}: {val}\n"
     
     final_env_source = layout_str + stats_str
     return final_env_source, ""
 
-    if obs.ndim != 4:
-        raise ValueError(f"Expected 4D observations, got shape {obs.shape}")
-
-    # Already (N, C, H, W)
-    # Check if channel is obviously dim 1 (e.g. 2 or 3 channels vs H/W > 3, or explicitly fewer channels than width)
-    if obs.shape[1] <= 3 or obs.shape[1] < obs.shape[-1]:
-        return obs
-
-    # Usually Crafter saved as (N, H, W, C)
-    if obs.shape[-1] <= 8:
-        return np.moveaxis(obs, -1, 1)
-
-    raise ValueError(f"Cannot infer channel axis for shape {obs.shape}")
 
 
 def extract_player_positions(obs: np.ndarray, player_id: int = PLAYER_ID) -> np.ndarray:
@@ -111,7 +138,8 @@ def plot_crafter_coverage_from_npz(data_path: str, save_path: str | None = None,
     heatmap = np.zeros((h, w), dtype=np.int64)
 
     for y, x in positions:
-        if 0 <= y < h and 0 <= x < w:
+        # Ignore boundary water (outermost row/column) for cleaner visualization
+        if 1 <= y < h - 1 and 1 <= x < w - 1:
             heatmap[y, x] += 1
 
     plt.figure(figsize=(7, 7))
@@ -182,6 +210,7 @@ def crafter_classification_loss(
     next_pred: torch.Tensor,
     next_true: torch.Tensor,
     reduction: str = "none",
+    weighted: bool = False,
 ) -> torch.Tensor:
     """
     Compute per-location CrossEntropy loss for Crafter classification output.
@@ -190,28 +219,39 @@ def crafter_classification_loss(
         next_pred: (B, 25, H, W) logits — first 20 = obj, last 5 = dir
         next_true: (B, 2, H, W)  ground truth — ch0=obj ID, ch1=dir ID
         reduction: 'none' => (B,H,W), 'mean' => scalar
-
-    Returns:
-        loss map or scalar depending on reduction
+        weighted: If True, use tiered class weighting (Minigrid-style)
     """
     obj_logits = next_pred[:, :CRAFTER_OBJ_CLASSES]   # (B, 20, H, W)
     dir_logits = next_pred[:, CRAFTER_OBJ_CLASSES:]   # (B, 5, H, W)
 
-
-    obj_true = next_true[:, 0].long()
-    dir_true = next_true[:, 1].long()
+    obj_true = next_true[:, 0].long().to(obj_logits.device, non_blocking=True)
+    dir_true = next_true[:, 1].long().to(dir_logits.device, non_blocking=True)
 
     obj_true, dir_true = crafter_clamp_targets(obj_true, dir_true)
 
-    # Add label_smoothing=0.1 to prevent model from being overconfident (logit explosion) on 3x6 maps
-    loss_obj = F.cross_entropy(obj_logits, obj_true, reduction=reduction, label_smoothing=0.1)
+    # --- 增加分层加权逻辑 ---
+    obj_weights = None
+    if weighted:
+        # Tiered Weights Map:
+        # Grass=0.5, Standard=1.0, Tools/Animals=10.0, Progress=25.0, HolyGrail=50.0
+        w = torch.ones(CRAFTER_OBJ_CLASSES, device=next_pred.device)
+        w[2] = 0.5   # Grass (Suppress common background)
+        w[8] = 10.0  # Coal
+        w[11] = 10.0 # Table
+        w[12] = 10.0 # Furnace
+        w[14:20] = 10.0 # Mobs (Cow, Zombie, Skeleton, etc)
+        w[9] = 25.0  # Iron
+        w[13] = 25.0 # Player
+        w[10] = 50.0 # Diamond (Highest priority)
+        obj_weights = w.to(obj_logits.device, non_blocking=True)
+
+    # Add label_smoothing=0.1 to prevent model from being overconfident
+    loss_obj = F.cross_entropy(obj_logits, obj_true, weight=obj_weights, reduction=reduction, label_smoothing=0.1)
     loss_dir = F.cross_entropy(dir_logits, dir_true, reduction=reduction, label_smoothing=0.1)
 
     total = loss_obj + loss_dir  # (B, H, W) or scalar
 
-    if reduction == "mean":
-        return total
-    return total  # (B, H, W) per-location loss
+    return total
 
 
 def crafter_reconstruct_from_logits(next_pred: torch.Tensor) -> torch.Tensor:
@@ -356,7 +396,7 @@ def visualize_crafter_wm(
     
     inv_text = ""
     if inv is not None:
-        inv_labels = ['health','food','drink','energy','wood','stone','coal','iron','diamond','sapling','w_pick','s_pick','i_pick','w_sword','s_sword','i_sword']
+        inv_labels = ['health', 'food', 'drink', 'energy', 'wood', 'stone', 'coal', 'iron', 'diamond', 'sapling', 'w_pick', 's_pick', 'i_pick', 'w_sword', 's_sword', 'i_sword']
         inv_text = "Inventory (Now -> Next):\n"
         for i, val in enumerate(inv):
             if i >= len(inv_labels): break
@@ -378,11 +418,11 @@ def visualize_crafter_wm(
     import matplotlib.patches as mpatches
     legend_items = [
         ("Water", colors[1]), ("Grass", colors[2]), ("Stone", colors[3]),
-        ("Path", colors[4]), ("Tree", colors[6]), ("Lava", colors[7]),
-        ("Table", colors[11]), ("Player", colors[13]), ("Zomb", colors[15])
+        ("Tree", colors[6]), ("Coal", colors[8]), ("Iron", colors[9]),
+        ("Table", colors[11]), ("Diam", colors[10]), ("Plant", colors[18])
     ]
     for i, (label, color) in enumerate(legend_items):
-        y_pos = 0.35 - (i // 3) * 0.1
+        y_pos = 0.35 - (i // 3) * 0.08
         x_pos = (i % 3) * 0.33
         axes[5].add_patch(mpatches.Rectangle((x_pos, y_pos), 0.05, 0.08, color=color, transform=axes[5].transAxes))
         axes[5].text(x_pos + 0.07, y_pos + 0.02, label, fontsize=10, transform=axes[5].transAxes)
@@ -419,4 +459,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

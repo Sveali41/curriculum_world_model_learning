@@ -1,0 +1,37 @@
+# trainer/conf/config_p2e.yaml
+# Plan2Explore (P2E) Configuration File
+
+defaults:
+  - config_ued                # Inherit base WM, Buffer, and EWC structure
+  - _self_
+
+# 1. Plan2Explore (P2E) Specific Hyperparameters
+p2e:
+  num_models: 10               # Original Plan2Explore uses 10 (3 is minimal, 10 is standard)
+  intrinsic_reward_scale: 1.0  # Scalar weight for the disagreement reward
+  disag_lr: 1e-4               # Learning rate for the MLP ensemble heads
+  batch_size: 256              # Training batch size for the ensemble
+  disag_train_frequency: 1     # Update ensemble every N iterations
+  target_type: "latent"        # Objective: "latent" (predict next latent) or "logits" (predict next ID)
+  transitions_per_collection: 6700  # n: transitions collected per rollout on one target 6700
+  updates_per_target: 10             # m: collect/train cycles executed per target
+  target_order: "sequential"        # sequential | random
+
+# 2. Domain Selection (Configurable via CLI override: domain=minigrid)
+# ----------------------------------------------------------------------
+domain: 'crafter' # 'crafter' or 'minigrid'
+
+# 3. Environment/Loop Overrides
+# ----------------------------------------------------------------------
+env:
+  collect:
+    mini_dataset_size: 2000    # Ensure consistent data collection volume
+    data_folder: ${oc.env:TRAINER_PATH}/data/p2e/
+
+generator_agent:
+  total_iterations: 100        # Match UED iteration count
+  wm_train_frequency: 1
+  agent_type: 'p2e'            # Identify baseline mode
+
+# Logger settings
+p2e_log_dir: ${oc.env:TRAINER_PATH}/logs/results_p2e/

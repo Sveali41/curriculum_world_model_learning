@@ -4,7 +4,8 @@ import torch
 import numpy as np
 import pandas as pd
 import copy
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
+from hydra import initialize, compose
 
 # Add project root to path
 PROJECT_ROOT = "/home/siyao/phd_file/Research/rlPractice/Curriculum_world_model_learning"
@@ -23,12 +24,15 @@ def setup_env():
     os.environ["MODEL_FPATH"] = os.path.join(PROJECT_ROOT, "modelBased/models")
 
 def setup_config():
-    # Load the CL config
-    config_path = os.path.join(PROJECT_ROOT, "trainer/conf/config_crafter_CL.yaml")
-    cfg = OmegaConf.load(config_path)
-    # Resolve interpolations
-    cfg.PROJECT_ROOT = PROJECT_ROOT
-    cfg.TRAIN_DATASET_PATH = os.environ["TRAIN_DATASET_PATH"]
+    # Use Hydra's compose API to properly load defaults (like config_ued)
+    # config_path is relative to this .py file
+    with initialize(version_base=None, config_path="conf"):
+        cfg = compose(config_name="config_cl")
+    
+    # Use open_dict to allow setting new keys on a structured DictConfig
+    with open_dict(cfg):
+        cfg.PROJECT_ROOT = PROJECT_ROOT
+        cfg.TRAIN_DATASET_PATH = os.environ["TRAIN_DATASET_PATH"]
     
     # Initialize support
     support = Support(cfg)
@@ -36,25 +40,34 @@ def setup_config():
 
 def collect_data():
     """
-    Original function to collect data for each minitask.
+    Modified function to collect uniform data for 6 target tasks.
     """
     setup_env()
     cfg, _ = setup_config()
     
-    tasks = [f"crafter_minitask_0{i}" for i in range(1, 7)]
-    # tasks.append("crafter_target_task_diamond") # optional
+    tasks = [f"crafter_target_task_{i}" for i in range(1, 7)]
     
     for task in tasks:
-        print(f"\n[Collection] Processing Task: {task}")
+        print(f"\n[Collection] Processing Target Task: {task}")
         
-        # Set paths dynamically
-        cfg.env.env_path = os.path.join(PROJECT_ROOT, f"trainer/level/crafter/{task}.txt")
-        cfg.env.collect.data_save_path = os.path.join(os.environ["TRAIN_DATASET_PATH"], f"{task}.npz")
-        cfg.env.collect.visualize_filename = f"{task}_random_coverage.png"
+        # 强制指定为 Uniform 采集模式，步数增加以覆盖 31x31 大图
+        cfg.env.collect.data_type = "uniform"
+        cfg.env.collect.max_steps = 80000
+        cfg.env.collect.uniform_reset_steps = 50
+        
+        # Set paths dynamically including subfolders
+        cfg.env.env_path = os.path.join(PROJECT_ROOT, f"trainer/level/crafter/target_tasks/{task}.txt")
+        cfg.env.collect.data_save_path = os.path.join(os.environ["TRAIN_DATASET_PATH"], f"{task}_uniform.npz")
+        
+        # Ensure separate folder for target tasks
+        cfg.env.collect.visualize_save_path = os.path.join(PROJECT_ROOT, "trainer/logs/dataset_visualization/target")
+        cfg.env.collect.env_visualize_save_path = os.path.join(PROJECT_ROOT, "trainer/logs/env_visualization/target")
+        cfg.env.collect.visualize_filename = f"{task}_uniform_coverage.png"
+        cfg.env.collect.env_visualize_filename = f"{task}_uniform_env.png"
         
         # Call the actual data collection logic
         data_collect(cfg)
-        print(f"[Done] Saved to {cfg.env.collect.data_save_path}")
+        print(f"[Done] Saved UNIFORM dataset to {cfg.env.collect.data_save_path}")
 
 def run_experiment_session(mode="minitask", all_results=None):
     """
@@ -80,7 +93,8 @@ def run_experiment_session(mode="minitask", all_results=None):
 
     # 2. Preparation for Validation Dataset (The universal test target)
     validation_dataset = os.path.join(cfg.TRAIN_DATASET_PATH, "crafter_target_task_diamond_uniform.npz")
-    cfg.attention_model.validation_data_dir = validation_dataset
+    with open_dict(cfg):
+        cfg.attention_model.validation_data_dir = validation_dataset
     
     # 3. Initialize model components for this session
     old_params = None
@@ -98,11 +112,12 @@ def run_experiment_session(mode="minitask", all_results=None):
         if mode == "random_baseline":
              task_name = f"random_phase_{i+1}"
 
-        print(f"\n[PHASE {i+1}/n_phases] Mode: {exp_label} | Training on: {task_filename}")
+        print(f"\n[PHASE {i+1}/{n_phases}] Mode: {exp_label} | Training on: {task_filename}")
 
         # --- Configure Training ---
         cfg_train = copy.deepcopy(cfg)
-        cfg_train.attention_model.data_dir = os.path.join(cfg.TRAIN_DATASET_PATH, task_filename)
+        with open_dict(cfg_train):
+            cfg_train.attention_model.data_dir = os.path.join(cfg.TRAIN_DATASET_PATH, task_filename)
         
         # Export old samples for Replay
         replay_data = fisher_buffer.export_dict() if len(fisher_buffer) > 0 else None
@@ -123,18 +138,17 @@ def run_experiment_session(mode="minitask", all_results=None):
         # --- Post-Training Maintenance ---
         # 1. Add fresh samples into Fisher Replay Buffer
         print(f"[Buffer] Sampling from {task_filename} for future replay...")
-        # target_shape should be large enough to handle ALL tasks (17x23 is the max)
         fisher_buffer.add_from_npz(
             cfg_train.attention_model.data_dir,
             current_sample_ratio=cfg.attention_model.ewc_ratio, # e.g., 0.05
-            target_shape=(17, 23) 
         )
 
         # 2. CROSS-TASK VALIDATION (Zero-shot on the common uniform target)
         print(f"--- Validating Phase {i+1} on Target UNIFORM Dataset ---")
         val_cfg = copy.deepcopy(cfg)
-        val_cfg.attention_model.freeze_weight = True
-        val_cfg.attention_model.data_dir = validation_dataset
+        with open_dict(val_cfg):
+            val_cfg.attention_model.freeze_weight = True
+            val_cfg.attention_model.data_dir = validation_dataset
         
         val_res = AttentionWM_training.train_api(
             val_cfg, 
@@ -178,5 +192,5 @@ if __name__ == "__main__":
     final_results = []
     # Start CL seq
     final_results = run_experiment_session(mode="minitask", all_results=final_results)
-    # Start Random seq
-    final_results = run_experiment_session(mode="random", all_results=final_results)
+    # # Start Random seq
+    # final_results = run_experiment_session(mode="random", all_results=final_results)

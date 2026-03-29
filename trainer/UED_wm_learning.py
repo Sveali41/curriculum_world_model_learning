@@ -4,6 +4,7 @@ ROOT_DIR =os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
 import hydra
 from omegaconf import DictConfig, open_dict
+from pathlib import Path
 import torch
 import glob
 import torch
@@ -98,7 +99,7 @@ def filter_balanced_batch(new_batch, fisher_buffer, ratio=0.5, elements_ratio=0.
 @hydra.main(
     version_base=None,
     config_path=str(TRAINER_PATH / "conf"),
-    config_name="config_UED",
+    config_name="config_ued",
 )
 def adversarial_ued_training(cfg: DictConfig):
     """
@@ -130,33 +131,40 @@ def adversarial_ued_training(cfg: DictConfig):
         metric_suffix = f"_{cfg.attention_model.validation_metric}"
         
     # Always construct path (handles empty suffixes naturally for default case)
-    summary_csv_path = log_dir / f"experiment_summary_mask3_mse{ablation_suffix}{metric_suffix}.csv"
+    summary_csv_path = log_dir / f"crafter_ued_results{ablation_suffix}{metric_suffix}.csv"
     if ablation_suffix or metric_suffix:
         print(f"[Log] CSV Path Adjusted: {summary_csv_path}")
 
-    data_save_dir = TRAINER_PATH / "data"
+    data_save_dir = Path(getattr(cfg.env.collect, "data_folder", str(TRAINER_PATH / "data")))
+    
+    # === A. 初始化 Temp Data Dir (阅后即焚隔离区) ===
+    env_type = getattr(cfg.attention_model, "env_type", "minigrid")
+    temp_data_dir = log_dir / "tmp_ued_data" / env_type
+    os.makedirs(temp_data_dir, exist_ok=True)
+    
+    # [TARGET DATA] Crafter target task datasets are in modelBased/data/train_world_model
+    target_data_dir = data_save_dir # Default
+    if env_type == "crafter":
+        target_data_dir = TRAINER_PATH.parent / "modelBased" / "data" / "train_world_model"
+    # 清空之前的临时残留
+    for f in os.listdir(temp_data_dir):
+        if f.endswith(".npz"): 
+            try: os.remove(temp_data_dir / f)
+            except: pass
 
-    # === 初始化 Summary CSV ===
-    # Only write header if the CSV does not already exist so multiple seed runs append to the same file
-    if not summary_csv_path.exists():
-        with open(summary_csv_path, mode='w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "Seed",
-                "Iter", 
-                "Gen_Mean_Reward",  # Initial Difficulty (Proxy)
-                "Gen_Real_Loss",    # [NEW] Raw Loss on generated maps (Unscaled)
-                "Gen_Loss", 
-                "Gen_Entropy",      # [NEW] Policy Entropy for debugging convergence
-                "Gen_Div_Reward",   # [NEW] Diversity Reward
-                "WM_Val_Loss",      # Target Tasks Mean (MSE or Weighted based on cfg)
-                "WM_Val_Max",       # [NEW] Worst-case Capability
-                "WM_Val_Std",       # [NEW] Stability
-                "New_Data_Size",
-                "Buffer_Size",
-                "Solvable_Count",  # [MODIFIED] Rate -> Count
-                "Avg_Path_Len"     # [NEW]
-            ])
+    # === 初始化 Summary CSV (FORCED REWRITE) ===
+    # For Crafter UED, we use a new 16-column symmetrical header. 
+    # We overwrite to avoid column misalignment from older runs.
+    with open(summary_csv_path, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Seed", "Iter", 
+            "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
+            "gen_val_val_inv_loss", "gen_val_val_ce_loss", "gen_val_avg_val_loss_wm",
+            "target_val_val_inv_loss", "target_val_val_ce_loss", "target_val_avg_val_loss_wm",
+            "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len"
+        ])
+    print(f"[Logger] Experiment summary initialized with 16 columns at {summary_csv_path}")
     print(f"[Logger] Experiment summary will be saved to {summary_csv_path}")
     
     # === Set default mini_dataset_size for data collection ===
@@ -175,6 +183,7 @@ def adversarial_ued_training(cfg: DictConfig):
         world_model=wm_instance,
         device=device,
         cfg=cfg,
+        agent_type=cfg.generator_agent.agent_type
     )
 
     # === C. 初始化 Fisher Replay Buffer ===
@@ -189,33 +198,13 @@ def adversarial_ued_training(cfg: DictConfig):
     warmup_iterations = getattr(cfg.generator_agent, "warmup_iterations", 0) # Read with default 0
     wm_train_frequency = cfg.generator_agent.wm_train_frequency  
 
-    # === E. 验证集定义 ===
-    target_tasks = [
-        "target_task0.txt",
-        "target_task1.txt",
-        "target_task2.txt",
-        "target_task3.txt",
-        "target_task4.txt",
-        "target_task5.txt",
-        "target_task6.txt",
-        "target_task7.txt",
-        "target_task8.txt",
-        "target_task9.txt",
-        "target_task10.txt",
-        "target_task11.txt",
-        "target_task12.txt",
-        "target_task13.txt",
-        "target_task14.txt",
-        "target_task15.txt",
-        "target_task16.txt",
-        "target_task17.txt",
-        "target_task18.txt",
-        "target_task19.txt",
-    ]
+    # === E. 验证集定义 (Crafter Target Tasks) ===
+    target_tasks = [f"crafter_target_task_{i}.txt" for i in range(1, 7)]
 
+    # Use the uniform datasets we generated
     target_files = [
-        os.path.splitext(t)[0] + "_test_uniform.npz"
-        for t in target_tasks
+        os.path.join(os.environ.get("TRAIN_DATASET_PATH", str(data_save_dir)), f"crafter_target_task_{i}_uniform.npz")
+        for i in range(1, 7)
     ]
 
     print(
@@ -237,9 +226,15 @@ def adversarial_ued_training(cfg: DictConfig):
             "[Generator] Generating environments and collecting trajectories..."
         )
 
-        # [MODIFIED] Added Solvable Count & Max BFS
-        # Returns: (maps, heats, loss, div, trajs, solvable_count, avg_bfs)
-        _, _, gen_raw_loss, gen_div_score, valid_trajectories, gen_solvable_count, gen_avg_bfs = gen_interface.step(iteration=iteration)
+        # [MODIFIED] Added 6 metrics support (Now returns 9 items)
+        step_res = gen_interface.step(old_params=old_params, iteration=iteration)
+        gen_val_avg_val_loss_wm = step_res[2]              # Total Loss (raw_loss)
+        gen_val_val_ce_loss = step_res[3]                  # Terrain CE
+        gen_val_val_inv_loss = step_res[4]                 # Inventory CE
+        gen_div_score = step_res[5]
+        valid_trajectories = step_res[6]
+        gen_solvable_count = step_res[7]
+        gen_avg_bfs = step_res[8]
         num_valid_trajs = len(valid_trajectories)
         print(
             f"[Generator] Collected {num_valid_trajs} valid trajectories. Solvable: {gen_solvable_count} | Avg BFS: {gen_avg_bfs:.2f}"
@@ -266,6 +261,14 @@ def adversarial_ued_training(cfg: DictConfig):
                 "act": new_batch["act"],
                 "info": new_batch["info"],
             }
+            # [BUG FIX] Must include inv/inv_next in buffer! 
+            # Without this, Fisher Buffer has no inventory data,
+            # and replay-based WM training completely lacks inventory supervision.
+            # This was causing UED to have worse INV Loss than DR.
+            if new_batch.get('inv') is not None:
+                buffer_input["inv"] = new_batch["inv"]
+            if new_batch.get('inv_next') is not None:
+                buffer_input["inv_next"] = new_batch["inv_next"]
             # Moved buffer update to AFTER training (Step 4.5) to prevent double counting
 
 
@@ -304,7 +307,7 @@ def adversarial_ued_training(cfg: DictConfig):
              gen_interface.diversity.archive.clear()
              gen_interface.elite_buffer.clear()
         
-        if (not is_warmup) and (iteration % wm_train_frequency == 0):
+        if (not is_warmup) and (iteration % wm_train_frequency == 0) and (new_batch is not None):
             print("[World Model] Retraining on current + replay data...")
             
             # --- [New Filter Logic] ---
@@ -318,15 +321,21 @@ def adversarial_ued_training(cfg: DictConfig):
             #         elements_ratio=cfg.attention_model.fisher_buffer_elements_ratio
             #     )
             
-            # Save FULL batch to disk
+            # Save FULL batch to disk in Temp Folder
+            current_data_path = None
             if new_batch is not None:
-                current_data_path = data_save_dir / f"training_set_iter_{iteration}.npz"
+                current_data_path = temp_data_dir / f"ued_training_set_iter_{iteration}.npz"
                 save_dict = {
                     'a': new_batch['obs'].cpu().numpy() if torch.is_tensor(new_batch['obs']) else new_batch['obs'],
                     'b': new_batch['obs_next'].cpu().numpy() if torch.is_tensor(new_batch['obs_next']) else new_batch['obs_next'],
                     'c': new_batch['act'].cpu().numpy() if torch.is_tensor(new_batch['act']) else new_batch['act'],
                     'f': new_batch['info']
                 }
+                if new_batch.get('inv') is not None:
+                     save_dict['g'] = new_batch['inv'].cpu().numpy() if torch.is_tensor(new_batch['inv']) else new_batch['inv']
+                if new_batch.get('inv_next') is not None:
+                     save_dict['h'] = new_batch['inv_next'].cpu().numpy() if torch.is_tensor(new_batch['inv_next']) else new_batch['inv_next']
+                
                 np.savez_compressed(current_data_path, **save_dict)
                 cfg.attention_model.data_dir = str(current_data_path)
             
@@ -350,13 +359,29 @@ def adversarial_ued_training(cfg: DictConfig):
                 param.requires_grad = True
 
             # 4. Train WM
-            old_params, fisher, _ = AttentionWM_training.train_api(
+            # [FIX] Clear stale hooks to prevent ReferenceError: weakly-referenced object no longer exists
+            if hasattr(wm_instance, "_state_dict_hooks"):
+                wm_instance._state_dict_hooks.clear()
+            if hasattr(wm_instance, "_parameters"):
+                for p_name, p in wm_instance._parameters.items():
+                    if p is not None and hasattr(p, "_hooks"):
+                        p._hooks.clear()
+
+            # [MODIFIED] Corrected unpacking after train_api update (now returns 3-tuple: result_dict, fisher, net)
+            train_res, fisher, _ = AttentionWM_training.train_api(
                 cfg,
                 wm_instance, 
                 old_params,
                 fisher,
                 replay_data=replay_data,
             )
+            # Update old_params from the result dict for next iteration
+            old_params = train_res.get("old_params")
+            
+            # Step 4.2: Delete Temp Data After Training (阅后即焚)
+            if current_data_path and os.path.exists(current_data_path):
+                try: os.remove(current_data_path)
+                except: pass
             
             # Log loss
             # Note: Need to extract loss from somewhere, train_api prints it but doesn't return scalar easily unless parsed
@@ -417,12 +442,14 @@ def adversarial_ued_training(cfg: DictConfig):
         target_max_loss = 0.0
         target_std_loss = 0.0
         # [MODIFIED] Validation Logic:
-        # 1. Warmup: Skip validation to save time (except the very last warmup step to establish baseline).
-        # 2. Training: Validate every step to track progress closely.
-        warmup_iters = cfg.generator_agent.warmup_iterations
+        # 1. Warmup: Skip validation to save time.
+        # 2. Training: Validate every step to track progress.
+        warmup_iters = getattr(cfg.generator_agent, "warmup_iterations", 0)
         if iteration >= (warmup_iters - 1): 
             print(f"\n>>> Validating on Target Tasks...")
-            avg_losses = []
+            target_ce_losses = []
+            target_inv_losses = []
+            target_avg_losses = []
             
             # Temporary set to validation mode
             old_freeze = cfg.attention_model.freeze_weight
@@ -433,35 +460,39 @@ def adversarial_ued_training(cfg: DictConfig):
             cfg.attention_model.use_wandb = False
 
             for t_name, t_file in zip(target_tasks, target_files):
-                # Fix: Create a FRESH model instance for validation instead of deepcopying.
-                # deepcopy triggers broken hooks on the source model.
-                # Creating a new instance and loading state_dict is safer.
-                
-                t_loss = validate_on_target_task(
+                res_dict = validate_on_target_task(
                     cfg, 
                     net=wm_instance, 
                     old_params=None, 
-                    data_save_dir=str(data_save_dir), 
+                    data_save_dir=str(target_data_dir), 
                     target_file=t_file, 
                     phase_name=f"Iter_{iteration}",
                     VALID_TIMES=1
                 )
                 
-                if t_loss is not None:
-                     avg_losses.append(t_loss)
+                if res_dict:
+                    target_avg_losses.append(res_dict['avg_val_loss_wm'])
+                    target_ce_losses.append(res_dict['terrain_loss'])
+                    target_inv_losses.append(res_dict['inventory_loss'])
             
             # Restore configs
             cfg.attention_model.freeze_weight = old_freeze
             cfg.attention_model.use_wandb = old_use_wandb
 
-            if avg_losses:
-                target_mean_loss = sum(avg_losses) / len(avg_losses)
-                target_max_loss = max(avg_losses)
-                target_std_loss = np.std(avg_losses)
-                print(f"[Metrics] Target Task Loss -> Mean: {target_mean_loss:.6f} | Max: {target_max_loss:.6f}")
+            # Aggregate Targets
+            if target_avg_losses:
+                target_val_avg_val_loss_wm = float(np.mean(target_avg_losses))
+                target_val_val_ce_loss = float(np.mean(target_ce_losses))
+                target_val_val_inv_loss = float(np.mean(target_inv_losses))
+                print(f"[Metrics] Combined Target Loss -> Total: {target_val_avg_val_loss_wm:.4f} | Terrain: {target_val_val_ce_loss:.4f}")
             else:
-                target_max_loss = 0.0
-                target_std_loss = 0.0
+                target_val_avg_val_loss_wm = 0.0
+                target_val_val_ce_loss = 0.0
+                target_val_val_inv_loss = 0.0
+        else:
+            target_val_avg_val_loss_wm = 0.0
+            target_val_val_ce_loss = 0.0
+            target_val_val_inv_loss = 0.0
 
         # --------------------------------------------------------
         # Step 6: 写 CSV 日志 (Experiment Summary)
@@ -469,24 +500,38 @@ def adversarial_ued_training(cfg: DictConfig):
         if summary_csv_path is not None:
             try:
                 with open(summary_csv_path, mode='a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        seed,
-                        iteration + 1,
-                        f"{gen_mean_reward:.4f}",
-                        f"{gen_raw_loss:.6f}",
-                        f"{gen_loss:.4f}",
-                        f"{gen_entropy:.4f}",
-                        f"{gen_div_score:.4f}",
+                    # --- [Symmetrical 6-Column Metrics] ---
+                    # Ensure we don't log NaN if lists are empty
+                    gen_div_reward_val = gen_div_score if gen_div_score is not None else 0.0
 
-                        f"{target_mean_loss:.6f}",
-                        f"{target_max_loss:.6f}",
-                        f"{target_std_loss:.6f}",
-                        new_data_size,
-                        len(fisher_buffer),
-                        f"{gen_solvable_count}",  # Count (Integer)
-                        f"{gen_avg_bfs:.2f}"      # Avg Path Length
-                    ])
+                    # Prepare row as a dictionary (Exact Column Order Alignment)
+                    row_data = {
+                        "Seed": seed,
+                        "Iter": iteration + 1,
+                        "Gen_Mean_Reward": f"{gen_mean_reward:.4f}",
+                        "Gen_Loss": f"{gen_loss:.4f}",
+                        "Gen_Entropy": f"{gen_entropy:.4f}",
+                        "Gen_Div_Reward": f"{gen_div_reward_val:.4f}",
+                        
+                        # --- 3 Columns for NEWLY GENERATED Tasks ---
+                        "gen_val_val_inv_loss": f"{gen_val_val_inv_loss:.6f}",
+                        "gen_val_val_ce_loss": f"{gen_val_val_ce_loss:.6f}",
+                        "gen_val_avg_val_loss_wm": f"{gen_val_avg_val_loss_wm:.6f}",
+
+                        # --- 3 Columns for FIXED TARGET Tasks ---
+                        "target_val_val_inv_loss": f"{target_val_val_inv_loss:.6f}",
+                        "target_val_val_ce_loss": f"{target_val_val_ce_loss:.6f}",
+                        "target_val_avg_val_loss_wm": f"{target_val_avg_val_loss_wm:.6f}",
+                        
+                        "New_Data_Size": new_data_size,
+                        "Buffer_Size": len(fisher_buffer),
+                        "Solvable_Count": f"{gen_solvable_count}",
+                        "Avg_Path_Len": f"{gen_avg_bfs:.2f}"
+                    }
+
+                    writer = csv.writer(f)
+                    writer.writerow(list(row_data.values()))
+
             except Exception as e:
                 print(f"[Error] Failed to write CSV log: {e}")
 
@@ -494,7 +539,8 @@ def adversarial_ued_training(cfg: DictConfig):
         # Step 7: Cleanup Temporary Data
         # --------------------------------------------------------
         # Delete generated trajectory files for this iteration to save space
-        temp_files = glob.glob(str(data_save_dir / f"UED_temp_data_path_iter{iteration}_*.npz"))
+        # Pattern matches UED_Dual_iter{iteration}_b{idx}_test_{explore_type}.npz
+        temp_files = glob.glob(str(data_save_dir / f"UED_Dual_iter{iteration}_b*.npz"))
         if temp_files:
             print(f"[Cleanup] Deleting {len(temp_files)} temporary files for Iteration {iteration}...")
             for f in temp_files:
@@ -510,7 +556,7 @@ def adversarial_ued_training(cfg: DictConfig):
 @hydra.main(
     version_base=None,
     config_path=str(TRAINER_PATH / "conf"),
-    config_name="config_UED",
+    config_name="config_ued",
 )
 def adversarial_ued_training_wrapper(cfg: DictConfig):
     """Wrapper for running a single seed"""
