@@ -7,12 +7,13 @@ import random
 from generator.generator_agent import GeneratorPPO
 from generator.random_generator_agent import RandomGeneratorAgent
 from generator.reward_system import DiversityModule, check_solvability
-from generator.env_designer import PCGSeeder, task_placer
+from generator.minigrid_env_designer import PCGSeeder as MinigridPCGSeeder, task_placer as minigrid_task_placer
+from generator.crafter_env_designer import CrafterPCGSeeder, CRAFTER_ACTION_MAP, CRAFTER_OBJ_MAP
 from minigrid.core.constants import OBJECT_TO_IDX, COLOR_TO_IDX
 from modelBased.common.support import Support
 from trainer.common.utils import extract_loss_map_over_validations, collect_data_general
 
-ACTION_TABLE = {
+ACTION_TABLE_MINIGRID = {
     0: None,  # No-op
     1: ("key", "yellow"),
     2: ("key", "red"),
@@ -104,9 +105,10 @@ class GeneratorInterface:
             self.seeder.structure_mode = struct_mode
             
             grid = self.seeder.generate(z=z)
-            min_dim = min(self.map_height, self.map_width)
-            adaptive_ratio = 0.85 if min_dim <= 10 else 0.4
-            grid, _ = task_placer(grid, min_dist_ratio=adaptive_ratio)
+            if not self.is_crafter:
+                min_dim = min(self.map_height, self.map_width)
+                adaptive_ratio = 0.85 if min_dim <= 10 else 0.4
+                grid, _ = minigrid_task_placer(grid, min_dist_ratio=adaptive_ratio)
             
             base_maps.append(grid)
             zm, zh = self._zero_context(1, self.map_height, self.map_width)
@@ -296,7 +298,14 @@ class GeneratorInterface:
         # Detect boundary positions [B, H, W]
         H, W = ids.shape[-2:]
         mask[:, 0, :] = 1.0
-        mask[:, -1, :] = 1.0
+        if self.is_crafter:
+            mask[:, -2, :] = 1.0 # Protect physical map bottom border (H-2)
+            # The row -1 is the inventory. We do NOT mask it because we WANT generator to edit it!
+            # But we mask the corners of inventory to save computing
+            mask[:, -1, 0] = 1.0
+            mask[:, -1, -1] = 1.0
+        else:
+            mask[:, -1, :] = 1.0
         mask[:, :, 0] = 1.0
         mask[:, :, -1] = 1.0
         
@@ -307,37 +316,65 @@ class GeneratorInterface:
         return mask.unsqueeze(1)
 
     def _apply_action(self, base_obj_map, act):
-        H, W = base_obj_map.shape
-        obj = base_obj_map.copy()
-        
-        MAX_OBJ_ID = max(OBJECT_TO_IDX.values())
-        default_color_map = np.zeros(MAX_OBJ_ID + 1, dtype=np.int64)
-        default_color_map[OBJECT_TO_IDX["wall"]] = COLOR_TO_IDX["grey"]
-        default_color_map[OBJECT_TO_IDX["door"]] = COLOR_TO_IDX["yellow"]
-        default_color_map[OBJECT_TO_IDX["key"]] = COLOR_TO_IDX["yellow"]
-        default_color_map[OBJECT_TO_IDX["ball"]] = COLOR_TO_IDX["red"]
-        default_color_map[OBJECT_TO_IDX["box"]] = COLOR_TO_IDX["yellow"]
-        default_color_map[OBJECT_TO_IDX["goal"]] = COLOR_TO_IDX["green"]
-        default_color_map[OBJECT_TO_IDX["lava"]] = COLOR_TO_IDX["red"]
-        
-        color = default_color_map[np.clip(obj, 0, MAX_OBJ_ID)]
-        immutable = (obj == self.OBJ_START) | (obj == self.OBJ_GOAL)
+        if self.is_crafter:
+            H, W = base_obj_map.shape
+            obj = base_obj_map.copy()
+            # Crafter doesn't use color map from generator, just return zeros to keep API compatible
+            color = np.zeros_like(obj)
+            immutable = (obj == self.OBJ_START) | (obj == self.OBJ_GOAL)
+            
+            for i in range(H):
+                for j in range(W):
+                    if immutable[i, j]: continue
+                    a = act[i, j]
+                    if a == 0: continue
+                    
+                    if a in self.ACTION_TABLE:
+                        act_val = self.ACTION_TABLE[a]
+                        # 拦截针对最后一行(Inventory Row)的操作和普通操作
+                        if isinstance(act_val, str) and i == H - 1:
+                            if act_val == "inventory_add_1":
+                                obj[i, j] += 1
+                            elif act_val == "inventory_add_2":
+                                obj[i, j] += 5
+                        elif not isinstance(act_val, str) and i < H - 1:
+                            # 正常的地形修改
+                            obj[i, j] = act_val
+                            
+            return obj, color
+            
+        else:
+            H, W = base_obj_map.shape
+            obj = base_obj_map.copy()
+            
+            MAX_OBJ_ID = max(OBJECT_TO_IDX.values())
+            default_color_map = np.zeros(MAX_OBJ_ID + 1, dtype=np.int64)
+            default_color_map[OBJECT_TO_IDX["wall"]] = COLOR_TO_IDX["grey"]
+            default_color_map[OBJECT_TO_IDX["door"]] = COLOR_TO_IDX["yellow"]
+            default_color_map[OBJECT_TO_IDX["key"]] = COLOR_TO_IDX["yellow"]
+            default_color_map[OBJECT_TO_IDX["ball"]] = COLOR_TO_IDX["red"]
+            default_color_map[OBJECT_TO_IDX["box"]] = COLOR_TO_IDX["yellow"]
+            default_color_map[OBJECT_TO_IDX["goal"]] = COLOR_TO_IDX["green"]
+            default_color_map[OBJECT_TO_IDX["lava"]] = COLOR_TO_IDX["red"]
+            
+            color = default_color_map[np.clip(obj, 0, MAX_OBJ_ID)]
+            immutable = (obj == self.OBJ_START) | (obj == self.OBJ_GOAL)
 
-        for i in range(H):
-            for j in range(W):
-                if immutable[i, j]: continue
-                a = act[i, j]
-                if a == 0: continue
-                obj_type, color_name = ACTION_TABLE[a]
-                if obj_type == "key":
-                    obj[i, j] = OBJECT_TO_IDX["key"]; color[i, j] = COLOR_TO_IDX[color_name]
-                elif obj_type == "door":
-                    obj[i, j] = OBJECT_TO_IDX["door"]; color[i, j] = COLOR_TO_IDX[color_name]
-                elif obj_type == "lava":
-                    obj[i, j] = OBJECT_TO_IDX["lava"]
-                elif obj_type == "empty":
-                    obj[i, j] = OBJECT_TO_IDX["empty"]; color[i, j] = 0
-        return obj, color
+            for i in range(H):
+                for j in range(W):
+                    if immutable[i, j]: continue
+                    a = act[i, j]
+                    if a == 0: continue
+                    obj_type, color_name = self.ACTION_TABLE[a]
+                    if obj_type == "key":
+                        obj[i, j] = OBJECT_TO_IDX["key"]; color[i, j] = COLOR_TO_IDX[color_name]
+                    elif obj_type == "door":
+                        obj[i, j] = OBJECT_TO_IDX["door"]; color[i, j] = COLOR_TO_IDX[color_name]
+                    elif obj_type == "lava":
+                        obj[i, j] = OBJECT_TO_IDX["lava"]
+                    elif obj_type == "empty":
+                        obj[i, j] = OBJECT_TO_IDX["empty"]; color[i, j] = 0
+            return obj, color
 
     def _zero_context(self, B, H, W):
         return (torch.zeros((B, 3, H, W), device=self.device), torch.zeros((B, 1, H, W), device=self.device))

@@ -26,7 +26,26 @@ training_generator:
         "ball": "B",
         "box": "X",
         "unseen": "?"
-    } 
+    }
+  map_element_crafter: {
+        "grass": "G",       # Foundation
+        "water": "W",       # Boundary/Obstacle
+        "tree": "T",        # Resource 1
+        "stone": "R",       # Resource 2 (Note: 'R' is stone in CHAR_TO_TILE)
+        "coal": "C",        # Resource 3
+        "iron": "I",        # Resource 4
+        "lava": "L",        # Hazard
+        "zombie": "Z",      # Mob
+        "table": "X",       # Pre-built facility
+        "furnace": "U",     # Pre-built facility
+        "agent": "A"        # Player start
+  } 
+  inventory_element_crafter: {
+        "empty": 0,         # Base state
+        "give_wood": 1,     # Edit to give wood
+        "give_wood_pick": 2,# Edit to give wood pickaxe
+        "give_stone_pick": 3# Edit to give stone pickaxe
+  } 
   color_element: {
     'R': 'red', 
     'G': 'green', 

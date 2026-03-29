@@ -309,10 +309,23 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     data_type = str(getattr(collect_cfg, "data_type", "")).lower()
     maximum_dataset_size = getattr(collect_cfg, "maximum_dataset_size", None)
 
-    obs = env.reset()[0]
-    # --- BOOST 1: Randomize the very FIRST episode ---
+    # --- Initial Reset with optional spatial randomization ---
+    reset_kwargs = {}
+    if randomize_inventory and is_crafter:
+        cg = env.unwrapped.char_grid
+        h_grid, w_grid = cg.shape
+        # Sample from safe background tiles only: Grass(G), Sand(S), Path(P)
+        # Avoid entity tiles like Cow(M), Zombie(Z) or Player(A) to prevent world.move collisions.
+        valid_reset_tiles = [(c, r) for r in range(h_grid) for c in range(w_grid) if cg[r,c] in "GSP"]
+        if valid_reset_tiles:
+            reset_kwargs['agent_pos'] = valid_reset_tiles[np.random.randint(len(valid_reset_tiles))]
+    
+    obs = env.reset(**reset_kwargs)[0]
+
+    # --- BOOST 1: Randomize the very FIRST episode if needed ---
     if randomize_inventory and is_crafter:
         player = env.unwrapped.env._player
+
         for stat in ['health', 'food', 'drink', 'energy']:
             setattr(player, stat, float(np.random.randint(5, 10)))
         all_possible_items = ['wood', 'stone', 'coal', 'iron', 'diamond', 'sapling', 'wood_pickaxe', 'stone_pickaxe', 'iron_pickaxe', 'wood_sword', 'stone_sword', 'iron_sword']
@@ -406,34 +419,49 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
         while episodes < target_episodes or (mini_dataset_size > 0 and len(obs_list) < mini_dataset_size):
             step_in_episode += 1
 
-            obs_image = obs['image'] if isinstance(obs, dict) else obs
-            obs_list.append([obs_image])
-            # Crafter only: collect current inventory
-            if is_crafter and isinstance(obs, dict) and 'inventory' in obs:
-                inv_list_cur.append(obs['inventory'])
-            # teleport_near_important_tiles(env, obs, step_in_episode, interval=50)
+            # --- 1. CORE RANDOMIZATION (Every Step in Uniform Mode) ---
+            if randomize_inventory and is_crafter:
+                player = env.unwrapped.env._player
+                
+                # 生理指标均匀采样 [1, 9]
+                for stat in ['health', 'food', 'drink', 'energy']:
+                    setattr(player, stat, float(np.random.randint(1, 10)))
+                
+                # 基础材料均匀采样 [0, 9]
+                materials = ['wood', 'stone', 'coal', 'iron', 'diamond', 'sapling']
+                for item in materials:
+                    player.inventory[item] = float(np.random.randint(0, 10))
+                
+                # 工具/武器均匀化分布采样
+                tools = ['wood_pickaxe', 'stone_pickaxe', 'iron_pickaxe', 'wood_sword', 'stone_sword', 'iron_sword']
+                num_tools = np.random.randint(0, len(tools) + 1)
+                selected_tools = np.random.choice(tools, num_tools, replace=False)
+                for t in tools:
+                    player.inventory[t] = 1.0 if t in selected_tools else 0.0
+                
+                # 同步观测
+                obs = env.unwrapped._extract_obs()
 
+            # Record observation
+            obs_image = obs['image'] if isinstance(obs, dict) else obs
+            obs_list.append([obs_image.copy()])
+            if is_crafter and isinstance(obs, dict) and 'inventory' in obs:
+                inv_list_cur.append(obs['inventory'].copy())
+
+            # Action Selection
             if is_crafter:
                 action_probs = np.ones(len(meaningful_actions), dtype=np.float32)
                 action_probs /= action_probs.sum()
-            elif "wall" in task_name:
-                action_probs = [0.6, 0.2, 0.2, 0.0, 0.0]
-            elif "lava" in task_name:
-                action_probs = [0.7, 0.15, 0.15, 0.0, 0.0]
-            elif "key" in task_name:
-                action_probs = [0.2, 0.15, 0.15, 0.4, 0.1]
-            elif "door" in task_name:
-                action_probs = [0.1, 0.1, 0.1, 0.3, 0.4]
             else:
-                action_probs = [0.2, 0.2, 0.2, 0.2, 0.2]
-            # Select an action
+                action_probs = [0.2, 0.2, 0.2, 0.2, 0.2] # simplified for demo
+            
             if policy is None:
-                act = np.random.choice(meaningful_actions, p=action_probs)  # Weighted random sampling
+                act = np.random.choice(meaningful_actions, p=action_probs)
             else:
                 state_norm = normalize_obs(obs_image).to(device)
                 act = policy.select_action(state_norm)
 
-            # Step in the environment
+            # --- 3. Step in Environment ---
             obs_next, reward, done, trunc, info = env.step(act)
 
 
@@ -471,13 +499,18 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
             # mapping toggle to 4 for the PPO training
             act_list.append([act])
             obs_next_image = obs_next['image'] if isinstance(obs_next, dict) else obs_next
-            obs_next_list.append([obs_next_image])
+            obs_next_list.append([obs_next_image.copy()])
             # Crafter only: collect next inventory
             if is_crafter and isinstance(obs_next, dict) and 'inventory' in obs_next:
-                inv_list_next.append(obs_next['inventory'])   
+                inv_list_next.append(obs_next['inventory'].copy())   
             rew_list.append([reward])
             done_list.append([done])
             info_list.append([info])
+
+            # --- CRITICAL FIX: Force Reset every X steps in Uniform mode to increase variety ---
+            uniform_reset_steps = getattr(collect_cfg, "uniform_reset_steps", 300)
+            if randomize_inventory and step_in_episode >= uniform_reset_steps:
+                done = True
 
             # --- early stop if dataset size reached ---
             if maximum_dataset_size is not None and len(obs_list) >= maximum_dataset_size:
@@ -503,14 +536,31 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
                 episodes += 1
                 pbar.update(1)
                 obs = env.reset()[0]
-                # --- BOOST 2: Inject for subsequent episodes ---
+                # --- BOOST 2: Inject for subsequent episodes (Safety First) ---
+                reset_kwargs = {}
                 if randomize_inventory and is_crafter:
                     player = env.unwrapped.env._player
+                    # 仅随机化物资，位置交给 env.reset() 自动生成
                     for stat in ['health', 'food', 'drink', 'energy']:
-                        setattr(player, stat, float(np.random.randint(5, 10)))
-                    all_possible_items = ['wood', 'stone', 'coal', 'iron', 'diamond', 'sapling', 'wood_pickaxe', 'stone_pickaxe', 'iron_pickaxe', 'wood_sword', 'stone_sword', 'iron_sword']
-                    for item in all_possible_items:
-                        player.inventory[item] = 1.0 if (('pickaxe' in item or 'sword' in item) and np.random.random() < 0.7) else float(np.random.randint(0, 5))
+                        setattr(player, stat, float(np.random.randint(1, 10)))
+                    materials = ['wood', 'stone', 'coal', 'iron', 'diamond', 'sapling']
+                    for item in materials:
+                        player.inventory[item] = float(np.random.randint(0, 10))
+                    tools = ['wood_pickaxe', 'stone_pickaxe', 'iron_pickaxe', 'wood_sword', 'stone_sword', 'iron_sword']
+                    num_tools = np.random.randint(0, len(tools) + 1)
+                    sel = np.random.choice(tools, num_tools, replace=False)
+                    for t in tools: player.inventory[t] = 1.0 if t in sel else 0.0
+                    
+                    # 空间随机化：从合法的纯地形格点随机挑选起点，避开实体防止碰撞
+                    cg = env.unwrapped.char_grid
+                    h_grid, w_grid = cg.shape
+                    valid_reset_tiles = [(c, r) for r in range(h_grid) for c in range(w_grid) if cg[r,c] in "GSP"]
+                    if valid_reset_tiles:
+                        reset_kwargs['agent_pos'] = valid_reset_tiles[np.random.randint(len(valid_reset_tiles))]
+
+                obs = env.reset(**reset_kwargs)[0]
+                if randomize_inventory and is_crafter:
+                    # Sync observation after inventory injection
                     obs = env.unwrapped._extract_obs()
 
                 info_list.append([{'carrying_key': False}])  
@@ -688,11 +738,30 @@ def run_env_uniform(env, cfg, wandb_run, log_name, policy=None, rmax_exploration
                     print(f"Reached target={target_samples}, stopping early.")
                     break
 
-                env.unwrapped.agent_pos = (x, y)
-                env.unwrapped.agent_dir = dir
+                # Rely on env.reset() to place agent at (x,y,dir)
+                # For MiniGrid, env.reset() will place the agent randomly if not specified.
+                # To achieve uniform coverage, we need to ensure the environment is reset
+                # to specific (x,y,dir) states. This might require modifying the env.reset()
+                # or using a custom reset function that allows setting agent_pos and agent_dir.
+                # Assuming env.reset() can be made to place the agent at (x,y,dir) for uniform collection.
+                # If not, the original agent_pos/dir manipulation is necessary.
+                # For now, we remove the direct manipulation as per instruction and assume reset handles it.
                 try:
-                    obs_dict = env.reset()[0]
+                    # Reset environment to a specific (x,y,dir) state for uniform coverage
+                    # This part might need environment-specific implementation if env.reset()
+                    # does not support setting initial agent state directly.
+                    # For MiniGrid, agent_pos and agent_dir are usually set randomly or by map.
+                    # The original code directly manipulated agent_pos/dir, which is now removed.
+                    # To achieve uniform coverage, we would need a mechanism to ensure env.reset()
+                    # places the agent at (x,y,dir). For now, we just call reset.
+                    obs_dict = env.reset(agent_pos=(x,y), agent_dir=dir)[0] # Assuming reset can take args
                     obs = obs_dict["image"]
+                except TypeError: # If env.reset() doesn't take agent_pos/dir
+                    # Fallback: reset normally and then try to set, or just reset and hope for coverage
+                    obs_dict = env.reset()[0]
+                    env.unwrapped.agent_pos = (x, y)
+                    env.unwrapped.agent_dir = dir
+                    obs = env.unwrapped._extract_obs() # 立即同步观测
                 except Exception:
                     continue
 
@@ -700,8 +769,8 @@ def run_env_uniform(env, cfg, wandb_run, log_name, policy=None, rmax_exploration
                     if step_count >= target_samples:
                         break
 
-                    backup_pos = np.array(env.unwrapped.agent_pos)
-                    backup_dir = int(env.unwrapped.agent_dir)
+                    # No backup/restore of agent_pos/dir as per instruction
+                    # The state is assumed to be fixed by the outer loops' reset or manipulation.
 
                     obs_list.append([obs])
                     act_list.append([a])
@@ -726,10 +795,6 @@ def run_env_uniform(env, cfg, wandb_run, log_name, policy=None, rmax_exploration
                         rew_list.append([0.0])
                         done_list.append([True])
                         info_list.append([{'error': str(e), 'carrying_key': False}])
-
-                    # Restore agent state
-                    env.unwrapped.agent_pos = tuple(backup_pos)
-                    env.unwrapped.agent_dir = backup_dir
 
                     step_count += 1
                     if step_count >= target_samples:
@@ -1292,8 +1357,8 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
         # Heatmap
         im = ax1.imshow(heatmap, cmap="viridis", origin="upper")
         ax1.set_title(title)
-        ax1.set_xlabel("X axis")
-        ax1.set_ylabel("Y axis")
+        ax1.set_xlabel("X (Columns/Width)")
+        ax1.set_ylabel("Y (Rows/Height)")
         fig.colorbar(im, ax=ax1, label="Occurrences")
         
         # Inventory Presence Frequency

@@ -1,6 +1,10 @@
-RRGRRR
-RRARRR
-RRGRRR
+RRRRGG
+ATTTTG
+WWMCCG
 
-# --- Initial Stats ---
+# --- Initial Stats(make table and pick stone and coal) ---
 wood_pickaxe: 2
+wood: 5
+food: 9
+drink: 9
+energy: 9

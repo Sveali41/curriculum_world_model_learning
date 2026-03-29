@@ -205,16 +205,21 @@ def extract_masked_state(state, mask_size, agent_position_yx):
         state = state.detach().cpu().numpy()
         tensor_flag = True
 
+    # --- Environment-Specific Padding ---
+    # Crafter (2 channels) -> Pad with Grass (ID 2)
+    # MiniGrid (3 channels) -> Pad with Zero (ID 0)
+    pad_val = 2 if state.shape[-3] == 2 else 0
+    
     if len(state.shape) == 3:
         state_masked = utils.extract_masked_state_support(
-            state, agent_position_yx, mask_size
+            state, agent_position_yx, mask_size, pad_value=pad_val
         )
     elif len(state.shape) == 4:
         bsz, channel, _, _ = state.shape
         state_masked = np.zeros((bsz, channel, mask_size, mask_size), dtype=state.dtype)
         for i in range(bsz):
             state_masked[i, :, :, :] = utils.extract_masked_state_support(
-                state[i], agent_position_yx[i], mask_size
+                state[i], agent_position_yx[i], mask_size, pad_value=pad_val
             )
     else:
         raise ValueError("Input must be a 3D or 4D array.")

@@ -11,6 +11,60 @@ PLAYER_ID = 13  # Updated: player ID in new CustomCrafterEnv mapping (was 10)
 
 def _to_nchw(obs: np.ndarray) -> np.ndarray:
     """Convert observations to (N, C, H, W)."""
+
+def interpret_env(env_tensor, cfg):
+    import torch
+    import numpy as np
+    from generator.crafter_env_designer import CRAFTER_OBJ_MAP
+    
+    if isinstance(env_tensor, torch.Tensor):
+        env_np = env_tensor.cpu().numpy()
+    else:
+        env_np = env_tensor
+
+    # Handle shape (H, W) or (C, H, W)
+    if env_np.ndim == 3:
+        env_np = env_np[0]
+
+    H_total, W = env_np.shape
+    H_phys = H_total - 1
+
+    phys_map = env_np[:H_phys, :]
+    inv_row = env_np[-1, :]
+
+    inv_obj_map = {v: k for k, v in CRAFTER_OBJ_MAP.items()}
+    # Dictionary from config
+    map_elem = cfg.training_generator.get('map_element_crafter', {
+        "grass": "G", "water": "W", "tree": "T", "stone": "R", "coal": "C",
+        "iron": "I", "lava": "L", "zombie": "Z", "table": "X", "furnace": "U", "agent": "A"
+    })
+    
+    lines = []
+    for r in range(H_phys):
+        row_str = ""
+        for c in range(W):
+            obj_idx = phys_map[r, c]
+            obj_name = inv_obj_map.get(int(obj_idx), 'grass')
+            char = map_elem.get(obj_name, 'G')
+            row_str += char
+        lines.append(row_str)
+    
+    layout_str = "\n".join(lines).strip()
+
+    # Dynamic parsing of the inventory row
+    stats_str = "\n\n# --- Initial Stats ---\n"
+    stats_str += f"wood: {int(inv_row[0])}\n"
+    stats_str += f"stone: {int(inv_row[1])}\n"
+    stats_str += f"coal: {int(inv_row[2])}\n"
+    stats_str += f"wood_pickaxe: {int(inv_row[3])}\n"
+    stats_str += f"stone_pickaxe: {int(inv_row[4])}\n"
+    stats_str += f"iron_pickaxe: {int(inv_row[5])}\n"
+    stats_str += f"wood_sword: {int(inv_row[6])}\n"
+    stats_str += f"stone_sword: {int(inv_row[7])}\n"
+    
+    final_env_source = layout_str + stats_str
+    return final_env_source, ""
+
     if obs.ndim != 4:
         raise ValueError(f"Expected 4D observations, got shape {obs.shape}")
 
@@ -133,23 +187,25 @@ def crafter_classification_loss(
     Compute per-location CrossEntropy loss for Crafter classification output.
 
     Args:
-        next_pred: (B, 22, H, W) logits — first 17 = obj, last 5 = dir
+        next_pred: (B, 25, H, W) logits — first 20 = obj, last 5 = dir
         next_true: (B, 2, H, W)  ground truth — ch0=obj ID, ch1=dir ID
         reduction: 'none' => (B,H,W), 'mean' => scalar
 
     Returns:
         loss map or scalar depending on reduction
     """
-    obj_logits = next_pred[:, :CRAFTER_OBJ_CLASSES]   # (B, 17, H, W)
+    obj_logits = next_pred[:, :CRAFTER_OBJ_CLASSES]   # (B, 20, H, W)
     dir_logits = next_pred[:, CRAFTER_OBJ_CLASSES:]   # (B, 5, H, W)
+
 
     obj_true = next_true[:, 0].long()
     dir_true = next_true[:, 1].long()
 
     obj_true, dir_true = crafter_clamp_targets(obj_true, dir_true)
 
-    loss_obj = F.cross_entropy(obj_logits, obj_true, reduction=reduction)
-    loss_dir = F.cross_entropy(dir_logits, dir_true, reduction=reduction)
+    # Add label_smoothing=0.1 to prevent model from being overconfident (logit explosion) on 3x6 maps
+    loss_obj = F.cross_entropy(obj_logits, obj_true, reduction=reduction, label_smoothing=0.1)
+    loss_dir = F.cross_entropy(dir_logits, dir_true, reduction=reduction, label_smoothing=0.1)
 
     total = loss_obj + loss_dir  # (B, H, W) or scalar
 

@@ -108,9 +108,42 @@ class WMRLDataset(Dataset):
         current_n = len(obs)
         assert current_n == len(obs_next) == len(act), "[BUG] Current lengths inconsistent!"
 
+        # [NEW] Training Sample Capping: Only use a subset if specified
+        max_train_samples = int(getattr(self.hparams, "max_train_samples", 0))
+        if 0 < max_train_samples < current_n:
+            indices = rng.choice(current_n, size=max_train_samples, replace=False)
+            obs, obs_next, act = obs[indices], obs_next[indices], act[indices]
+            if rew is not None: rew = rew[indices]
+            if done is not None: done = done[indices]
+            if inv is not None: inv = inv[indices]
+            if inv_next is not None: inv_next = inv_next[indices]
+            if info is not None: info = info[indices]
+            current_n = max_train_samples
+            print(f"[Dataset] Capped current task data to {max_train_samples} samples.")
+
         # [NEW] Check for empty current and replay datasets immediately
         if current_n == 0 and (replay_data is None or len(replay_data.get('obs', [])) == 0):
             return {'obs': np.array([]), 'obs_next': np.array([]), 'act': np.array([])}
+
+        # [NEW] For Crafter: Pad any smaller maps to a consistent 6x8 shape (matches target task)
+        # Using pad value 2 (Grass) for objects and 0 for directions.
+        if env_type == 'crafter':
+            h_tgt, w_tgt = 17, 23
+            # Standardize all Crafter task observations to 17x23 using Grass(2) padding
+            def pad_crafter(data):
+                # data shape: (N, 2, H, W)
+                B, C, H, W = data.shape
+                padded = np.zeros((B, C, h_tgt, w_tgt), dtype=data.dtype)
+                padded[:, 0, :, :] = 2 # Object channel: Default to Grass (ID 2)
+                # Slicing safely: crop if input is somehow larger than tgt, pad if smaller
+                h_max = min(H, h_tgt)
+                w_max = min(W, w_tgt)
+                padded[:, :, :h_max, :w_max] = data[:, :, :h_max, :w_max]
+                return padded
+            
+            obs = pad_crafter(obs)
+            obs_next = pad_crafter(obs_next)
+            print(f"[DataModule] Standardized Crafter shape to ({h_tgt},{w_tgt}) using Grass(2) padding.")
 
         # ===== (0.5) Frame Stacking (If enabled for new data) =====
         frame_stack = int(getattr(self.hparams, "frame_stack", 1))

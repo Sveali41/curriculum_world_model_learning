@@ -24,6 +24,8 @@ class Support:
         return env
 
     def interpret_env(self, env, color_array=None):
+        if self.cfg.attention_model.env_type == 'crafter':
+            return crafter_support.interpret_env(env, self.cfg)
         return minigrid_support.interpret_env(env, self.cfg, color_array=color_array)
 
     def collect_data_trainer(

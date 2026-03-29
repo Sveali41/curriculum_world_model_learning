@@ -1,171 +1,182 @@
 import os
 import sys
-
-# Add project root to sys.path
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.append(PROJECT_ROOT)
-
-from omegaconf import DictConfig
-from modelBased.common.utils import TRAINER_PATH
-from modelBased.world_model import AttentionWM_training
-from datetime import datetime
-import hydra
 import torch
 import numpy as np
+import pandas as pd
+import copy
+from omegaconf import OmegaConf
 
-from modelBased.policy_training import PPO_world_training
+# Add project root to path
+PROJECT_ROOT = "/home/siyao/phd_file/Research/rlPractice/Curriculum_world_model_learning"
+sys.path.append(PROJECT_ROOT)
 
+from modelBased.common.support import Support
+from modelBased.data.data_collect import data_collect
+from modelBased.world_model import AttentionWM_training
+from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
 
-'''
-Process
-1. load the generator
-2. use the generator to generator env 
-(comparision among the different env as loss1)
-3. collect data from the env
-4. train(finetuning) the attention & WM
-5. using the trained attention & WM to play in the final task sets
-6. return score in the final task as the feedback
+def setup_env():
+    os.environ["PROJECT_ROOT"] = PROJECT_ROOT
+    os.environ["TRAINER_PATH"] = os.path.join(PROJECT_ROOT, "trainer")
+    os.environ["WORLD_MODEL_PATH"] = os.path.join(PROJECT_ROOT, "modelBased")
+    os.environ["TRAIN_DATASET_PATH"] = os.path.join(PROJECT_ROOT, "modelBased/data/train_world_model")
+    os.environ["MODEL_FPATH"] = os.path.join(PROJECT_ROOT, "modelBased/models")
 
-'''
-
-
-@hydra.main(version_base=None, config_path=str(TRAINER_PATH / "conf"), config_name="config_crafter_CL")
-def collect_data(cfg: DictConfig):
-    import modelBased.common.support as support_mod
-    support = support_mod.Support(cfg)
+def setup_config():
+    # Load the CL config
+    config_path = os.path.join(PROJECT_ROOT, "trainer/conf/config_crafter_CL.yaml")
+    cfg = OmegaConf.load(config_path)
+    # Resolve interpolations
+    cfg.PROJECT_ROOT = PROJECT_ROOT
+    cfg.TRAIN_DATASET_PATH = os.environ["TRAIN_DATASET_PATH"]
     
-    env_task_names = [
-        'crafter_minitask_01', 'crafter_minitask_02', 'crafter_minitask_03', 
-        'crafter_minitask_04', 'crafter_minitask_05', 'crafter_minitask_06',
-        'crafter_target_task_diamond'
-    ]
-    level_dir = os.path.join(PROJECT_ROOT, 'trainer', 'level', 'crafter')
-    data_save_dir = os.environ.get("TRAIN_DATASET_PATH", os.path.join(PROJECT_ROOT, "modelBased/data/train_world_model"))
-    
-    # Ensure save directory exists
-    os.makedirs(data_save_dir, exist_ok=True)
+    # Initialize support
+    support = Support(cfg)
+    return cfg, support
 
-    for task_name in env_task_names:
-        print(f"\n--- Collecting data for {task_name} ---")
-        file_path = os.path.join(level_dir, f"{task_name}.txt")
-        
-        # Wrap environment from text file
-        env = support.wrap_env_from_text(file_path, max_steps=20000)
-        
-        # Set collection path
-        cfg.env.collect.data_save_path = os.path.join(data_save_dir, f'{task_name}.npz')
-        
-        # Execute collection
-        support.collect_data_trainer(
-            env=env,
-            wandb_run=None,
-            validate=False,
-            save_img=False,
-            log_name=f"collect_{task_name}",
-            max_steps=20000 # Collect 20k steps per minitask
-        )
-        print(f"Saved: {cfg.env.collect.data_save_path}")
-
-@hydra.main(version_base=None, config_path=str(TRAINER_PATH / "conf"), config_name="config_crafter_CL")
-def test_1(cfg: DictConfig):
+def collect_data():
     """
-    Performs continual training of the Attention-based World Model (WM) on a sequence of Crafter tasks.
-    Validates on the target uniform dataset after each task training.
+    Original function to collect data for each minitask.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
-    from modelBased.world_model.AttentionWM import AttentionWorldModel
-    import numpy as np
-
-    fisher_buffer = FisherReplayBuffer(max_size=500000)
-    old_params, fisher = None, None
-    trained_net = None
-
-    # Task sequence based on curriculum
-    env_task_names = ['crafter_minitask_01', 'crafter_minitask_02', 'crafter_minitask_03']  
-    target_val_dataset = "crafter_target_uniform_test.npz"
+    setup_env()
+    cfg, _ = setup_config()
     
-    data_save_dir = os.environ.get("TRAIN_DATASET_PATH", "/home/siyao/phd_file/Research/rlPractice/Curriculum_world_model_learning/modelBased/data/train_world_model")
+    tasks = [f"crafter_minitask_0{i}" for i in range(1, 7)]
+    # tasks.append("crafter_target_task_diamond") # optional
     
-    for step, task_name in enumerate(env_task_names):
-        print(f"\n\n{'#'*60}")
-        print(f"### PHASE {step+1}: Training on {task_name}")
-        print(f"{'#'*60}\n")
+    for task in tasks:
+        print(f"\n[Collection] Processing Task: {task}")
         
-        cfg.attention_model.freeze_weight = False
+        # Set paths dynamically
+        cfg.env.env_path = os.path.join(PROJECT_ROOT, f"trainer/level/crafter/{task}.txt")
+        cfg.env.collect.data_save_path = os.path.join(os.environ["TRAIN_DATASET_PATH"], f"{task}.npz")
+        cfg.env.collect.visualize_filename = f"{task}_random_coverage.png"
+        
+        # Call the actual data collection logic
+        data_collect(cfg)
+        print(f"[Done] Saved to {cfg.env.collect.data_save_path}")
 
-        # === 设置当前任务数据路径 ===
-        cfg.attention_model.data_dir = os.path.join(data_save_dir, f'{task_name}.npz')
+def run_experiment_session(mode="minitask", all_results=None):
+    """
+    Runs a 6-phase continual learning experiment.
+    mode: "minitask" (01->06) or "random_baseline" (random sampling from target)
+    """
+    setup_env()
+    cfg, _ = setup_config()
+    
+    if all_results is None:
+        all_results = []
 
-        # === 混合 replay ===
+    # --- Phase Setup ---
+    n_phases = 6
+    if mode == "minitask":
+        task_files = [f"crafter_minitask_0{i}.npz" for i in range(1, 7)]
+        exp_label = "Minitask_CL"
+    else:
+        # For random baseline, we always pull from the same random source file
+        # The datamodule will trigger max_train_samples (20k) random sampling each time.
+        task_files = ["crafter_target_task_diamond_random.npz"] * n_phases
+        exp_label = "Random_Baseline"
+
+    # 2. Preparation for Validation Dataset (The universal test target)
+    validation_dataset = os.path.join(cfg.TRAIN_DATASET_PATH, "crafter_target_task_diamond_uniform.npz")
+    cfg.attention_model.validation_data_dir = validation_dataset
+    
+    # 3. Initialize model components for this session
+    old_params = None
+    fisher = None
+    # Replay buffer shared across phases in this session
+    fisher_buffer = FisherReplayBuffer(max_size=cfg.attention_model.fisher_buffer_size)
+
+    print(f"\n\n{'='*70}")
+    print(f"### [START SESSION] Type: {exp_label}")
+    print(f"{'='*70}\n")
+
+    for i in range(n_phases):
+        task_filename = task_files[i]
+        task_name = task_filename.split('.')[0]
+        if mode == "random_baseline":
+             task_name = f"random_phase_{i+1}"
+
+        print(f"\n[PHASE {i+1}/n_phases] Mode: {exp_label} | Training on: {task_filename}")
+
+        # --- Configure Training ---
+        cfg_train = copy.deepcopy(cfg)
+        cfg_train.attention_model.data_dir = os.path.join(cfg.TRAIN_DATASET_PATH, task_filename)
+        
+        # Export old samples for Replay
         replay_data = fisher_buffer.export_dict() if len(fisher_buffer) > 0 else None
 
-        # === 启动训练（含 EWC） ===
-        # 注意：AttentionWM_training.train_api 返回的是 (old_params, fisher, net)
-        # 我们将 trained_net 传回，以在同一模型实例上继续训练
-        cur_old_params, cur_fisher, trained_net = AttentionWM_training.train_api(
-            cfg, 
-            net=trained_net, 
+        # --- Execute Training (EWC + Replay) ---
+        train_res = AttentionWM_training.train_api(
+            cfg_train, 
+            net=None, 
             old_params=old_params, 
             fisher=fisher, 
             replay_data=replay_data
         )
-        old_params, fisher = cur_old_params, cur_fisher
-
-        # === 立即验证：泛化性能测试 (Target Test Set) ===
-        print(f"\n--- VALIDATING Phase {step+1} on Target Uniform Dataset ---")
-        cfg.attention_model.freeze_weight = True
-        cfg.attention_model.data_dir = os.path.join(data_save_dir, target_val_dataset)
         
-        # 使用刚刚训练好的网络进行验证
-        AttentionWM_training.run(
-            cfg, 
-            net=trained_net, 
-            old_params=old_params, 
-            fisher=fisher, 
-            replay_data=None
+        # Update weights and fisher info for next task
+        old_params = train_res["old_params"]
+        fisher = train_res["fisher"]
+
+        # --- Post-Training Maintenance ---
+        # 1. Add fresh samples into Fisher Replay Buffer
+        print(f"[Buffer] Sampling from {task_filename} for future replay...")
+        # target_shape should be large enough to handle ALL tasks (17x23 is the max)
+        fisher_buffer.add_from_npz(
+            cfg_train.attention_model.data_dir,
+            current_sample_ratio=cfg.attention_model.ewc_ratio, # e.g., 0.05
+            target_shape=(17, 23) 
         )
 
-        # === 更新 Fisher Replay Buffer (使用最新的 data_dir 之前训练时的数据) ===
-        task_data_path = os.path.join(data_save_dir, f'{task_name}.npz')
-        task_npz = np.load(task_data_path, allow_pickle=True)
-        samples = {
-            'obs': task_npz['a'],
-            'obs_next': task_npz['b'],
-            'act': task_npz['c'],
-            'info': task_npz['f'] if 'f' in task_npz else None,
-            'inv': task_npz['g'] if 'g' in task_npz else None,
-            'inv_next': task_npz['h'] if 'h' in task_npz else None,
+        # 2. CROSS-TASK VALIDATION (Zero-shot on the common uniform target)
+        print(f"--- Validating Phase {i+1} on Target UNIFORM Dataset ---")
+        val_cfg = copy.deepcopy(cfg)
+        val_cfg.attention_model.freeze_weight = True
+        val_cfg.attention_model.data_dir = validation_dataset
+        
+        val_res = AttentionWM_training.train_api(
+            val_cfg, 
+            net=None, 
+            old_params=old_params, 
+            fisher=fisher
+        )
+
+        # --- Metrics Recording (Standardized Columns) ---
+        target_metrics_dict = {}
+        if isinstance(val_res.get("avg_val_loss"), list) and len(val_res["avg_val_loss"]) > 0:
+            target_metrics_dict = val_res["avg_val_loss"][0]
+
+        metrics = {
+            "experiment_type": exp_label,
+            "phase": i + 1,
+            "task": task_name,
+            "train_best_val_loss": train_res.get("best_loss", 0.0),
+            "target_val_val_inv_loss": target_metrics_dict.get("val/inv_loss", 0.0),
+            "target_val_val_ce_loss": target_metrics_dict.get("val/ce_loss", 0.0),
+            "target_val_avg_val_loss_wm": target_metrics_dict.get("avg_val_loss_wm", 0.0)
         }
-        # 使用训练后的模型更新 Buffer
-        fisher_buffer.update_combined(samples, 0.3, 0.5) 
+        all_results.append(metrics)
+        
+        # Save to the specified combined CSV
+        df = pd.DataFrame(all_results)
+        csv_out_path = os.path.join(PROJECT_ROOT, "trainer/logs/cl_comparison_results.csv")
+        df.to_csv(csv_out_path, index=False)
+        
+        print(f"[Metrics] Phase {i+1} Target CE Loss: {metrics['target_val_val_ce_loss']:.4f}")
 
+    print(f"\n[SUCCESS] Finished {exp_label} session.\n")
+    return all_results
 
-@hydra.main(version_base=None, config_path=str(TRAINER_PATH / "conf"), config_name="config_test")
-def test_2(cfg: DictConfig):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    old_params, fisher = None, None
-    env_text_file_name = ['env1_test.txt']
-    step_len = len(env_text_file_name)
-
-    for step in range(step_len):
-        print(f"Step {step+1} of {step_len}...")
-        # env = support.wrap_env(support.generate_env(model))
-        file_name = os.path.splitext(env_text_file_name[step])[0]  # 'env1_move'
-        data_save_dir = '/home/siyao/project/rlPractice/MiniGrid/trainer/data'
-        cfg.attention_model.data_dir = os.path.join(data_save_dir, f'{file_name}.npz')
-        cur_old_params, cur_fisher = AttentionWM_training.train_api(cfg, old_params, fisher)
-        old_params, fisher = cur_old_params, cur_fisher
-
-    cfg.attention_model.freeze_weight = True
-    cfg.attention_model.data_dir = '/home/siyao/project/rlPractice/MiniGrid/trainer/data/env1_test.npz'
-    AttentionWM_training.train_api(cfg, old_params, fisher)
-    cfg.attention_model.data_dir = '/home/siyao/project/rlPractice/MiniGrid/trainer/data/env2_test.npz'
-    AttentionWM_training.train_api(cfg, old_params, fisher)
-
-    
 if __name__ == "__main__":
-    collect_data()
-    test_1()
-    # test_2()
+    # # 1. Data Collection Mode
+    # collect_data()
+    
+    # 2. Training Mode (A/B Comparison)
+    setup_env()
+    final_results = []
+    # Start CL seq
+    final_results = run_experiment_session(mode="minitask", all_results=final_results)
+    # Start Random seq
+    final_results = run_experiment_session(mode="random", all_results=final_results)

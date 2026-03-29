@@ -4,17 +4,18 @@ attention_model:
   data_type: discrete
   model_type: Attention
   grid_shape: [2, 0, 0]  # Crafter=2 channels (object + direction)
-  attention_mask_size: 3
-  batch_size: 256
-  n_cpu: 4
-  embed_dim: 128
-  num_heads: 1
+  attention_mask_size: 5
+  batch_size: 512
+  n_cpu: 8
+  embed_dim: 256
+  num_heads: 4
   # Default directory, will be overridden in the script
   data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_minitask_01.npz
   validation_data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_target_uniform_test.npz
-  n_epochs: 25
-  lr: 5e-4
-  wd: 1e-5
+  max_train_samples: 20000
+  n_epochs: 15
+  lr: 8e-4
+  wd: 1e-4
   obs_norm_values: [10, 5, 3] # Overridden in code for crafter
   action_norm_values: 5 
   valid_values_obj: [1, 2, 4, 5, 8, 10]
@@ -29,14 +30,16 @@ attention_model:
 
   # Continual Learning / EWC Params
   continue_learning: True
-  lambda_ewc: 500.0         
-  ewc_ratio: 0.2           
+  lambda_ewc: 200.0 # higher to protect the old knowledge      
+  ewc_ratio: 0.05           
   lambda_ema: 0.1
-  lambda_ewc_min: 10.0
-  lambda_ewc_max: 2000.0
+  lambda_ewc_min: 0.1
+  lambda_ewc_max: 10000.0
   scale_factor: 1.0
-  replay_frac: 0.5
+  replay_frac: 0.7
   fisher_buffer_size: 500000
+  fisher_buffer_elements_ratio: 0.8
+  fisher_beta: 0.7 # 0.3 -> 0.5: Standard update speed (smaller -> faster)
 
   # Visualization
   visualization: True     
@@ -49,9 +52,16 @@ env:
   env_type: crafter
   visualize: False
   collect:
-    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_cl_temp.npz
-    episodes: 200 # Default episodes for collection if needed
-    data_type: uniform
-    save_coverage_visualize: False
+    data_type: random
+    episodes: 500
+    mini_dataset_size: 8000
+    maximum_dataset_size: 20000
+    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_minitask_01.npz
+    save_coverage_visualize: True
+    visualize_save_path: ${oc.env:PROJECT_ROOT}/trainer/logs/dataset_visualization
+    visualize_filename: crafter_minitask_01_random_coverage.png
+    save_env_visualize: True
+    env_visualize_save_path: ${oc.env:PROJECT_ROOT}/trainer/logs/env_visualization
+    env_visualize_filename: crafter_minitask_01_random_env.png
 
 

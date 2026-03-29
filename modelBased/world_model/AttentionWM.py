@@ -439,7 +439,10 @@ class AttentionWorldModel(pl.LightningModule):
                 count += d.numel()
 
             if count > 0:
-                total = total / count
+                # 科学折中：不除以总参数数(会太小)，也不完全不除(会太大)。
+                # 我们除以参与参数化的“层”的数量（大约 50-100 层），让量级回到 1-10 之间。
+                num_layers = len([n for n, p in self.named_parameters() if p.requires_grad])
+                total = total / (num_layers * 2.0)
 
         # [DEBUG]
         if self.global_step % 1000 == 0:
@@ -562,8 +565,8 @@ class AttentionWorldModel(pl.LightningModule):
              state_change_mask = torch.zeros_like(change_mask)
 
         # 4. Combine Weights
-        # Base=1.0, Move=+10, Interaction=+100 -> Total 111.0 for Opening Door
-        weights = 1.0 + (change_mask * 10.0) + (state_change_mask * 100.0)
+        # Base=1.0, Move=+10, Interaction=+50 -> Total 61.0 for Opening Door (Reduced from 111.0 to improve stability)
+        weights = 1.0 + (change_mask * 10.0) + (state_change_mask * 50.0)
         
         if obs_masked is not None:
              if obs_masked.ndim == 3:
@@ -575,10 +578,11 @@ class AttentionWorldModel(pl.LightningModule):
              interaction_mask = change_mask * static_mask
              
              if self.env_type == 'crafter':
-                 # For Crafter, these elements are stochastic entities (zombies, animals).
-                 # We want to learn them but not let them dominate the loss due to random jitter.
-                 stochastic_weight = 5.0
+                 # For Crafter: restrict influence of stochastic jitter (zombies/cows)
+                 # and normalize weight map average to 1.0 to prevent total loss explosion.
+                 stochastic_weight = 2.0
                  weights = weights + (interaction_mask * stochastic_weight)
+                 weights = weights / weights.mean()
              else:
                  # Original MiniGrid behavior: boost critical interactions like keys/doors
                  weights = weights + (interaction_mask * 100.0)
@@ -595,9 +599,25 @@ class AttentionWorldModel(pl.LightningModule):
 
 
     def configure_optimizers(self):
-        params = [p for p in self.parameters() if p.requires_grad]
-        optimizer = optim.Adam(params, lr=self.lr, betas=(0.9, 0.999), eps=1e-6, weight_decay=self.weight_decay)
-        # reduce_lr_on_plateau = ReduceLROnPlateau(optimizer, mode='min',verbose=True, min_lr=1e-8)
+        # 针对分类头 (self.fc) 使用更高的学习率，以加快对新环境瓦片的适应
+        # 其他参数使用标准学习率
+        head_params = []
+        base_params = []
+        
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            # 'fc' 是负责地图 Tile 分类的输出层
+            if 'fc' in name:
+                head_params.append(param)
+            else:
+                base_params.append(param)
+
+        optimizer = optim.Adam([
+            {'params': base_params, 'lr': self.lr},
+            {'params': head_params, 'lr': self.lr * 2.0} # 分类头学习率翻倍
+        ], betas=(0.9, 0.999), eps=1e-6, weight_decay=self.weight_decay)
+
         reduce_lr_on_plateau = ReduceLROnPlateau(optimizer, mode='min', min_lr=1e-8)
         return {
             "optimizer": optimizer,
@@ -634,8 +654,9 @@ class AttentionWorldModel(pl.LightningModule):
         curr_obj_idx = (self.frame_stack - 1) * C_base
         object_map = obs_masked[:, curr_obj_idx]  # 取最后一帧的第0通道 (B,H,W)
         if self.env_type == 'crafter':
-            # Interactive elements in Crafter: cow(11), zombie(12), skeleton(13), arrow(14), plant(15)
-            elements_mask = (object_map >= 11) & (object_map <= 15)
+            # Interactive elements in Crafter: Cow(14), Zombie(15), Skeleton(16), Arrow(17), Plant(18)
+            # Exclusion: Player(13) must be predicted precisely, Table(11)/Furnace(12) are static.
+            elements_mask = (object_map >= 14) & (object_map <= 18)
         else:
             key_mask = (object_map == 5)
             door_mask = (object_map == 4)
@@ -708,12 +729,12 @@ class AttentionWorldModel(pl.LightningModule):
         if self.env_type == 'crafter' and inv_pred is not None and inv_next is not None:
             if inv is not None:
                 inv_diff = torch.abs(inv_next - inv).float()
-                inv_weights = 1.0 + (inv_diff > 1e-5).float() * 100.0
+                inv_weights = 1.0 + (inv_diff > 1e-5).float() * 20.0
                 inv_loss = (F.mse_loss(inv_pred, inv_next.float(), reduction='none') * inv_weights).mean()
             else:
                 inv_loss = F.mse_loss(inv_pred, inv_next.float())
-                
-            loss_total = loss_total + 10.0 * inv_loss
+            # 加大背包损失权重 (从 15.0 -> 5.0)，平衡背包与地图信号
+            loss_total = loss_total + 5.0 * inv_loss
             self.log("train/inv_loss", inv_loss, prog_bar=True, on_step=True, on_epoch=True)
 
         # —— 统一日志 —— #
@@ -804,7 +825,7 @@ class AttentionWorldModel(pl.LightningModule):
             raw_mse = F.mse_loss(obs_pred, obs_next)
             loss_val = raw_mse
 
-        self.log("val_loss", loss_val, prog_bar=True)
+        # No longer logging redundant "val_loss" here as we log "avg_val_loss_wm" at epoch end.
 
         return {
             "loss_wm_val": loss_val,             

@@ -60,23 +60,23 @@ env:
   env_path: ${oc.env:TRAINER_PATH}/level/crafter/crafter_target_task_diamond.txt
   visualize: False
   env_type: crafter
-  # data_type: uniform (enables exhaustive inventory randomization for generalization testing)
-  data_type: uniform
   max_steps: 10000
   crafter:
     stochastic: False     # False = entities frozen (zombie/cow don't move)
     slippery_prob: 0.0     # 0.0 = fully deterministic for initial validation
   collect:
+    data_type: random
+    uniform_reset_steps: 5000
     episodes: 1000
     mini_dataset_size: 8000
-    maximum_dataset_size: 100000  # limit to 50k for faster iteration on small map
-    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_target_task_diamond.npz #crafter_minitask_06.npz
+    maximum_dataset_size: 100000 
+    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_target_task_diamond_random.npz #crafter_minitask_06.npz
     save_coverage_visualize: True
     visualize_save_path: ${oc.env:PROJECT_ROOT}/trainer/logs/dataset_visualization
-    visualize_filename: crafter_target_task_diamond_uniform_coverage.png #crafter_minitask_06_random_coverage.png
+    visualize_filename: crafter_target_task_diamond_random_coverage.png #crafter_minitask_06_random_coverage.png
     save_env_visualize: True
     env_visualize_save_path: ${oc.env:PROJECT_ROOT}/trainer/logs/env_visualization
-    env_visualize_filename: crafter_target_task_diamond_uniform_env.png #crafter_minitask_06_random_env.png
+    env_visualize_filename: crafter_target_task_diamond_random_env.png #crafter_minitask_06_random_env.png
 
 # 4. PPO model
 PPO:

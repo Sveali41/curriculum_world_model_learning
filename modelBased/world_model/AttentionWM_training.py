@@ -128,7 +128,8 @@ def run(
         # Watching adds hooks to the persistent 'net', which reference this temporary 'wandb_logger'.
         # When 'wandb_logger' is GC'ed after this function returns, the hooks break.
         if not cfg.attention_model.freeze_weight:
-            wandb_logger.experiment.watch(net, log='all', log_freq=1000)
+            # wandb_logger.experiment.watch(net, log='all', log_freq=1000)
+            pass
 
     # callbacks
     metric_to_monitor = 'avg_val_loss_wm'
@@ -248,12 +249,7 @@ def train_api(
         replay_data=replay_data
     )
 
-    if result["mode"] == "train":
-        return result["old_params"], result["fisher"], result["net"]
-
-    else:
-        # For validation mode, return avg_val_loss as the loss metric
-        return result["avg_val_loss"], None, result["net"]
+    return result  # Return the full dictionary for more flexibility
 
 
 

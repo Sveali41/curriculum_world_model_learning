@@ -442,10 +442,24 @@ def extract_loss_map_over_validations(
         loss_map = model.loss_map_result  # (H,W) array
 
         # Accumulate map
-        if sum_map is None:
-            sum_map = np.array(loss_map, dtype=np.float32)
+        if getattr(cfg.attention_model, "env_type", "") == "crafter":
+            # 提取标量的背包损失并在最底端铺满一整行，作为第 H 行的误差
+            loss_inv = 0.0
+            if isinstance(val_result, list) and len(val_result) > 0:
+                loss_inv = float(val_result[0].get('val/inv_loss', 0.0))
+            elif isinstance(val_result, dict):
+                loss_inv = float(val_result.get('val/inv_loss', 0.0))
+            
+            # 把背包误差拼接到地形误差下方，还原出 (H+1) x W 的完整画布误差
+            inv_row_error = np.full((1, loss_map.shape[1]), loss_inv, dtype=np.float32)
+            final_loss_map_for_this_step = np.vstack([loss_map, inv_row_error])
         else:
-            sum_map += loss_map
+            final_loss_map_for_this_step = loss_map
+            
+        if sum_map is None:
+            sum_map = np.array(final_loss_map_for_this_step, dtype=np.float32)
+        else:
+            sum_map += final_loss_map_for_this_step
 
         # Record scalar loss (val_result can be float, dict, or list of dict)
         if isinstance(val_result, list) and len(val_result) > 0:

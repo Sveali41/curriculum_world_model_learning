@@ -1,7 +1,12 @@
-GGCCGG
-GGAGGG
-GGCCGG
+GGGGGG
+IGAGGG
+IWWMCC
 
-# --- Minitask 04: Coal Mining ---
-health: 9
-wood_pickaxe: 1
+# --- Initial Stats(make table and make stone pickaxe and pick iron) ---
+coal: 4
+stone: 4
+stone_pickaxe: 1
+wood: 5
+food: 9
+drink: 9
+energy: 9

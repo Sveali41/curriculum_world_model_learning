@@ -72,34 +72,36 @@ def extract_tensor_grid(env):
     engine = get_engine(env)
     # Crafter engine returns (Width, Height) i.e. (Col, Row)
     W, H = engine.world_shape
-    # Return (Col, Row, Chan) to satisfy ColRowCanl_to_CanlRowCol expectations
-    grid = np.zeros((W, H, 2), dtype=np.int32)
+    # Return (Row, Col, Chan) standard format
+    grid = np.zeros((H, W, 2), dtype=np.int32)
 
     mat_map = engine.tile_map
     for x in range(W):
         for y in range(H):
             # mat_map is indexed (x, y) where x=col, y=row
             tile_val = int(mat_map[x, y]) if x < mat_map.shape[0] and y < mat_map.shape[1] else 0
-            grid[x, y, 0] = max(0, min(tile_val, 12))
+            grid[y, x, 0] = max(0, min(tile_val, 12))
 
     for ent in getattr(engine, "entities", []):
         ex, ey = int(ent.pos[0]), int(ent.pos[1])
         if not (0 <= ex < W and 0 <= ey < H):
             continue
         kind = type(ent).__name__.lower()
-        # grid[col, row] -> grid[ex, ey]
-        grid[ex, ey, 0] = ENTITY_ID.get(kind, 0)
+        # grid[row, col] -> grid[ey, ex]
+        grid[ey, ex, 0] = ENTITY_ID.get(kind, 0)
         if hasattr(ent, "facing"):
             dir_id = DIR_TO_ID.get(tuple(int(v) for v in ent.facing), 0)
-            grid[ex, ey, 1] = dir_id
+            grid[ey, ex, 1] = dir_id
 
     px, py = map(int, engine.player.pos)
-    grid[px, py, 0] = ENTITY_ID["player"]
+    # grid[row, col] -> grid[py, px]
+    grid[py, px, 0] = ENTITY_ID["player"]
     if hasattr(engine.player, "facing"):
         dir_id = DIR_TO_ID.get(tuple(int(v) for v in engine.player.facing), 0)
-        grid[px, py, 1] = dir_id
+        grid[py, px, 1] = dir_id
 
     return grid
+
 
 
 # ---------------------------------------------------------------------
@@ -197,6 +199,8 @@ CHAR_TO_TILE = {
     'L': 'lava',
     'P': 'path',
     'S': 'sand',
+    'X': 'table',
+    'U': 'furnace',
 }
 
 CHAR_TO_ENTITY = {
@@ -395,6 +399,25 @@ class CustomCrafterEnv(gym.Env):
 
         # Build custom map
         world, player = make_world_from_chars(self.char_grid, seed=self.seed)
+        
+        # --- Handle custom position/direction for uniform sampling ---
+        target_pos = kwargs.get('agent_pos', None)
+        target_dir = kwargs.get('agent_dir', None)
+        
+        if target_pos is not None:
+             # Use engine-native move to handle chunking and object tracking
+             try:
+                 world.move(player, np.array(target_pos, dtype=np.int32))
+             except Exception as e:
+                 print(f"[Warning] Failed to teleport to {target_pos}: {e}. Keeping default spawn.")
+
+
+
+
+        
+        if target_dir is not None:
+             player.facing = np.array(target_dir, dtype=np.float32)
+
         self.env._world = world
         self.env._player = player
 
@@ -421,6 +444,7 @@ class CustomCrafterEnv(gym.Env):
                     self.env._player.inventory[item] = amount
 
         return self._extract_obs(), {}
+
 
     def step(self, action):
         """
@@ -490,13 +514,13 @@ class CustomCrafterEnv(gym.Env):
                 material, _ = world[(x, y)]
                 if material is not None:
                     texture = textures.get(material, (unit, unit))
-                    engine._draw(canvas, np.array([x, y]) * unit, texture)
+                    engine._draw(canvas, (np.array([x, y]) * unit).astype(np.int32), texture)
                     
         # 2. Render all objects on top
         for obj in world.objects:
             pos = obj.pos
             texture = textures.get(obj.texture, (unit, unit))
-            engine._draw_alpha(canvas, pos * unit, texture)
+            engine._draw_alpha(canvas, (pos * unit).astype(np.int32), texture)
             
         # Optional: time-of-day lighting
         # For a clean full map view, we just return the daylight canvas
@@ -517,17 +541,17 @@ if __name__ == "__main__":
 
     layout_str = """
     GGIIGGG
-    GGAGGGW
-    GKGGGTG
+    GGAGXGW
+    GKGGGtG
     RGOPGGI
-    GWGGGGG
+    GWGUGGG
     GKGGGTG
     GWGGGGG
     """
 
     # --- 1. Create a custom environment from the layout string ---
     base_env = CustomCrafterEnv(layout_str=layout_str, seed=0)
-    base_env.ai_enabled = True  # keep deterministic (disable Cow/Zombie auto-movement)
+    base_env.ai_enabled = False  # keep deterministic (disable Cow/Zombie auto-movement)
 
     # --- 2. Reset the environment ---
     obs, _ = base_env.reset()

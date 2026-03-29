@@ -173,7 +173,16 @@ class FisherReplayBuffer:
 
         for b in range(B):
             # ID=13 for Crafter player, ID=10 for MiniGrid player
-            player_id = 13 if (obj_map[b] == 13).any() else 10
+            if (obj_map[b] == 13).any():
+                player_id = 13
+                # Crafter interactive: Tree(6), Stone(3/4), Coal(8), Iron(9), Diamond(10), Table(11), Furnace(12), Cow(14), Zombie(15), Skeleton(16), Plant(18)
+                # Note: ID 3/4 are Stone/Path in Crafter, ID 13 is Player
+                interactive_ids = [3, 4, 6, 8, 9, 10, 11, 12, 14, 15, 16, 18]
+            else:
+                player_id = 10
+                # MiniGrid interactive: door(4), key(5), lava(9)
+                interactive_ids = [4, 5, 9]
+
             agent_pos = (obj_map[b] == player_id).nonzero(as_tuple=False)
             if agent_pos.numel() == 0:
                 continue
@@ -190,7 +199,7 @@ class FisherReplayBuffer:
                 neighbors.append(obj_map[b, y, x + 1])
 
             for val in neighbors:
-                if val.item() in [4, 5, 9]:  # door or key or lava
+                if val.item() in interactive_ids:
                     near_mask[b] = True
                     break
 
@@ -307,6 +316,37 @@ class FisherReplayBuffer:
             indices_to_remove = np.random.choice(all_indices, size=num_to_remove, replace=False)
             indices_to_keep = sorted(list(set(all_indices) - set(indices_to_remove)))
             self.buffer = [self.buffer[i] for i in indices_to_keep]
+
+    def add_from_npz(self, path, current_sample_ratio=0.05, fisher_buffer_elements_ratio=0.5, target_shape=None):
+        """Helper to load data from npz and add to buffer using update_combined."""
+        if not os.path.exists(path):
+            print(f"[FisherBuffer] Warning: File not found {path}")
+            return
+        
+        try:
+            data = np.load(path, allow_pickle=True)
+            # Support both letter keys (a, b, c...) and descriptive string keys
+            key_map = {
+                'a': 'obs', 'b': 'obs_next', 'c': 'act', 'd': 'rew', 'e': 'done', 'f': 'info', 'g': 'inv', 'h': 'inv_next'
+            }
+            samples = {}
+            for k in data.files:
+                actual_k = key_map.get(k, k)
+                samples[actual_k] = data[k]
+            
+            # Additional safety for missing expected keys
+            if 'obs' not in samples and 'a' not in data.files:
+                 print(f"[FisherBuffer] Warning: No 'obs' or 'a' key found in {path}")
+            
+            self.update_combined(
+                samples, 
+                current_sample_ratio=current_sample_ratio,
+                fisher_buffer_elements_ratio=fisher_buffer_elements_ratio,
+                target_shape=target_shape
+            )
+            print(f"[FisherBuffer] Added samples from {os.path.basename(path)}. Buffer size: {len(self.buffer)}")
+        except Exception as e:
+            print(f"[FisherBuffer] Error loading {path}: {e}")
 
 
 

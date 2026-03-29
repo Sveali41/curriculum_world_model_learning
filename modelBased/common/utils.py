@@ -17,16 +17,16 @@ def map_to_nearest_value_support(tensor, valid_values):
     nearest_values = valid_values[indices]  # Get nearest values using indices
     return nearest_values
 
-def extract_masked_state_support(state, agent_position_yx, mask_size):
+def extract_masked_state_support(state, agent_position_yx, mask_size, pad_value=0):
     """
     state dimensions: (channels, rows, cols)
     """
     channels, rows, cols = state.shape
     y, x = agent_position_yx
     half = mask_size // 2
-    margin_data = state[:, 0, 0]
-    region = np.tile(margin_data.reshape(channels, 1, 1),
-                     (1, mask_size, mask_size))
+    
+    # 使用指定的 pad_value 初始化区域 (Crafter=1, MiniGrid=0)
+    region = np.full((channels, mask_size, mask_size), pad_value, dtype=state.dtype)
 
     src_slice_y = slice(max(y - half, 0), min(y + half + 1, rows))
     src_slice_x = slice(max(x - half, 0), min(x + half + 1, cols))

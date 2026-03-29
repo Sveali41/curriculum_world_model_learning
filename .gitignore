@@ -16,6 +16,7 @@ generator/visualize
 
 # ignore model files
 modelBased/models/
+modelBased/log/
 lightning_logs
 
 
