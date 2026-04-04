@@ -11,6 +11,9 @@ from domain.minigrid.minigrid_support import (
 )
 from domain.minigrid.minigrid_custom_env import *
 from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper
+from domain.bipedalwalker.bipedalwalker_support import (
+    wrap_env_from_text as wrap_bipedal_env_from_text,
+)
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import time
@@ -298,6 +301,7 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     obs = env.reset()[0]
     has_carried_key_this_episode = False  # 新增：本轮是否已经捡过钥匙
     step_in_episode = 0  # 当前 episode 中的 step 计数器
+    max_x_in_episode = 0.0  # BipedalWalker only: Odometry tracking
     collect_cfg = cfg.env.collect if hasattr(cfg, "env") else cfg.collect
     if hasattr(collect_cfg, "env_type") and collect_cfg.env_type:
         task_name = str(collect_cfg.env_type).lower()
@@ -306,6 +310,8 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     else:
         task_name = ""
     is_crafter = ("crafter" in task_name)
+    is_bipedal = ("bipedal" in task_name)
+    is_minigrid = (not is_crafter) and (not is_bipedal)
     data_type = str(getattr(collect_cfg, "data_type", "")).lower()
     maximum_dataset_size = getattr(collect_cfg, "maximum_dataset_size", None)
 
@@ -380,6 +386,16 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
                 except Exception:
                     img = env.render()
         
+        # fix: Extract actual image array if nested in tuple
+        while isinstance(img, tuple) or isinstance(img, list):
+            img = img[0]
+            
+        if not isinstance(img, np.ndarray):
+            try:
+                img = np.array(img)
+            except:
+                pass
+        
         # --- save locally ---
         env_vis_path = getattr(collect_cfg, "env_visualize_save_path", getattr(cfg.env, "visualize_save_path", "trainer/logs/env_visualization"))
         os.makedirs(env_vis_path, exist_ok=True)
@@ -416,6 +432,16 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     # Define meaningful actions (forward, turn_left, turn_right)
     if is_crafter:
         meaningful_actions = list(range(env.action_space.n))
+    elif is_bipedal:
+        meaningful_actions = None
+        # Initialize the heuristic policy to be used as a 30% prior if no external policy is given
+        if policy is None:
+            from domain.bipedalwalker.bipedalwalker_support import BipedalHeuristicPolicy
+            # Extract prior weight from cfg.domains.bipedalwalker if available, specific only to BipedalWalker
+            prior_weight = 0.3
+            if hasattr(cfg, "domains") and "bipedalwalker" in cfg.domains:
+                prior_weight = getattr(cfg.domains.bipedalwalker, "bipedal_prior_weight", 0.3)
+            bipedal_prior_policy = BipedalHeuristicPolicy(prior_weight=prior_weight)
     else:
         meaningful_actions = [
             env.unwrapped.actions.forward,
@@ -507,6 +533,17 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
                     action_probs = np.ones(len(meaningful_actions), dtype=np.float32)
                     action_probs /= action_probs.sum()
                     act = np.random.choice(meaningful_actions, p=action_probs)
+            elif is_bipedal:
+                if policy is None:
+                    # Use the 30% heuristic prior + noise instead of pure sample()
+                    act = bipedal_prior_policy.select_action(obs_image, add_noise=True)
+
+                else:
+                    act = policy.select_action(obs_image)
+                    if torch.is_tensor(act):
+                        act = act.detach().cpu().numpy()
+                    act = np.asarray(act, dtype=np.float32).reshape(env.action_space.shape)
+                    act = np.clip(act, env.action_space.low, env.action_space.high)
             else:
                 action_probs = [0.2, 0.2, 0.2, 0.2, 0.2] # simplified for demo
                 if policy is None:
@@ -521,6 +558,12 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
             # --- 3. Step in Environment ---
             obs_next, reward, done, trunc, info = env.step(act)
 
+            # --- BipedalWalker Odometry Update ---
+            if is_bipedal:
+                current_x = getattr(env.unwrapped, "hull", None).position[0] if hasattr(env.unwrapped, "hull") else 0.0
+                max_x_in_episode = max(max_x_in_episode, current_x)
+
+
             # --- P2E: Override reward with intrinsic if provided ---
             if intrinsic_reward_fn is not None:
                 obs_next_image = obs_next['image'] if isinstance(obs_next, dict) else obs_next
@@ -528,7 +571,7 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
                 if policy is not None and hasattr(policy, "record_transition"):
                     policy.record_transition(float(reward), bool(done))
 
-            if not is_crafter and hasattr(env, "env") and getattr(env.env, "carrying", None) is not None:
+            if is_minigrid and hasattr(env, "env") and getattr(env.env, "carrying", None) is not None:
                 info['carrying_key'] = (env.env.carrying.type == 'key')
             else:
                 info['carrying_key'] = False
@@ -584,7 +627,11 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
 
 
             # Update visit count and RMax exploration
-            state_action_key = (tuple(np.asarray(obs_image).flatten()), int(act))
+            if is_bipedal:
+                act_key = tuple(np.asarray(act).reshape(-1).tolist())
+            else:
+                act_key = int(act)
+            state_action_key = (tuple(np.asarray(obs_image).flatten()), act_key)
             visit_count[state_action_key] = visit_count.get(state_action_key, 0) + 1
             if rmax_exploration is not None:
                 rmax_exploration.update_visit_count(obs_image, act)
@@ -600,6 +647,11 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
                 episodes += 1
                 pbar.update(1)
                 
+                # --- BipedalWalker Odometry Print ---
+                if is_bipedal:
+                    pbar.write(f"[Episode {episodes}] Finished. Max Travel Distance: {max_x_in_episode:.2f}m")
+                    max_x_in_episode = 0.0  # Reset
+                
                 # --- BOOST 2: Exhaustive Spawning (Cycling through all tiles) ---
                 reset_kwargs = {}
                 if randomize_inventory and is_crafter:
@@ -607,6 +659,10 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
                     if sp: reset_kwargs['agent_pos'] = sp
 
                 obs = env.reset(**reset_kwargs)[0]
+                
+                # Reset heuristic internal state on done
+                if is_bipedal and policy is None:
+                    bipedal_prior_policy.reset()
                 
                 if randomize_inventory and is_crafter:
                     player = env.unwrapped.env._player
@@ -635,7 +691,7 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     obs_next_np = np.concatenate(obs_next_list)
     act_np = np.concatenate(act_list)
     # Only for MiniGrid convention.
-    if not is_crafter:
+    if is_minigrid:
         act_np[act_np == 5] = 4
     rew_np = np.concatenate(rew_list)
     done_np = np.concatenate(done_list)
@@ -678,7 +734,6 @@ def teleport_near_important_tiles(env, obs, step_in_episode, interval):
         return
 
     import random
-    import numpy as np
 
     grid_type = obs['image'][:, :, 0]  # tile type channel
 
@@ -940,16 +995,22 @@ def uniform_collect_data_postprocess(env, cfg, wandb_run, log_name, policy=None,
 
 
 def save_experiments(cfg: DictConfig, obs, obs_next, act, rew, done, info=None, inv=None, inv_next=None):
-    # Detect environment type from channel dimension
-    # Crafter symbolic grid has C=2, MiniGrid has C=3
-    if obs.shape[-1] == 2:
-        # Crafter: (N, H, W, C) -> (N, C, H, W) without swapping spatial H and W
-        obs = np.moveaxis(obs, -1, 1)
-        obs_next = np.moveaxis(obs_next, -1, 1)
+    # Grid observations (MiniGrid/Crafter) are 4-D; vector observations (e.g., Bipedal) are 2-D.
+    if obs.ndim == 4:
+        # Crafter symbolic grid has C=2 in the last axis before conversion.
+        if obs.shape[-1] == 2:
+            # Crafter: (N, H, W, C) -> (N, C, H, W)
+            obs = np.moveaxis(obs, -1, 1)
+            obs_next = np.moveaxis(obs_next, -1, 1)
+        else:
+            # MiniGrid: (N, Col, Row, Canl) -> (N, Canl, Row, Col)
+            obs = ColRowCanl_to_CanlRowCol(obs)
+            obs_next = ColRowCanl_to_CanlRowCol(obs_next)
+    elif obs.ndim == 2:
+        obs = obs.astype(np.float32, copy=False)
+        obs_next = obs_next.astype(np.float32, copy=False)
     else:
-        # MiniGrid: (N, Col, Row, Canl) -> (N, Canl, Row, Col) i.e. (0, 3, 2, 1)
-        obs = ColRowCanl_to_CanlRowCol(obs)
-        obs_next = ColRowCanl_to_CanlRowCol(obs_next)
+        raise ValueError(f"Unsupported observation shape for saving: {obs.shape}")
     save_path = cfg.collect.data_save_path
     save_dir = os.path.dirname(save_path)
     if save_dir:
@@ -1157,7 +1218,7 @@ def downsample_moves_only(
 @hydra.main(version_base=None, config_path = str(WORLD_MODEL_PATH / "config"), config_name="config")
 def data_collect(cfg: DictConfig):
     env_type = str(getattr(cfg.env, "env_type", "")).lower()
-    mode = 'human' if getattr(cfg.env, "visualize", False) else None
+    mode = 'human' if getattr(cfg.env, "visualize", False) else 'rgb_array'
 
     if env_type == "crafter":
         # Workaround for numba cache issues seen in some environments when importing crafter.
@@ -1174,6 +1235,17 @@ def data_collect(cfg: DictConfig):
         else:
             env = CustomCrafterEnv(max_steps=max_steps,
                                    ai_enabled=stochastic, slippery_prob=slippery_prob)
+    elif env_type == "bipedalwalker":
+        if mode != 'human':
+            # 强制 PyGame 不要创建任何物理窗口（部分系统 HIDDEN 依然会闪屏）
+            os.environ["SDL_VIDEODRIVER"] = "dummy"
+        
+        env_path = getattr(cfg.env, "env_path", None)
+        from domain.bipedalwalker.custom_bipedal_env import CustomBipedalEnv
+        if env_path and os.path.exists(env_path):
+            env = wrap_bipedal_env_from_text(env_path, render_mode=mode)
+        else:
+            env = CustomBipedalEnv(render_mode=mode)
     else:
         env_path = getattr(cfg.env, "env_path", None)
         max_steps = getattr(cfg.env, "max_steps", 10000)
@@ -1204,6 +1276,10 @@ def data_collect(cfg: DictConfig):
         os.makedirs(vis_save_path, exist_ok=True)
         save_path = os.path.join(vis_save_path, filename)
         data = np.load(data_path, allow_pickle=True)
+        if data["a"].ndim < 4:
+            print(f"[Visualization] Skipped coverage plot for non-grid observation shape: {data['a'].shape}")
+            env.close()
+            return
 
         collect_cfg = cfg.env.collect if hasattr(cfg.env, "collect") else cfg.env
         dataset_type = getattr(collect_cfg, "data_type", "Random")
@@ -1347,6 +1423,10 @@ def _finalize_and_save(cfg, env, obs_all, obsn_all, act_all, rew_all, done_all, 
         filename = getattr(cfg.env.collect, "visualize_filename", None)
         save_path = os.path.join(cfg.env.collect.visualize_save_path, filename)
         data = np.load(data_path, allow_pickle=True)
+        if data["a"].ndim < 4:
+            print(f"[Visualization] Skipped coverage plot for non-grid observation shape: {data['a'].shape}")
+            env.close()
+            return obs_all, obsn_all, act_all, rew_all, done_all, info_all
 
         collect_cfg = cfg.env.collect if hasattr(cfg.env, "collect") else cfg.env
         dataset_type = getattr(collect_cfg, "data_type", "Random")
@@ -1404,38 +1484,41 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
     # -------------------------------
     # Step 3: Handle Inventory Stats if available
     # -------------------------------
-    inv_stats = None
-    if 'g' in data:
-        inv_data = data['g']
-        if len(inv_data.shape) == 2:
-            # Calculate non-zero occurrence rate (Frequency %)
-            inv_stats = np.mean(inv_data > 0, axis=0) * 100
-            inv_labels = [
-                'Health', 'Food', 'Drink', 'Energy', 
-                'Wood', 'Stone', 'Coal', 'Iron', 'Diamond', 'Sapling',
-                'Wood_Pickaxe', 'Stone_Pickaxe', 'Iron_Pickaxe', 
-                'Wood_Sword', 'Stone_Sword', 'Iron_Sword'
-            ]
+    import matplotlib
+    if save_path:
+        matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
 
-    # -------------------------------
-    # Step 4: 绘图
-    # -------------------------------
-    if inv_stats is not None:
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+    if 'g' in data and len(data['g']) > 0:
+        inv_data = data['g']
+        if len(inv_data.shape) == 3: # (N, _, 16)
+            inv_data = inv_data[:, 0, :]
+        max_inv = np.max(inv_data, axis=0)
         
-        # Heatmap
+        inv_labels = ['Health', 'Food', 'Drink', 'Energy', 
+                     'Wood', 'Stone', 'Coal', 'Iron', 'Diamond', 'Sapling', 
+                     'Wood_Pickaxe', 'Stone_Pickaxe', 'Iron_Pickaxe', 
+                     'Wood_Sword', 'Stone_Sword', 'Iron_Sword']
+                     
+        inv_stats = np.mean(inv_data > 0, axis=0) * 100
+        
+        # Create a figure with two subplots: Heatmap and Bar chart
+        fig = plt.figure(figsize=(14, 6))
+        
+        # 1. Heatmap
+        ax1 = plt.subplot(1, 2, 1)
         im = ax1.imshow(heatmap, cmap="viridis", origin="upper")
-        ax1.set_title(title)
-        ax1.set_xlabel("X (Columns/Width)")
-        ax1.set_ylabel("Y (Rows/Height)")
-        fig.colorbar(im, ax=ax1, label="Occurrences")
+        ax1.set_title(title, fontsize=12, fontweight='bold')
+        ax1.set_xlabel("X axis")
+        ax1.set_ylabel("Y axis")
+        plt.colorbar(im, ax=ax1, label="Occurrences", fraction=0.046, pad=0.04)
         
-        # Inventory Presence Frequency
-        # Define Color Groups: Stats (Blue), Materials (Green), Tools/Weapons (Red/Orange)
+        # 2. Inventory Stats
+        ax2 = plt.subplot(1, 2, 2)
         colors = ['#3498db']*4 + ['#2ecc71']*6 + ['#e74c3c']*3 + ['#f39c12']*3
+        bars = ax2.bar(range(len(inv_labels)), inv_stats, color=colors, alpha=0.8, edgecolor='black')
         
-        ax2.bar(inv_labels, inv_stats, color=colors, alpha=0.8, edgecolor='black', linewidth=0.5)
-        ax2.set_title("Tech-State Coverage (Items Presence %)")
+        ax2.set_title("Agent Inventory Acquisition Rate", fontsize=12, fontweight='bold')
         ax2.set_ylabel("Presence Rate (%)")
         ax2.set_ylim(0, 115) # Leave space for text
         ax2.set_xticks(range(len(inv_labels)))

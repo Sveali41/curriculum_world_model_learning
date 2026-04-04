@@ -100,7 +100,7 @@ class DiversityModule(nn.Module):
         super().__init__()
         self.k = k
         self.max_size = max_archive_size
-        self.archive = [] 
+        self.archive = []
         self.env_type = env_type
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

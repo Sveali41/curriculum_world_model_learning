@@ -56,24 +56,22 @@ class RandomGeneratorAgent:
         # Slots 0-15 (Key 0-15): Inc by 1
         # Slots 0-15 (Key 16-31): Inc by 5
         num_keys = 32
-        stats_action = torch.zeros((B, num_keys), device=self.device)
         
-        # How many keys to press?
-        k_stats = max(1, int(round(max_stats_edit_ratio * num_keys)))
-        
-        for b in range(B):
-            # Randomly pick indices to modify
-            indices_stats = np.random.choice(num_keys, k_stats, replace=False)
-            # Binary actions (0 or 1)
-            stats_action[b, indices_stats] = 1.0
+        # [Fix] Treat max_stats_edit_ratio as an independent probability for each slot
+        # This completely removes the artificial constraint of exactly 'k' items, 
+        # unlocking true power-set permutations just like independent PPO outputs.
+        p = max(0.0, min(1.0, max_stats_edit_ratio))
+        rand_tensor = torch.rand((B, num_keys), device=self.device)
+        stats_action = (rand_tensor < p).float()
             
         # --- 3. Dummies ---
         logprob = torch.zeros(B, device=self.device)
         value = torch.zeros(B, device=self.device)
         topk_mask = torch.ones((B, self.num_actions), device=self.device)
+        topk_stats_mask = torch.ones((B, num_keys), device=self.device, dtype=torch.bool)
         global_ctx = torch.zeros((1, 64), device=self.device)
 
-        return action, stats_action, logprob, value, topk_mask, global_ctx
+        return action, stats_action, logprob, value, topk_mask, topk_stats_mask, global_ctx
 
     def update(self, *args, **kwargs):
         """No-op update for random agent"""

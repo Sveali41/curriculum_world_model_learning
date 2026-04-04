@@ -17,6 +17,7 @@ from . import AttentionWM_support
 from . import Embedding_support
 from . import MLP_support
 import pandas as pd
+import numpy as np
 
 
 class AttentionWorldModel(pl.LightningModule):
@@ -37,6 +38,9 @@ class AttentionWorldModel(pl.LightningModule):
         self.lambda_ewc = float(getattr(hparams, "lambda_ewc", 1.0))
         self.loss_accumulator = [[[] for _ in range(self.col)] for _ in range(self.row)]
         self.loss_map_result = None
+        self.inventory_loss_vector_result = None
+        self.inventory_loss_accumulator = []
+        self._val_step_outputs = []
 
 
 
@@ -49,6 +53,8 @@ class AttentionWorldModel(pl.LightningModule):
         self.old_params = None
         self.env_type = hparams.env_type
         self.frame_stack = getattr(hparams, "frame_stack", 1)
+        self.use_bipedal_flag = bool(getattr(hparams, "use_bipedal_attention", False))
+        self.is_bipedal = bool(self.use_bipedal_flag or self.env_type == "bipedalwalker")
         MODEL_MAPPING = {
             'attention': AttentionWM_support.AttentionModule,
             'embedding': Embedding_support.EmbeddingModule,
@@ -63,7 +69,7 @@ class AttentionWorldModel(pl.LightningModule):
                 hparams.attention_mask_size, 
                 hparams.embed_dim, 
                 hparams.num_heads,
-                env_type=self.env_type,
+                env_type="bipedalwalker" if self.is_bipedal else self.env_type,
                 frame_stack=self.frame_stack
             )
         else:
@@ -494,6 +500,17 @@ class AttentionWorldModel(pl.LightningModule):
         Returns:
             feat: (B, N, embed_dim) spatial token features after conv+positional encoding
         """
+        if getattr(self, "is_bipedal", False) and hasattr(self.model, "state_tokenizer"):
+            with torch.no_grad() if not self.training else torch.enable_grad():
+                if state.ndim == 1:
+                    state = state.unsqueeze(0)
+                state = state.float()
+                B = state.shape[0]
+                x = state.view(B, self.model.num_tokens, self.model.token_dim)
+                x = self.model.state_tokenizer(x)
+                x = x + self.model.pos_embedding
+            return x
+
         if not hasattr(self.model, 'conv1'):
             # Fallback: flatten the obs as a simple feature
             B = state.shape[0]
@@ -565,6 +582,9 @@ class AttentionWorldModel(pl.LightningModule):
         """
         device = next_observations_predict.device 
         use_weighted_loss = getattr(self.hparams, "use_weighted_loss", False)
+        if self.is_bipedal:
+            loss = F.mse_loss(next_observations_predict, next_observations_true)
+            return {"loss_obs": loss}
         
         # 1. Base Loss (MSE for MiniGrid, CrossEntropy for Crafter)
         if self.env_type == 'crafter':
@@ -667,6 +687,10 @@ class AttentionWorldModel(pl.LightningModule):
         inv = batch.get('inv', None)
         inv_next = batch.get('inv_next', None)
 
+        if self.is_bipedal:
+            self.step_counter += 1
+            return obs.float(), act.float(), obs_next.float(), None, None, None, None, None
+
         player_id = 13 if self.env_type == 'crafter' else 10
         agent_postion_yx_batch = minigrid_utils.get_agent_position(obs, player_id=player_id)
         obs_masked = minigrid_utils.extract_masked_state(obs, self.mask_size, agent_postion_yx_batch)
@@ -703,7 +727,7 @@ class AttentionWorldModel(pl.LightningModule):
         except:
             pass
             
-        if self.visualizationFlag and is_last_epoch and (self.step_counter % self.visualize_every == 0):
+        if self.visualizationFlag and (not self.is_bipedal) and is_last_epoch and (self.step_counter % self.visualize_every == 0):
             if self.env_type == 'crafter':
                 visualize_crafter_wm(obs, obs_next, obs_pred, int(act[0].item()), self.step_counter, 
                                      save_dir=os.path.join("modelBased/log", "wm_visual/train"),
@@ -812,12 +836,16 @@ class AttentionWorldModel(pl.LightningModule):
             for i in range(batch_size):
                 agent_pos = agent_position[i].tolist()  # (y, x)
                 self.accumulate_loss(loss_map[i], agent_pos)
+            if self.env_type == 'crafter' and inv_pred is not None and inv_next is not None:
+                # Slot-wise inventory error signal for generator context (shape [16])
+                inv_slot_mse = F.mse_loss(inv_pred, inv_next.float(), reduction='none').mean(dim=0)
+                self.inventory_loss_accumulator.append(inv_slot_mse.detach().cpu())
   
         if obs_next.dtype != obs_pred.dtype:
             obs_next = obs_next.float()
         
         # [NEW] Crafter WM Visualization for Validation (Dataset 2)
-        if self.visualizationFlag and batch_idx == 0:
+        if self.visualizationFlag and (not self.is_bipedal) and batch_idx == 0:
             if self.env_type == 'crafter':
                 visualize_crafter_wm(obs, obs_next, obs_pred, int(act[0].item()), self.step_counter, 
                                      save_dir=os.path.join("modelBased/log", "wm_visual/val"),
@@ -850,14 +878,19 @@ class AttentionWorldModel(pl.LightningModule):
 
         # No longer logging redundant "val_loss" here as we log "avg_val_loss_wm" at epoch end.
 
+        self._val_step_outputs.append(loss_val.detach())
+
         return {
             "loss_wm_val": loss_val,             
         }
 
-    def validation_epoch_end(
-        self, outputs: List[Dict[str, torch.Tensor]]
-    ) -> Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor]]]:
+    def on_validation_epoch_start(self):
+        self._val_step_outputs = []
+        if getattr(self.hparams, "keep_cell_loss", False):
+            self.loss_accumulator = [[[] for _ in range(self.col)] for _ in range(self.row)]
+            self.inventory_loss_accumulator = []
 
+    def on_validation_epoch_end(self):
         if getattr(self.hparams, "keep_cell_loss", False):
             avg_loss_map = torch.zeros((self.row, self.col), device=self.device)
             for y in range(self.row):
@@ -866,23 +899,23 @@ class AttentionWorldModel(pl.LightningModule):
                     avg_loss_map[y, x] = sum(vals) / len(vals) if vals else 0
 
             self.loss_map_result = avg_loss_map.cpu().numpy()
-        # 保存为 CSV（不包含 index）
-        # df.to_csv("validation_21*21_emb_mask5.csv", index=False, header=False)
-        # 绘制 loss 变化曲线
-        # import matplotlib.pyplot as plt
-        # plt.figure(figsize=(8, 5))
-        # plt.plot(batch_indices, losses, marker="o", linestyle="-")
-        # plt.xlabel("Batch Index")
-        # plt.ylabel("Validation Loss")
-        # plt.title("Validation Loss per Batch")
-        # plt.grid(True)
-
-        avg_loss = torch.stack([x["loss_wm_val"] for x in outputs]).mean()
-        self.log("avg_val_loss_wm", avg_loss)
+            if self.env_type == 'crafter':
+                if len(self.inventory_loss_accumulator) > 0:
+                    stacked = torch.stack(self.inventory_loss_accumulator, dim=0)  # [num_batches, 16]
+                    self.inventory_loss_vector_result = stacked.mean(dim=0).numpy().astype(np.float32)
+                else:
+                    self.inventory_loss_vector_result = np.zeros(16, dtype=np.float32)
+            self.inventory_loss_accumulator = []
+            # Clear cell-level history to avoid memory growth across repeated validations.
+            self.loss_accumulator = [[[] for _ in range(self.col)] for _ in range(self.row)]
         
-        return {
-            "avg_val_loss_wm": avg_loss,
-        }
+        if len(self._val_step_outputs) > 0:
+            avg_loss = torch.stack(self._val_step_outputs).mean()
+        else:
+            avg_loss = torch.tensor(0.0, device=self.device)
+
+        self.log("avg_val_loss_wm", avg_loss)
+        self._val_step_outputs = []
 
     def on_save_checkpoint(self, checkpoint):
         # Example checkpoint customization: removing specific keys if needed
@@ -929,4 +962,3 @@ class AttentionWorldModel(pl.LightningModule):
 
 
    
-

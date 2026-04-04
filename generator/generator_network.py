@@ -170,23 +170,43 @@ class MapEditorActorCritic(nn.Module):
         action_logprob = dist.log_prob(action)
 
         # B. Stats (32 Piano Buttons) Sampling
-        global_vec = F.adaptive_avg_pool2d(features, (1, 1)).view(B, -1)
+        # [Fix 1] Use MaxPool instead of AvgPool to capture the presence of sparse objects
+        global_vec = F.adaptive_max_pool2d(features, (1, 1)).view(B, -1)
         if stats_heat is None:
             stats_heat = torch.zeros(B, 16, device=map_vec.device)
         global_vec = torch.cat([global_vec, stats_heat], dim=1)
         
         logits_stats = self.stats_actor(global_vec).view(B, self.num_stats_slots, self.num_stats_actions)
         topk_stats_mask = self._get_stats_topk_mask(logits_stats, max_stats_edit_ratio)
-        logits_stats[:, :, 0].masked_fill_(~topk_stats_mask, 1e9)
-        logits_stats[:, :, 1].masked_fill_(~topk_stats_mask, -1e9)
+        # [Fix 2] Remove Hard Masking on logits to fix the DEAD GRADIENT issue. 
+        # Let PPO learn natively without 1e9 jumping discontinuities.
+        # logits_stats[:, :, 0].masked_fill_(~topk_stats_mask, 1e9)
+        # logits_stats[:, :, 1].masked_fill_(~topk_stats_mask, -1e9)
         stats_dist = Categorical(logits=logits_stats)
         stats_action = stats_dist.sample()
         stats_logprob = stats_dist.log_prob(stats_action).sum(dim=-1)
 
         value = self.critic(features)
-        return action.detach(), stats_action.detach(), action_logprob.detach(), stats_logprob.detach(), value.detach(), topk_mask.detach()
+        return (
+            action.detach(),
+            stats_action.detach(),
+            action_logprob.detach(),
+            stats_logprob.detach(),
+            value.detach(),
+            topk_mask.detach(),
+            topk_stats_mask.detach(),
+        )
 
-    def evaluate(self, map_vec, context_vec, action_tuple, action_mask=None, target_topk_mask=None, stats_heat=None):
+    def evaluate(
+        self,
+        map_vec,
+        context_vec,
+        action_tuple,
+        action_mask=None,
+        target_topk_mask=None,
+        target_stats_topk_mask=None,
+        stats_heat=None,
+    ):
         terrain_action, stats_action = action_tuple
         features = self.forward_features(map_vec, context_vec)
         B, _, H, W = map_vec.shape
@@ -201,12 +221,17 @@ class MapEditorActorCritic(nn.Module):
         dist_entropy = dist.entropy().mean()
 
         # B. Stats Eval
-        global_vec = F.adaptive_avg_pool2d(features, (1, 1)).view(B, -1)
+        # [Fix 1] MaxPool matching the inference code above
+        global_vec = F.adaptive_max_pool2d(features, (1, 1)).view(B, -1)
         if stats_heat is None:
             stats_heat = torch.zeros(B, 16, device=map_vec.device)
         global_vec = torch.cat([global_vec, stats_heat], dim=1)
         
         logits_stats = self.stats_actor(global_vec).view(B, self.num_stats_slots, self.num_stats_actions)
+        # [Fix 2] Removed evaluation target hard masking matching inference
+        # if target_stats_topk_mask is not None:
+        #     logits_stats[:, :, 0].masked_fill_(~target_stats_topk_mask, 1e9)
+        #     logits_stats[:, :, 1].masked_fill_(~target_stats_topk_mask, -1e9)
         stats_dist = Categorical(logits=logits_stats)
         stats_logprobs = stats_dist.log_prob(stats_action).sum(dim=-1)
         stats_entropy = stats_dist.entropy().mean()

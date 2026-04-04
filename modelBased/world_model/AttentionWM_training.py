@@ -17,6 +17,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 import wandb
 import numpy as np
 from modelBased.common.utils import TRAINER_PATH
+from omegaconf import open_dict
 
 
 # === Define Custom Datamodule for Validation ===
@@ -29,7 +30,7 @@ class ValidationDataModule(WMRLDataModule):
             loaded = np.load(self.data_dir, allow_pickle=True)
         
         # Create dataset
-        data = WMRLDataset(loaded, self.hparams, self.replay_data)
+        data = WMRLDataset(loaded, self.cfg, self.replay_data)
         
         # Use 100% data for test
         # Create a Subset that covers the full range
@@ -42,10 +43,10 @@ class ValidationDataModule(WMRLDataModule):
     def val_dataloader(self):
         return torch.utils.data.DataLoader(
             self.data_test, 
-            batch_size=self.hparams.batch_size, 
+            batch_size=self.cfg.batch_size, 
             shuffle=False, 
             drop_last=False, # Allow small batches
-            num_workers=self.hparams.n_cpu,
+            num_workers=self.cfg.n_cpu,
             pin_memory=True,
             persistent_workers=False
         )
@@ -97,6 +98,10 @@ def run(
     replay_data=None,
     direct_data=None
 ):
+    if bool(getattr(cfg.attention_model, "train_bipedalwalker", False)):
+        with open_dict(cfg):
+            cfg.attention_model.env_type = "bipedalwalker"
+
     if net is None:
         from modelBased.world_model.AttentionWM import AttentionWorldModel
         net = AttentionWorldModel(cfg.attention_model)

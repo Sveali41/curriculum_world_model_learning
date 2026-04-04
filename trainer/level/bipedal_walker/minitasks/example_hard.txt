@@ -1,0 +1,2 @@
+# Hard long track
+G20 S3.0 P4 T4 P4 T-3 S2.0 G10 P5 T3 G20

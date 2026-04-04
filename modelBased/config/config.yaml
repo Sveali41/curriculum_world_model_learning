@@ -1,21 +1,66 @@
+domain: bipedalwalker  # crafter | minigrid | bipedalwalker
+
+domains:
+  crafter:
+    env_type: crafter
+    max_steps: 10000
+    grid_shape: [2, 0, 0]
+    attention_mask_size: 5
+    obs_norm_values: [20, 5, 0]
+    action_norm_values: 17
+    env_path: ${oc.env:TRAINER_PATH}/level/crafter/crafter_target_task_diamond.txt
+    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_target_task_diamond_random.npz
+    validation_data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_train_random_2.npz
+    visualize_filename: crafter_target_task_diamond_random_coverage.png
+    env_visualize_filename: crafter_target_task_diamond_random_env.png
+
+  minigrid:
+    env_type: minigrid
+    max_steps: 10000
+    grid_shape: [3, 0, 0]
+    attention_mask_size: 3
+    obs_norm_values: [10, 5, 3]
+    action_norm_values: 7
+    env_path: ${oc.env:TRAINER_PATH}/level/level.txt
+    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/minigrid_train_random.npz
+    validation_data_dir: null
+    visualize_filename: minigrid_train_random_coverage.png
+    env_visualize_filename: minigrid_train_random_env.png
+
+  bipedalwalker:
+    env_type: bipedalwalker
+    max_steps: 1600
+    grid_shape: [1, 1, 24]
+    attention_mask_size: 5
+    obs_norm_values: [1]
+    action_norm_values: 4
+    env_path: ${oc.env:TRAINER_PATH}/level/bipedal_walker/minitasks/example_easy.txt
+    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/bipedalwalker_train_random.npz
+    validation_data_dir: null
+    visualize_filename: bipedalwalker_train_random_coverage.png
+    env_visualize_filename: bipedalwalker_train_random_env.png
+    bipedal_prior_weight: 0.5  # 30% prior weight for heuristic vs random noise
+
+
 attention_model:
-  env_type: ${env.env_type}
+  env_type: ${domains.${domain}.env_type}
+  use_bipedal_attention: False
   data_type: discrete # 'norm' or 'discrete' 
   model_type: Attention       # Attention, Embedding, MLP
-  grid_shape: [2, 0, 0]  # Crafter=2(obj+dir), MiniGrid=3
-  attention_mask_size: 3
+  grid_shape: ${domains.${domain}.grid_shape}
+  attention_mask_size: ${domains.${domain}.attention_mask_size}
   batch_size: 256  # larger batch → better GPU utilization
   n_cpu: 4  # 4 workers is enough; too many causes overhead
   embed_dim: 128  # 128 64/128/256
   num_heads: 1   # 1 if the embed_dim is 64, num_heads should better be 1
   data_dir: ${env.collect.data_save_path}
   # After training on data_dir, validate on this second dataset (set to null to skip)
-  validation_data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_train_random_2.npz
+  validation_data_dir: ${domains.${domain}.validation_data_dir}
   n_epochs: 25 # 30
   lr: 5e-4 # 1e-4 
   wd: 1e-5
-  obs_norm_values: [10, 5, 3] # will be overridden in code if crafter
-  action_norm_values: 5 
+  obs_norm_values: ${domains.${domain}.obs_norm_values}
+  action_norm_values: ${domains.${domain}.action_norm_values}
   valid_values_obj: [1, 2, 4, 5, 8, 10]                                                             
   valid_values_color: [0, 1, 5]
   valid_values_state: [0, 1, 2, 3]
@@ -57,10 +102,10 @@ attention_model:
 env:
   # For Crafter collection, env_path is not used by CustomCrafterEnv.
   # Keep it for backward compatibility with MiniGrid scripts.
-  env_path: ${oc.env:TRAINER_PATH}/level/crafter/crafter_target_task_diamond.txt
+  env_path: ${domains.${domain}.env_path}
   visualize: False
-  env_type: crafter
-  max_steps: 10000
+  env_type: ${domains.${domain}.env_type}
+  max_steps: ${domains.${domain}.max_steps}
   crafter:
     stochastic: False     # False = entities frozen (zombie/cow don't move)
     slippery_prob: 0.0     # 0.0 = fully deterministic for initial validation
@@ -69,14 +114,14 @@ env:
     uniform_reset_steps: 5000
     episodes: 1000
     mini_dataset_size: 8000
-    maximum_dataset_size: 100000 
-    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_target_task_diamond_random.npz #crafter_minitask_06.npz
+    maximum_dataset_size: 10000 
+    data_save_path: ${domains.${domain}.data_save_path}
     save_coverage_visualize: True
     visualize_save_path: ${oc.env:PROJECT_ROOT}/trainer/logs/dataset_visualization
-    visualize_filename: crafter_target_task_diamond_random_coverage.png #crafter_minitask_06_random_coverage.png
+    visualize_filename: ${domains.${domain}.visualize_filename}
     save_env_visualize: True
     env_visualize_save_path: ${oc.env:PROJECT_ROOT}/trainer/logs/env_visualization
-    env_visualize_filename: crafter_target_task_diamond_random_env.png #crafter_minitask_06_random_env.png
+    env_visualize_filename: ${domains.${domain}.env_visualize_filename}
 
 # 4. PPO model
 PPO:

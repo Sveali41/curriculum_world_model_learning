@@ -183,7 +183,7 @@ class GeneratorInterface:
 
 
         # 3. select dual actions
-        actions, stats_actions, logp, values, topk_action_mask, _ = self.ppo.select_action(
+        actions, stats_actions, logp, values, topk_action_mask, topk_stats_action_mask, _ = self.ppo.select_action(
             curr_map, ppo_input_context, mask, self.max_edits_layout, self.max_edits_inventory
         )
 
@@ -255,7 +255,15 @@ class GeneratorInterface:
             is_connected_final = is_connected if self.is_crafter else solved
             r_div = self.diversity.get_reward(torch.tensor(final_map_2ch).unsqueeze(0).to(self.device), inventory_vec=final_stats)
             div_rewards.append(r_div)
-            reward = self._calculate_reward(raw_loss_val, r_div, is_connected_final, is_warmup, inv_diversity=inv_changed_slots)
+            reward = self._calculate_reward(
+                raw_loss_val,
+                r_div,
+                is_connected_final,
+                is_warmup,
+                inv_diversity=inv_changed_slots,
+                ce_loss=t_loss_batch,
+                inv_loss=i_loss_batch,
+            )
             
             if not traj or 'obs' not in traj:
                 reward = -5.0 # Basic failure penalty
@@ -279,7 +287,8 @@ class GeneratorInterface:
                 logp[i:i+1],
                 values[i:i+1],
                 reward,
-                topk_action_mask[i:i+1]
+                topk_action_mask[i:i+1],
+                topk_stats_action_mask[i:i+1],
             )
             
             if traj and 'obs' in traj:
@@ -300,26 +309,33 @@ class GeneratorInterface:
         mean_ce_loss = np.mean(raw_ce_losses) if len(raw_ce_losses) > 0 else 0.0
         mean_inv_loss = np.mean(raw_inv_losses) if len(raw_inv_losses) > 0 else 0.0
         mean_div_reward = np.mean(div_rewards) if len(div_rewards) > 0 else 0.0
-
         return None, None, mean_raw_loss, mean_ce_loss, mean_inv_loss, mean_div_reward, valid_trajs, solved_count, avg_bfs
 
     def _rollout_combined(self, map_np, stats_np, iter, idx, old_params=None):
+        import traceback
+
+        env_type = str(getattr(self.cfg.attention_model, "env_type", "")).lower()
+        print(f"[GeneratorInterface] Rollout start | env_type={env_type} | iter={iter} | idx={idx}")
+
         try:
              # Use the modernized support.interpret_env
              # Note: For MiniGrid, stats_np is ignored by its version of support/interpret
-             env_source, _ = self.support.interpret_env(map_np, self.cfg, inventory_vec=stats_np)
+             if env_type == "crafter":
+                 env_source, _ = self.support.interpret_env(map_np, inventory_vec=stats_np)
+             elif env_type == "minigrid":
+                 env_source, _ = self.support.interpret_env(map_np)
+             elif env_type == "bipedalwalker":
+                 env_source, _ = self.support.interpret_env(map_np)
+             else:
+                 raise ValueError(f"Unsupported env_type for rollout routing: {env_type}")
+
              save_name = f'UED_Dual_iter{iter}_b{idx}'
              save_path = collect_data_general(self.support.cfg, env_source=env_source, save_name=save_name, recollect_data=True)
-             
-             if not os.path.exists(save_path): return {}, {}, 0.0, False
-             
-             # Extract Dual-Head Error Signal
-             v_times = getattr(self.cfg.attention_model, "valid_times", 1)
-             res_eval = extract_loss_map_over_validations(self.cfg, self.wm, old_params, save_path, valid_times=v_times)
-             error_dict, loss_list = res_eval[0], res_eval[1]
-             terrain_losses, inv_losses = res_eval[2], res_eval[3]
+             if not os.path.exists(save_path):
+                 print(f"[GeneratorInterface] Missing rollout file after collection: {save_path}")
+                 return {}, {}, 0.0, False, 0.0, 0.0, 0
 
-             # Load trajectory (a=obs, b=obs_next, c=act, f=info)
+             # Load trajectory first. Even if validation later fails, keep the rollout.
              task_npz = np.load(save_path, allow_pickle=True)
              traj = {
                  'obs': torch.tensor(task_npz['a'], device=self.device),
@@ -331,18 +347,34 @@ class GeneratorInterface:
              }
              solved = np.any((task_npz['e']) & (task_npz['d'] > 0))
              
-             # [NEW] Compute Inventory Transition Diversity
-             # Count how many distinct inventory slots changed at least once during the rollout
              inv_changed_slots = 0
              if 'g' in task_npz and 'h' in task_npz:
-                 inv_arr      = task_npz['g'].astype(np.float32)  # [T, 16]
-                 inv_next_arr = task_npz['h'].astype(np.float32)  # [T, 16]
+                 inv_arr = task_npz['g'].astype(np.float32)
+                 inv_next_arr = task_npz['h'].astype(np.float32)
                  delta = inv_next_arr - inv_arr
-                 inv_changed_slots = int(np.any(delta != 0, axis=0).sum())  # 0-16
-             
-             return traj, error_dict, np.mean(loss_list), solved, np.mean(terrain_losses), np.mean(inv_losses), inv_changed_slots
+                 inv_changed_slots = int(np.any(delta != 0, axis=0).sum())
+
+             error_dict = {"terrain": np.zeros((self.map_height, self.map_width)), "inventory": np.zeros(16)}
+             mean_loss = 0.0
+             mean_terrain_loss = 0.0
+             mean_inv_loss = 0.0
+             try:
+                 # Extract Dual-Head Error Signal
+                 v_times = getattr(self.cfg.attention_model, "valid_times", 1)
+                 res_eval = extract_loss_map_over_validations(self.cfg, self.wm, old_params, save_path, valid_times=v_times)
+                 error_dict, loss_list = res_eval[0], res_eval[1]
+                 terrain_losses, inv_losses = res_eval[2], res_eval[3]
+                 mean_loss = float(np.mean(loss_list)) if len(loss_list) > 0 else 0.0
+                 mean_terrain_loss = float(np.mean(terrain_losses)) if len(terrain_losses) > 0 else 0.0
+                 mean_inv_loss = float(np.mean(inv_losses)) if len(inv_losses) > 0 else 0.0
+             except Exception as e:
+                 print(f"[GeneratorInterface] Validation failed for {save_name}: {e}")
+                 traceback.print_exc()
+
+             return traj, error_dict, mean_loss, solved, mean_terrain_loss, mean_inv_loss, inv_changed_slots
         except Exception as e:
-             print(f"[GeneratorInterface] Rollout failed: {e}")
+             print(f"[GeneratorInterface] Rollout failed for env_type={env_type}, iter={iter}, idx={idx}: {e}")
+             traceback.print_exc()
              return {}, {"terrain": np.zeros((self.map_height, self.map_width)), "inventory": np.zeros(16)}, 0.0, False, 0.0, 0.0, 0
 
     def _apply_action(self, base_map, act, mask=None):
@@ -400,17 +432,41 @@ class GeneratorInterface:
                 
         return obj, np.zeros_like(obj)
 
-    def _calculate_reward(self, raw_loss, div_score, solved, is_warmup, inv_diversity=0):
+    def _calculate_reward(self, raw_loss, div_score, solved, is_warmup, inv_diversity=0, ce_loss=None, inv_loss=None):
         if is_warmup: return 1.0 + div_score * 5.0
         
         # Crafter: No BFS, Pure adversarial reward loop. 
         # Any environment is a valid challenge for the World Model.
         if self.is_crafter:
-            # [MODIFIED] Only provide bonus if stats actions are NOT randomized
-            # This allows PPO to focus 100% on challenging terrain (raw_loss) during randomized experiments.
-            
-            print(f"[Reward] raw_loss={raw_loss:.3f} | div={div_score:.3f} | inv_slots_changed={inv_diversity}")
-            return raw_loss * 5.0 + 3.0 * div_score + 2.0
+            w_ce = float(getattr(self.cfg.generator_agent, "reward_w_ce", 5.0))
+            w_inv = float(getattr(self.cfg.generator_agent, "reward_w_inv", 5.0))
+            w_div = float(getattr(self.cfg.generator_agent, "reward_w_div", 3.0))
+            w_inv_change = float(getattr(self.cfg.generator_agent, "reward_w_inv_change", 0.0))
+            inv_change_norm_slots = float(getattr(self.cfg.generator_agent, "inv_change_norm_slots", 8.0))
+            bias = float(getattr(self.cfg.generator_agent, "reward_bias", 2.0))
+            reward_clip = float(getattr(self.cfg.generator_agent, "reward_clip", 100.0))
+
+            ce_term = float(ce_loss) if ce_loss is not None else float(raw_loss)
+            inv_term = float(inv_loss) if inv_loss is not None else 0.0
+            inv_changed = max(float(inv_diversity), 0.0)
+            inv_norm = max(inv_change_norm_slots, 1e-6)
+            inv_change_bonus = min(inv_changed / inv_norm, 1.0)
+            reward = (
+                w_ce * ce_term
+                + w_inv * inv_term
+                + w_div * float(div_score)
+                + w_inv_change * inv_change_bonus
+                + bias
+            )
+            reward = float(np.clip(reward, -reward_clip, reward_clip))
+
+            print(
+                f"[Reward] ce={ce_term:.3f} | inv={inv_term:.3f} | "
+                f"div={div_score:.3f} | "
+                f"inv_slots_changed={inv_diversity} | "
+                f"inv_change_bonus={inv_change_bonus:.3f}"
+            )
+            return reward
             
         # Minigrid: Strict solvability required (Walls are immutable obstacles).
         # Regret-based reward for curricular difficulty
@@ -435,4 +491,3 @@ class GeneratorInterface:
     def update(self):
         loss, ent = self.ppo.update()
         return loss, ent, self.ppo.last_mean_reward
-

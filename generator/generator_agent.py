@@ -96,6 +96,7 @@ class GeneratorPPO:
             "value": [],
             "reward": [],
             "topk_mask": [],
+            "stats_topk_mask": [],
             "stats_heat": [],     # Inventory error history [1, 16]
         }
         self.last_mean_reward = 0.0
@@ -146,18 +147,18 @@ class GeneratorPPO:
                 global_ctx = self._compute_global_context_dual(pm, pht, phs)
             ctx = global_ctx.repeat(B, 1)
 
-        action, stats_act, map_logp, stats_logp, value, topk_mask = self.policy_old.act(
+        action, stats_act, map_logp, stats_logp, value, topk_mask, topk_stats_mask = self.policy_old.act(
             base_map, ctx, mask, max_edits_layout, max_stats_edit_ratio=max_edits_stats, stats_heat=phs
         )
 
         # map_logp is [B, H, W], stats_logp is [B] (already summed in network)
         total_logprob = map_logp.sum(dim=(1, 2)) + stats_logp
-        return action, stats_act, total_logprob, value, topk_mask, global_ctx
+        return action, stats_act, total_logprob, value, topk_mask, topk_stats_mask, global_ctx
 
     # ------------------------------------------------------------------
     # Buffer
     # ------------------------------------------------------------------
-    def save_buffer(self, curr_map, prev_data, mask, action, stats_action, logprob, value, reward, topk_mask):
+    def save_buffer(self, curr_map, prev_data, mask, action, stats_action, logprob, value, reward, topk_mask, stats_topk_mask):
         self.buffer["curr_map"].append(curr_map.cpu())
         self.buffer["mask"].append(mask.cpu())
         self.buffer["action"].append(action.cpu())
@@ -166,6 +167,7 @@ class GeneratorPPO:
         self.buffer["value"].append(value.cpu())
         self.buffer["reward"].append(float(reward))
         self.buffer["topk_mask"].append(topk_mask.cpu())
+        self.buffer["stats_topk_mask"].append(stats_topk_mask.cpu())
 
         if prev_data is None:
             B, _, H, W = curr_map.shape
@@ -225,6 +227,7 @@ class GeneratorPPO:
             old_logprob = torch.cat(self.buffer["logprob"]).to(device)
             old_value = torch.cat(self.buffer["value"]).to(device).squeeze()
             topk_mask = torch.cat(self.buffer["topk_mask"]).to(device)
+            stats_topk_mask = torch.cat(self.buffer["stats_topk_mask"]).to(device)
 
             # 获取用于 HistoryEncoder 的素材
             prev_map = torch.cat(self.buffer["prev_map"]).to(device)
@@ -251,7 +254,13 @@ class GeneratorPPO:
 
                 # action_tuple: (terrain_action, stats_action)
                 logp_terrain, logp_stats, value, entropy = self.policy.evaluate(
-                    curr_map, ctx, (action, stats_action), mask, target_topk_mask=topk_mask, stats_heat=prev_heat_stats
+                    curr_map,
+                    ctx,
+                    (action, stats_action),
+                    mask,
+                    target_topk_mask=topk_mask,
+                    target_stats_topk_mask=stats_topk_mask,
+                    stats_heat=prev_heat_stats,
                 )
 
                 # Joint LogProb

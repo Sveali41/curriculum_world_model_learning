@@ -1,0 +1,2 @@
+# Mixed obstacles with recover sections
+G25 S3.0 P4 T2 G12 P3 T-2 G20

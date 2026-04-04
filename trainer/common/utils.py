@@ -142,7 +142,9 @@ def collect_data_general(
     # -----------------------------
     # 0. Print environment info (Optional but helpful for debugging)
     # -----------------------------
-    is_crafter = (getattr(cfg.attention_model, "env_type", "") == "crafter")
+    env_type = getattr(cfg.attention_model, "env_type", "")
+    is_crafter = (env_type == "crafter")
+    is_bipedal = (env_type == "bipedalwalker")
     
     # -----------------------------
     # 1. Build environment
@@ -158,8 +160,15 @@ def collect_data_general(
             env = CrafterEnv(layout_str=env_source, max_steps=max_steps)
 
     elif not is_crafter and isinstance(env_source, (str, os.PathLike)) and str(env_source).endswith(".txt"):
-        # MiniGrid from text file
+        # MiniGrid/Bipedal from text file (resolved by Support)
         env = support.wrap_env_from_text(env_source, max_steps=max_steps)
+
+    elif is_bipedal and isinstance(env_source, str):
+        # Bipedal from layout string (e.g., "G20 S3 P4 T2")
+        from domain.bipedalwalker.custom_bipedal_env import CustomBipedalEnv
+        render_mode = "human" if getattr(cfg.env, "visualize", False) else None
+        env = CustomBipedalEnv(render_mode=render_mode)
+        env.set_custom_layout_from_str(env_source)
 
     elif isinstance(env_source, tuple) and len(env_source) == 2:
         # MiniGrid from minitask strings (layout_str, color_str)
@@ -176,6 +185,8 @@ def collect_data_general(
         # Fallback for other cases (e.g. direct env objects if supported later)
         if is_crafter:
              raise ValueError("For Crafter UED, env_source must be a .txt path or a layout string.")
+        if is_bipedal:
+             raise ValueError("For BipedalWalker UED, env_source must be a .txt path or a layout string.")
         raise ValueError("env_source must be a .txt filepath or (layout_str, color_str) tuple")
 
     # -----------------------------
@@ -359,7 +370,10 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
     prev_data_dir = cfg.attention_model.data_dir
 
     cfg.attention_model.freeze_weight = True
-    cfg.attention_model.keep_cell_loss = True
+    # Optional switch: default off for lightweight target validation.
+    cfg.attention_model.keep_cell_loss = bool(
+        getattr(cfg.attention_model, "target_validation_keep_cell_loss", False)
+    )
     cfg.attention_model.data_dir = os.path.join(data_save_dir, target_file)
 
     losses = []
@@ -486,6 +500,10 @@ def extract_loss_map_over_validations(
     import torch
     from modelBased.world_model import AttentionWM_training
 
+    prev_freeze_weight = cfg.attention_model.freeze_weight
+    prev_keep_cell_loss = cfg.attention_model.keep_cell_loss
+    prev_data_dir = cfg.attention_model.data_dir
+
     # 开启WM的验证模式、保留热图模式
     cfg.attention_model.freeze_weight = True
     cfg.attention_model.keep_cell_loss = True
@@ -495,55 +513,65 @@ def extract_loss_map_over_validations(
     loss_list = []
     terrain_loss_list = []
     inv_loss_list = []
+    inv_vectors = []
 
     is_crafter = (getattr(cfg.attention_model, "env_type", "") == "crafter")
 
-    for _ in range(valid_times):
-        # 执行一轮验证
-        val_result, _, model = AttentionWM_training.train_api(cfg, net, old_params, None)
-        loss_map = model.loss_map_result  # (H,W) array
+    try:
+        for _ in range(valid_times):
+            # 执行一轮验证
+            val_result, _, model = AttentionWM_training.train_api(cfg, net, old_params, None)
+            loss_map = model.loss_map_result  # (H,W) array
 
-        if sum_map is None:
-            sum_map = np.array(loss_map, dtype=np.float32)
-        else:
-            sum_map += loss_map
+            if sum_map is None:
+                sum_map = np.array(loss_map, dtype=np.float32)
+            else:
+                sum_map += loss_map
 
-        # train_api returns a dict with "avg_val_loss" containing the actual lightning output
-        # e.g., result["avg_val_loss"] = [{'avg_val_loss_wm': 1.2, 'val/terrain_loss': 0.8...}]
-        actual_val_out = val_result.get("avg_val_loss", {})
-        
-        # Robust result parsing for both list and dict formats from Lightning's trainer.validate
-        if isinstance(actual_val_out, list) and len(actual_val_out) > 0:
-             metrics = actual_val_out[0]
-        elif isinstance(actual_val_out, dict):
-             metrics = actual_val_out
-        else:
-             metrics = {}
-        
-        # Primary metrics: Classification cross-entropy
-        total_l = float(metrics.get('avg_val_loss_wm', metrics.get('best_loss', 0.0)))
-        t_l = float(metrics.get('val/terrain_loss', metrics.get('val/ce_loss', total_l)))
-        i_l = float(metrics.get('val/inventory_loss', metrics.get('val/inv_loss', 0.0)))
-        
-        loss_list.append(total_l)
-        terrain_loss_list.append(t_l)
-        inv_loss_list.append(i_l)
+            # train_api returns a dict with "avg_val_loss" containing the actual lightning output
+            # e.g., result["avg_val_loss"] = [{'avg_val_loss_wm': 1.2, 'val/terrain_loss': 0.8...}]
+            actual_val_out = val_result.get("avg_val_loss", {})
+            
+            # Robust result parsing for both list and dict formats from Lightning's trainer.validate
+            if isinstance(actual_val_out, list) and len(actual_val_out) > 0:
+                 metrics = actual_val_out[0]
+            elif isinstance(actual_val_out, dict):
+                 metrics = actual_val_out
+            else:
+                 metrics = {}
+            
+            # Primary metrics: Classification cross-entropy
+            total_l = float(metrics.get('avg_val_loss_wm', metrics.get('best_loss', 0.0)))
+            t_l = float(metrics.get('val/terrain_loss', metrics.get('val/ce_loss', total_l)))
+            i_l = float(metrics.get('val/inventory_loss', metrics.get('val/inv_loss', 0.0)))
+            
+            loss_list.append(total_l)
+            terrain_loss_list.append(t_l)
+            inv_loss_list.append(i_l)
+            inv_vec = getattr(model, "inventory_loss_vector_result", None)
+            if inv_vec is not None:
+                inv_vectors.append(np.asarray(inv_vec, dtype=np.float32))
 
-        # Cleanup
-        del model
-        torch.cuda.empty_cache()
-        gc.collect()
-
-    # Disable special val mode
-    cfg.attention_model.keep_cell_loss = False
+            # Cleanup
+            del model
+            torch.cuda.empty_cache()
+            gc.collect()
+    finally:
+        cfg.attention_model.freeze_weight = prev_freeze_weight
+        cfg.attention_model.keep_cell_loss = prev_keep_cell_loss
+        cfg.attention_model.data_dir = prev_data_dir
 
     # 计算均值
     avg_loss_map = sum_map / valid_times
 
     if is_crafter:
-        # 对物资误差进行“重归一化”，使其与地形误差量级匹配 (for generator Reward map)
-        avg_inv_total = np.mean(inv_loss_list)
-        inventory_pattern = np.full(16, avg_inv_total / 10.0, dtype=np.float32)
+        # Use slot-wise inventory error vector if available.
+        # Fallback: keep legacy scalar->vector behavior for compatibility.
+        if len(inv_vectors) > 0:
+            inventory_pattern = np.mean(np.stack(inv_vectors, axis=0), axis=0).astype(np.float32)
+        else:
+            avg_inv_total = np.mean(inv_loss_list)
+            inventory_pattern = np.full(16, avg_inv_total / 10.0, dtype=np.float32)
         
         return {"terrain": avg_loss_map, "inventory": inventory_pattern}, loss_list, terrain_loss_list, inv_loss_list
     
@@ -595,15 +623,34 @@ def convert_trajectories_to_batch(trajectories):
             if has_inv_next:
                 inv_next_list.append(to_numpy(traj['inv_next']))
 
+        obs = np.concatenate(obs_list, axis=0)
+        obs_next = np.concatenate(next_obs_list, axis=0)
+        act = np.concatenate(act_list, axis=0)
+        rew = np.concatenate(rew_list, axis=0) if rew_list else None
+        done = np.concatenate(done_list, axis=0) if done_list else None
+        info = np.concatenate(info_list, axis=0) if has_info else None
+        inv = np.concatenate(inv_list, axis=0) if has_inv else None
+        inv_next = np.concatenate(inv_next_list, axis=0) if has_inv_next else None
+
+        # Keep both legacy training keys (a-h) and readable aliases for callers
+        # such as fisher buffer utilities that still expect obs/act naming.
         return {
-            'obs': np.concatenate(obs_list, axis=0),
-            'obs_next': np.concatenate(next_obs_list, axis=0),
-            'act': np.concatenate(act_list, axis=0),
-            'rew': np.concatenate(rew_list, axis=0) if rew_list else None,
-            'done': np.concatenate(done_list, axis=0) if done_list else None,
-            'info': np.concatenate(info_list, axis=0) if has_info else None,
-            'inv': np.concatenate(inv_list, axis=0) if has_inv else None,
-            'inv_next': np.concatenate(inv_next_list, axis=0) if has_inv_next else None
+            'a': obs,
+            'b': obs_next,
+            'c': act,
+            'd': rew,
+            'e': done,
+            'f': info,
+            'g': inv,
+            'h': inv_next,
+            'obs': obs,
+            'obs_next': obs_next,
+            'act': act,
+            'rew': rew,
+            'done': done,
+            'info': info,
+            'inv': inv,
+            'inv_next': inv_next,
         }
 
     # 2. Legacy Format: List of Lists of Tuples
@@ -618,11 +665,27 @@ def convert_trajectories_to_batch(trajectories):
             rew_list.append(reward)
             done_list.append(done)
             
+    obs = np.array(obs_list)
+    obs_next = np.array(next_obs_list)
+    act = np.array(act_list)
+    rew = np.array(rew_list)
+    done = np.array(done_list)
+
     return {
-        'obs': np.array(obs_list),     
-        'obs_next': np.array(next_obs_list), 
-        'act': np.array(act_list),
-        'rew': np.array(rew_list),
-        'done': np.array(done_list),
-        'info': None      
+        'a': obs,
+        'b': obs_next,
+        'c': act,
+        'd': rew,
+        'e': done,
+        'f': None,
+        'g': None,
+        'h': None,
+        'obs': obs,
+        'obs_next': obs_next,
+        'act': act,
+        'rew': rew,
+        'done': done,
+        'info': None,
+        'inv': None,
+        'inv_next': None,
     }

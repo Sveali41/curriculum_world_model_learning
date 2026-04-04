@@ -1,0 +1,166 @@
+# trainer/conf/config_ued.yaml
+# The Ultimate Unified UED Discovery Configuration
+# Use 'domain' to toggle between Crafter and MiniGrid experiments automatically.
+
+# 1. Domain-Specific Overrides (Categorized for ease of management)
+# ----------------------------------------------------------------------
+domain: 'crafter' # 'crafter' OR 'minigrid'
+
+# [Internal Taxonomy] Do not edit these directly unless adding a new domain
+domains:
+  crafter:
+    h: 8
+    w: 8
+    grid_shape: [2, 31, 31]
+    obs_norm: [20, 5, 0]
+    action_norm: 17
+    attention_mask: 5
+    data_folder: ${oc.env:TRAINER_PATH}/data/ued/crafter/
+    target_tasks_folder: ${oc.env:TRAINER_PATH}/data/crafter/target_tasks/
+    target_task_prefix: "crafter_target_task_"
+    target_task_suffix: "_uniform.npz"
+    target_task_start_idx: 1
+    target_task_count: 20
+    mini_tasks_temp_root: ${oc.env:TRAINER_PATH}/data/crafter/mini_tasks_temp/
+    env_visualize_folder: ${oc.env:TRAINER_PATH}/logs/env_visualization/ued/crafter/
+    dataset_visualize_folder: ${oc.env:TRAINER_PATH}/logs/dataset_visualization/ued/crafter/
+    map_elements: { "grass": "G", "water": "W", "tree": "T", "stone": "R", "coal": "C", "iron": "I", "table": "X", "furnace": "U", "agent": "A", "diamond": "O", "cow": "M", "plant": "t" }
+  
+  minigrid:
+    h: 15
+    w: 15
+    grid_shape: [3, 0, 0]
+    obs_norm: [11, 6, 3]
+    action_norm: 7
+    attention_mask: 3
+    data_folder: ${oc.env:TRAINER_PATH}/data/ued/minigrid/
+    target_tasks_folder: ${oc.env:TRAINER_PATH}/data/minigrid/target_tasks/
+    target_task_prefix: "target_task"
+    target_task_suffix: "_test_uniform.npz"
+    target_task_start_idx: 0
+    target_task_count: 20
+    mini_tasks_temp_root: ${oc.env:TRAINER_PATH}/data/minigrid/mini_tasks_temp/
+    env_visualize_folder: ${oc.env:TRAINER_PATH}/logs/env_visualization/ued/minigrid/
+    dataset_visualize_folder: ${oc.env:TRAINER_PATH}/logs/dataset_visualization/ued/minigrid/
+    map_elements: { "wall": "W", "goal": "G", "door": "O", "key": "K", "lava": "L", "empty": "E", "floor": "F", "agent": "S", "ball": "B", "box": "X", "unseen": "?" }
+
+# 2. Sequential/Training Configuration (Interpolated from Domain pool)
+# ----------------------------------------------------------------------
+training_generator:
+  map_width: ${domains.${domain}.w}
+  map_height: ${domains.${domain}.h}
+  batch_size: 1
+  lr: 8e-4
+  map_element: ${domains.${domain}.map_elements}
+  env_path: ${oc.env:TRAINER_PATH}/level/level.txt
+
+env:
+  env_path: null                  # overridden at runtime for data collection
+  env_type: ${domain}             # used by data_collect to route to correct env
+  collect:
+    env_type: ${domain}
+    data_type: random
+    episodes: 200
+    mini_dataset_size: 1000
+    data_folder: ${domains.${domain}.data_folder}
+    data_save_path: ${domains.${domain}.data_folder}trainer.npz
+    env_visualize_save_path: ${domains.${domain}.env_visualize_folder}
+    env_visualize_filename: ued_env.png
+    save_env_visualize: false # visualize env layout
+    visualize_save_path: ${domains.${domain}.dataset_visualize_folder}
+    visualize_filename: ued_dataset.png
+    save_coverage_visualize: true # visualize the exploration coverage
+    maximum_dataset_size: 1000
+    max_steps: 80000              # max steps per data collection episode
+    uniform_reset_steps: 50       # reset interval for uniform exploration
+
+attention_model:
+  env_type: ${domain}
+  train_bipedalwalker: false
+  use_bipedal_attention: false
+  data_type: discrete
+  model_type: Attention
+  grid_shape: ${domains.${domain}.grid_shape}
+  attention_mask_size: ${domains.${domain}.attention_mask}
+  batch_size: 64
+  n_cpu: 2
+  embed_dim: 128
+  num_heads: 1
+  n_epochs: 6
+  lr: 5e-5
+  wd: 1e-5                     # weight decay - required by AttentionWorldModel
+  obs_norm_values: ${domains.${domain}.obs_norm}
+  action_norm_values: ${domains.${domain}.action_norm}
+  valid_values_obj: [1, 2, 4, 5, 8, 10]
+  valid_values_color: [0, 1, 5]
+  valid_values_state: [0, 1, 2, 3]
+  use_wandb: False
+  keep_cell_loss: false
+  target_validation_keep_cell_loss: false
+  frame_stack: 1
+  data_dir: null # overridden at runtime
+
+  # Model save/load
+  freeze_weight: False
+  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model.ckpt
+
+  # Visualization
+  visualization: False
+  visualize_every: 1000
+  save_path: ${oc.env:TRAINER_PATH}/visulization
+  direction_map: {0: 'right', 1: 'down', 2: 'left', 3: 'up'}
+  action_map: {0: 'left', 1: 'right', 2: 'forward', 3: 'pickup', 4: 'drop', 5: 'toggle', 6: 'done'}
+
+  # Validation metric
+  validation_metric: "mse"
+
+  # Continual Learning / EWC Shielding
+  continue_learning: true
+  fisher_buffer_size: 500000
+  current_sample_ratio: 0.3
+  fisher_buffer_elements_ratio: 0.8
+  replay_frac: 3
+  fisher_beta: 0.3
+  lambda_ewc: 20000
+  ewc_ratio: 0.9
+  lambda_ewc_min: 1e-4
+  lambda_ewc_max: 1e3
+  lambda_ema: 0.05
+  fisher_samples: 1000
+  scale_factor: 1.0
+  drift_cooldown: 100
+  n_phases_to_collect: 1
+
+generator_agent:
+  total_iterations: 60
+  batch_size: 8
+  context_dim: 64
+  his_emb_dim: 16
+  ctx_top_k_features: 16
+  max_edits_layout: 0.5
+  max_edits_inventory: 0.5
+  reward_w_ce: 7.0
+  reward_w_inv: 3.5
+  reward_w_div: 1.8
+  reward_w_inv_change: 4.0
+  inv_change_norm_slots: 8.0
+  reward_bias: 1.0
+  reward_clip: 50.0
+  wm_train_frequency: 1
+  map_height: ${domains.${domain}.h}
+  map_width: ${domains.${domain}.w}
+  agent_type: 'ppo'
+  warmup_iterations: 10
+  div_k: 10
+
+ablation:
+  type: "none"
+
+seed: 0
+
+# Temporary NPZ path used during MAC WM retraining
+mac_temp_data_dir: ${domains.${domain}.mini_tasks_temp_root}mac/
+
+PPO:
+  lr_actor: 8e-4
+  lr_critic: 1.5e-3

@@ -2,7 +2,7 @@
 # Unified Continual Learning (CL) Baseline Configuration
 
 defaults:
-  - config_ued                 # Inherit WM, EWC, Buffer from unified config
+  - config_mac                 # Inherit WM, EWC, Buffer from unified config
   - _self_
 
 # --- Control Switch (Unified across all baselines) ---
@@ -11,9 +11,9 @@ domain: 'crafter'              # 'crafter' or 'minigrid'
 # --- Domain-Specific Specifications for Sequential Phase Training ---
 domains:
   crafter:
-    n_phases: 6
+    n_phases: 20
     task_prefix: "crafter_target_task_"
-    data_path: ${oc.env:TRAIN_DATASET_PATH}/
+    data_path: ${oc.env:TRAINER_PATH}/data/crafter/target_tasks/
     train_suffix: "_random.npz"
     val_suffix: "_uniform.npz"
     grid_shape: [2, 31, 31]
@@ -24,7 +24,7 @@ domains:
   minigrid:
     n_phases: 20
     task_prefix: "target_task"
-    data_path: ${oc.env:TRAINER_PATH}/data/
+    data_path: ${oc.env:TRAINER_PATH}/data/minigrid/target_tasks/
     train_suffix: "_test_random.npz"
     val_suffix: "_test_uniform.npz"
     grid_shape: [3, 0, 0]

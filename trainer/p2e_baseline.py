@@ -228,9 +228,12 @@ def p2e_baseline_experiment(cfg: DictConfig):
         "CycleIdx",
         "TargetName",
     ]
-    with open(summary_csv_path, mode='w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(summary_header)
+    file_exists = os.path.exists(summary_csv_path)
+    file_non_empty = file_exists and os.path.getsize(summary_csv_path) > 0
+    if not file_non_empty:
+        with open(summary_csv_path, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(summary_header)
 
     # Initialize Models
     wm_instance = AttentionWorldModel(cfg.attention_model).to(device)
@@ -254,8 +257,8 @@ def p2e_baseline_experiment(cfg: DictConfig):
 
     # Target Tasks
     if domain == "crafter":
-        target_tasks = [f"crafter_target_task_{i}.txt" for i in range(1, 7)]
-        target_data_dir = TRAINER_PATH.parent / "modelBased" / "data" / "train_world_model"
+        target_tasks = [f"crafter_target_task_{i}.txt" for i in range(1, 21)]
+        target_data_dir = TRAINER_PATH / "data" / "crafter" / "target_tasks"
         val_suffix = "_uniform.npz"
     else:
         target_tasks = [f"target_task{i}.txt" for i in range(20)]
@@ -405,15 +408,27 @@ def p2e_baseline_experiment(cfg: DictConfig):
             v_ce_ls = []
             for t_f in ordered_targets:
                 t_nn = t_f.replace(".txt", "")
-                res = validate_on_target_task(
-                    cfg,
-                    wm_instance,
-                    None,
-                    str(target_data_dir),
-                    f"{t_nn}{val_suffix}",
-                    phase_name=f"p2e_t{target_idx + 1}_c{cycle_idx + 1}",
-                    VALID_TIMES=1,
-                )
+                val_file = f"{t_nn}{val_suffix}"
+                val_path = target_data_dir / val_file
+
+                if not val_path.exists():
+                    print(f"  [Warn] Skip validation: missing {val_path}")
+                    continue
+
+                try:
+                    res = validate_on_target_task(
+                        cfg,
+                        wm_instance,
+                        None,
+                        str(target_data_dir),
+                        val_file,
+                        phase_name=f"p2e_t{target_idx + 1}_c{cycle_idx + 1}",
+                        VALID_TIMES=1,
+                    )
+                except FileNotFoundError:
+                    print(f"  [Warn] Skip validation due to missing file: {val_path}")
+                    continue
+
                 if res:
                     v_ls.append(res["avg_val_loss_wm"])
                     v_inv_ls.append(res.get("inventory_loss", np.nan))

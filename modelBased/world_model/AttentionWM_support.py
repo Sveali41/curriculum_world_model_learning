@@ -168,6 +168,8 @@ class AttentionModule(nn.Module):
         self.data_type = data_type
         self.env_type = env_type
         self.frame_stack = frame_stack
+        self.is_bipedal = (env_type == "bipedalwalker")
+        self.embed_dim = embed_dim
         if data_type == 'discrete':
             if env_type == 'crafter':
                 # 20 object classes (0-19) + 5 direction classes = 25 channels per frame
@@ -184,21 +186,39 @@ class AttentionModule(nn.Module):
                 self.action_embedding = nn.Embedding(7, embed_dim)
             self.key_embedding = nn.Embedding(2, embed_dim)
         else:
-            self.input_channel = grid_shape[0] * frame_stack
-            self.action_fc = nn.Linear(1, embed_dim)
+            if self.is_bipedal:
+                self.state_dim = int(grid_shape[-1]) if len(grid_shape) > 0 else 24
+                self.action_dim = 4
+                self.token_dim = 3
+                if self.state_dim % self.token_dim != 0:
+                    raise ValueError(
+                        f"Bipedal state_dim={self.state_dim} must be divisible by token_dim={self.token_dim}"
+                    )
+                self.num_tokens = self.state_dim // self.token_dim
+                self.state_tokenizer = nn.Linear(self.token_dim, embed_dim)
+                self.action_fc = nn.Linear(self.action_dim, embed_dim)
+                self.pos_embedding = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))
+                nn.init.trunc_normal_(self.pos_embedding, std=0.02)
+                self.context_fc = nn.Linear(self.state_dim, embed_dim)
+                self.token_head = nn.Linear(embed_dim, self.token_dim)
+            else:
+                self.input_channel = grid_shape[0] * frame_stack
+                self.action_fc = nn.Linear(1, embed_dim)
 
         self.mask_size = mask_size
         self.y, self.x = mask_size // 2, mask_size // 2
-        self.conv1 = nn.Conv2d(self.input_channel, embed_dim, kernel_size=3, padding=1)
-        self.bn1 = nn.GroupNorm(8, embed_dim)
-        self.conv2 = nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1)
-        self.bn2 = nn.GroupNorm(8, embed_dim)
+        if not self.is_bipedal:
+            self.conv1 = nn.Conv2d(self.input_channel, embed_dim, kernel_size=3, padding=1)
+            self.bn1 = nn.GroupNorm(8, embed_dim)
+            self.conv2 = nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1)
+            self.bn2 = nn.GroupNorm(8, embed_dim)
         self.relu = nn.ReLU(inplace=True)
         self.to_gamma_beta = nn.Linear(embed_dim, 2 * embed_dim)
 
-        self.flatten = nn.Flatten(2)
-        self.pos_embedding = nn.Parameter(torch.zeros(1, mask_size * mask_size, embed_dim))
-        nn.init.trunc_normal_(self.pos_embedding, std=0.02)
+        if not self.is_bipedal:
+            self.flatten = nn.Flatten(2)
+            self.pos_embedding = nn.Parameter(torch.zeros(1, mask_size * mask_size, embed_dim))
+            nn.init.trunc_normal_(self.pos_embedding, std=0.02)
 
         self.fuse_fc = nn.Linear(embed_dim * 3, embed_dim)
         self.res_mlp = ResidualMLP(embed_dim, embed_dim * 2, dropout=0.1)
@@ -211,15 +231,49 @@ class AttentionModule(nn.Module):
         
         if env_type == 'crafter':
             self.out_channel = 20 + 5  # 20 obj classes (0-19) + 5 dir classes
+        elif self.is_bipedal:
+            self.out_channel = self.state_dim
         else:
             self.out_channel = 3
-        self.fc = nn.Linear(embed_dim, self.out_channel)
+        if not self.is_bipedal:
+            self.fc = nn.Linear(embed_dim, self.out_channel)
         
         self.dropout_conv = nn.Dropout(p=0.1)
 
 
     def forward(self, state, action, info, inv=None):
         orginal_dim = state.ndim
+        if self.is_bipedal:
+            if orginal_dim == 1:
+                state = state.unsqueeze(0)
+                action = torch.as_tensor(action, device=state.device).view(1, -1)
+            elif orginal_dim == 2 and not torch.is_tensor(action):
+                action = torch.as_tensor(action, device=state.device)
+
+            state = state.float()
+            action = action.float()
+            B = state.size(0)
+            x = state.view(B, self.num_tokens, self.token_dim)
+            x = self.state_tokenizer(x)
+            x = x + self.pos_embedding
+
+            action_emb = self.action_fc(action).unsqueeze(1).expand(-1, self.num_tokens, -1)
+            context_emb = self.context_fc(state).unsqueeze(1).expand(-1, self.num_tokens, -1)
+
+            fused = torch.cat([x, action_emb, context_emb], dim=-1)
+            x = self.fuse_fc(fused)
+
+            attn_weights = None
+            for layer in self.transformer_layers:
+                x, attn_weights = layer(x)
+
+            x = self.res_mlp(x)
+            x_out = self.token_head(x).reshape(B, self.state_dim)
+
+            if orginal_dim == 1:
+                x_out = x_out.squeeze(0)
+            return x_out, attn_weights, None
+
         if orginal_dim == 3:  # 单个样本
             state = state.unsqueeze(0)
             action = torch.tensor([action]).to(state.device)

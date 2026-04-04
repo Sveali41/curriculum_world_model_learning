@@ -2,7 +2,7 @@
 # Plan2Explore (P2E) Configuration File
 
 defaults:
-  - config_ued                # Inherit base WM, Buffer, and EWC structure
+  - config_mac                # Inherit base WM, Buffer, and EWC structure
   - _self_
 
 # 1. Plan2Explore (P2E) Specific Hyperparameters
@@ -13,8 +13,8 @@ p2e:
   batch_size: 256              # Training batch size for the ensemble
   disag_train_frequency: 1     # Update ensemble every N iterations
   target_type: "latent"        # Objective: "latent" (predict next latent) or "logits" (predict next ID)
-  transitions_per_collection: 6700  # n: transitions collected per rollout on one target 6700
-  updates_per_target: 10             # m: collect/train cycles executed per target
+  transitions_per_collection: 4000  # n: transitions collected per rollout on one target 6700
+  updates_per_target: 5             # m: collect/train cycles executed per target
   target_order: "sequential"        # sequential | random
 
 # 2. Domain Selection (Configurable via CLI override: domain=minigrid)

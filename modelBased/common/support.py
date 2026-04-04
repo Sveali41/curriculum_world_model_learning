@@ -4,6 +4,7 @@ from pathlib import Path
 from domain.minigrid import minigrid_support
 from domain.crafter import crafter_support
 from domain.crafter.crafter_custom_env import CustomCrafterEnv
+from domain.bipedalwalker import bipedalwalker_support
 from modelBased.data.data_collect import data_collect_api
 
 
@@ -17,6 +18,8 @@ class Support:
     def wrap_env_from_text(self, file_path, max_steps=10000):
         if self.cfg.attention_model.env_type == 'crafter':
             return self.wrap_env_from_text_crafter(file_path, max_steps)
+        if self.cfg.attention_model.env_type == 'bipedalwalker':
+            return bipedalwalker_support.wrap_env_from_text(file_path)
         return minigrid_support.wrap_env_from_text(file_path, max_steps, self.cfg)
 
     def wrap_env_from_text_crafter(self, file_path, max_steps=10000):

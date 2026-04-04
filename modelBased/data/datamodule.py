@@ -326,8 +326,11 @@ class WMRLDataModule(pl.LightningDataModule):
             data: Optional data dictionary, e.g., {'a': np.array(...), 'b': np.array(...), 'c': np.array(...)}
         """
         super().__init__()
-        self.save_hyperparameters(hparams)
-        self.data_dir = self.hparams.data_dir
+        # Keep config as a plain attribute instead of Lightning hparams.
+        # Lightning merges module/datamodule hparams during validation and will
+        # raise if both sides define the same keys with different values.
+        self.cfg = hparams
+        self.data_dir = self.cfg.data_dir
         self.direct_data = data  # Store the data passed directly
         self.replay_data = replay_data
         
@@ -337,7 +340,7 @@ class WMRLDataModule(pl.LightningDataModule):
         else:
             # Load data from a file if `self.data_dir` is set and data is not provided directly
             loaded = np.load(self.data_dir, allow_pickle=True) # Allow pickle for safety with complex data structures
-        data = WMRLDataset(loaded, self.hparams, self.replay_data)
+        data = WMRLDataset(loaded, self.cfg, self.replay_data)
         if len(data) == 0:
             print("[Warning] Dataset is empty! Training and Test sets will be empty.")
             self.data_train = torch.utils.data.Subset(data, [])
@@ -359,7 +362,7 @@ class WMRLDataModule(pl.LightningDataModule):
     def train_dataloader(self):
         return DataLoader(
             self.data_train, 
-            batch_size=self.hparams.batch_size, 
+            batch_size=self.cfg.batch_size, 
             shuffle=True,
             drop_last=True,
             num_workers=0,
@@ -370,7 +373,7 @@ class WMRLDataModule(pl.LightningDataModule):
     def val_dataloader(self):
         return DataLoader(
             self.data_test, 
-            batch_size=self.hparams.batch_size, 
+            batch_size=self.cfg.batch_size, 
             shuffle=True,
             drop_last=False,
             num_workers=0,
