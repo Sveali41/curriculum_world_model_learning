@@ -1,10 +1,10 @@
 # trainer/conf/config_ued.yaml
 # The Ultimate Unified UED Discovery Configuration
-# Use 'domain' to toggle between Crafter and MiniGrid experiments automatically.
+# Use `domain` as the only top-level switch for environment-specific behavior.
 
 # 1. Domain-Specific Overrides (Categorized for ease of management)
 # ----------------------------------------------------------------------
-domain: 'crafter' # 'crafter' OR 'minigrid'
+domain: 'bipedalwalker' # 'crafter' OR 'minigrid' OR 'bipedalwalker'
 
 # [Internal Taxonomy] Do not edit these directly unless adding a new domain
 domains:
@@ -25,10 +25,28 @@ domains:
     env_visualize_folder: ${oc.env:TRAINER_PATH}/logs/env_visualization/ued/crafter/
     dataset_visualize_folder: ${oc.env:TRAINER_PATH}/logs/dataset_visualization/ued/crafter/
     map_elements: { "grass": "G", "water": "W", "tree": "T", "stone": "R", "coal": "C", "iron": "I", "table": "X", "furnace": "U", "agent": "A", "diamond": "O", "cow": "M", "plant": "t" }
+    data_type: discrete
+    use_bipedal_attention: false
+    # Data collection budget for MAC/DR (per training iteration).
+    # Runtime will split this by generator_batch_size to get per-rollout max transitions.
+    iter_transition_budget: 2000
+    generator_batch_size: 8
+    max_edits_layout: 0.6
+    max_edits_inventory: 0.5
+    lambda_ewc: 20000.0
+    validation_metric: "mse"
+    reward:
+      ce: 7.0
+      inv: 3.5
+      div: 1.8
+      inv_change: 4.0
+      inv_change_norm_slots: 8.0
+      bias: 1.0
+      clip: 50.0
   
   minigrid:
-    h: 15
-    w: 15
+    h: 8
+    w: 8
     grid_shape: [3, 0, 0]
     obs_norm: [11, 6, 3]
     action_norm: 7
@@ -43,6 +61,76 @@ domains:
     env_visualize_folder: ${oc.env:TRAINER_PATH}/logs/env_visualization/ued/minigrid/
     dataset_visualize_folder: ${oc.env:TRAINER_PATH}/logs/dataset_visualization/ued/minigrid/
     map_elements: { "wall": "W", "goal": "G", "door": "O", "key": "K", "lava": "L", "empty": "E", "floor": "F", "agent": "S", "ball": "B", "box": "X", "unseen": "?" }
+    data_type: discrete
+    use_bipedal_attention: false
+    # Data collection budget for MAC/DR (per training iteration).
+    # Example: 1400 with batch=8 -> each rollout collects 175 transitions.
+    iter_transition_budget: 4667
+    generator_batch_size: 8
+    max_edits_layout: 0.5
+    # MiniGrid does not use inventory edits; keep this as 0.0 to disable.
+    max_edits_inventory: 0.0
+    lambda_ewc: 20000.0
+    validation_metric: "mse_weighted"
+
+  bipedalwalker:
+    h: 1
+    w: 24
+    active_w: 6                  # bipedal-only: only the first active_w slots can place obstacles
+    grid_shape: [1, 1, 24]
+    obs_norm: [1]
+    action_norm: 4
+    attention_mask: 5
+    data_folder: ${oc.env:TRAINER_PATH}/data/ued/bipedalwalker/
+    target_tasks_folder: ${oc.env:TRAINER_PATH}/data/bipedalwalker/target_tasks/
+    target_task_prefix: "bipedal_target_task_"
+    target_task_suffix: "_uniform.npz"
+    target_task_start_idx: 1
+    target_task_count: 20
+    mini_tasks_temp_root: ${oc.env:TRAINER_PATH}/data/bipedalwalker/mini_tasks_temp/
+    env_visualize_folder: ${oc.env:TRAINER_PATH}/logs/env_visualization/ued/bipedal/
+    dataset_visualize_folder: ${oc.env:TRAINER_PATH}/logs/dataset_visualization/ued/bipedal/
+    map_elements: {}
+    data_type: norm
+    use_bipedal_attention: true
+    # Data collection budget for MAC/DR (per training iteration).
+    iter_transition_budget: 1000
+    generator_batch_size: 8
+    max_edits_layout: 1.0
+    max_edits_inventory: 0.0
+    lambda_ewc: 0.05
+    validation_metric: "mse"
+    reward:
+      contact_bce: 1
+      total_loss: 20.0
+      div: 2.0
+      survival: 0.01
+      bias: 0.0
+      clip: 30.0
+    contact_positive_ratio: 0.5  # Ratio of contact=1 samples in Fisher Buffer label balancing
+    history_len: 10
+    # Behavior policy used by bipedal data collection (when env.collect.data_type == random):
+    # - "heuristic": use only BipedalHeuristicPolicy
+    # - "pretrained_sb3": use only SB3 policy
+    # - "mix": per episode choose expert/heuristic by expert_ratio
+    # Note: if env.collect.data_type == "uniform", code auto-forces "pretrained_sb3".
+    behavior_policy: "pretrained_sb3"
+    # Only used when behavior_policy == "mix". Example: 0.3 => 30% expert, 70% heuristic.
+    expert_ratio: 0.3
+    # Optional: sb3_algo can be "SAC" or "PPO". If omitted, code defaults to SAC.
+    # sb3_algo: "SAC"
+    # If sb3_model_path is null, policy is loaded from HuggingFace repo_id/filename below.
+    sb3_repo_id: "sb3/sac-BipedalWalkerHardcore-v3"
+    sb3_filename: "sac-BipedalWalkerHardcore-v3.zip"
+    # Local SB3 checkpoint path. Set null to use HuggingFace model above.
+    sb3_model_path: null
+    # Extra Gaussian action noise added on top of SB3 output.
+    sb3_noise_std: 0.3
+    # SB3 predict mode: true = deterministic action, false = stochastic sampling.
+    sb3_deterministic: false
+    # Heuristic policy weight vs random noise inside heuristic action generation.
+    # Only affects heuristic branch (pure heuristic or the heuristic side of mix).
+    bipedal_prior_weight: 0.5
 
 # 2. Sequential/Training Configuration (Interpolated from Domain pool)
 # ----------------------------------------------------------------------
@@ -59,26 +147,28 @@ env:
   env_type: ${domain}             # used by data_collect to route to correct env
   collect:
     env_type: ${domain}
+    # random/uniform. For bipedal, uniform mode forces behavior_policy -> pretrained_sb3 in code.
     data_type: random
     episodes: 200
-    mini_dataset_size: 1000
+    mini_dataset_size: 500
     data_folder: ${domains.${domain}.data_folder}
     data_save_path: ${domains.${domain}.data_folder}trainer.npz
     env_visualize_save_path: ${domains.${domain}.env_visualize_folder}
     env_visualize_filename: ued_env.png
-    save_env_visualize: false # visualize env layout
+    # visualize the env and layout of the env
+    save_env_visualize: true # visualize env layout
     visualize_save_path: ${domains.${domain}.dataset_visualize_folder}
     visualize_filename: ued_dataset.png
     save_coverage_visualize: true # visualize the exploration coverage
-    maximum_dataset_size: 1000
+    current_layout_str: null      # bipedal-only: runtime layout string for UED coverage visualization
+    maximum_dataset_size: 500
     max_steps: 80000              # max steps per data collection episode
     uniform_reset_steps: 50       # reset interval for uniform exploration
 
 attention_model:
   env_type: ${domain}
-  train_bipedalwalker: false
-  use_bipedal_attention: false
-  data_type: discrete
+  use_bipedal_attention: ${domains.${domain}.use_bipedal_attention}
+  data_type: ${domains.${domain}.data_type}
   model_type: Attention
   grid_shape: ${domains.${domain}.grid_shape}
   attention_mask_size: ${domains.${domain}.attention_mask}
@@ -86,7 +176,7 @@ attention_model:
   n_cpu: 2
   embed_dim: 128
   num_heads: 1
-  n_epochs: 6
+  n_epochs: 8
   lr: 5e-5
   wd: 1e-5                     # weight decay - required by AttentionWorldModel
   obs_norm_values: ${domains.${domain}.obs_norm}
@@ -102,7 +192,7 @@ attention_model:
 
   # Model save/load
   freeze_weight: False
-  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model.ckpt
+  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_${domain}_${ablation.type}.ckpt
 
   # Visualization
   visualization: False
@@ -112,17 +202,18 @@ attention_model:
   action_map: {0: 'left', 1: 'right', 2: 'forward', 3: 'pickup', 4: 'drop', 5: 'toggle', 6: 'done'}
 
   # Validation metric
-  validation_metric: "mse"
+  validation_metric: ${domains.${domain}.validation_metric}
 
   # Continual Learning / EWC Shielding
   continue_learning: true
   fisher_buffer_size: 500000
   current_sample_ratio: 0.3
   fisher_buffer_elements_ratio: 0.8
-  replay_frac: 3
+  replay_frac: 0.7 # The amount of replay data = amount of new data * this parameter. (bipedal:0.7 | discrete_grids: 3)
   fisher_beta: 0.3
-  lambda_ewc: 20000
-  ewc_ratio: 0.9
+  # Domain-specific EWC strength (reads from domains.${domain}.lambda_ewc)
+  lambda_ewc: ${domains.${domain}.lambda_ewc}
+  ewc_ratio: 0.9 
   lambda_ewc_min: 1e-4
   lambda_ewc_max: 1e3
   lambda_ema: 0.05
@@ -133,15 +224,17 @@ attention_model:
 
 generator_agent:
   total_iterations: 60
-  batch_size: 8
+  # Per-domain override comes from domains.${domain}.generator_batch_size.
+  batch_size: ${domains.${domain}.generator_batch_size}
   context_dim: 64
   his_emb_dim: 16
   ctx_top_k_features: 16
-  max_edits_layout: 0.5
-  max_edits_inventory: 0.5
+  max_edits_layout: ${domains.${domain}.max_edits_layout}
+  max_edits_inventory: ${domains.${domain}.max_edits_inventory}
   reward_w_ce: 7.0
   reward_w_inv: 3.5
   reward_w_div: 1.8
+  reward_w_total: 0.0
   reward_w_inv_change: 4.0
   inv_change_norm_slots: 8.0
   reward_bias: 1.0
@@ -149,9 +242,14 @@ generator_agent:
   wm_train_frequency: 1
   map_height: ${domains.${domain}.h}
   map_width: ${domains.${domain}.w}
+  active_width: ${domains.${domain}.active_w}  # bipedal-only: effective editable width for UED layout generation
   agent_type: 'ppo'
   warmup_iterations: 10
   div_k: 10
+  # Diversity archive reset interval (iterations). Set to 0 to disable.
+  # Periodically clearing the KNN archive prevents mode collapse by forcing
+  # the generator to re-earn diversity rewards with novel terrain combinations.
+  div_reset_interval: 20
 
 ablation:
   type: "none"
@@ -164,3 +262,7 @@ mac_temp_data_dir: ${domains.${domain}.mini_tasks_temp_root}mac/
 PPO:
   lr_actor: 8e-4
   lr_critic: 1.5e-3
+  gamma: 0.99
+  eps_clip: 0.2
+  K_epochs: 2
+  entropy_coef: 0.01

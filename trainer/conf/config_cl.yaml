@@ -6,7 +6,7 @@ defaults:
   - _self_
 
 # --- Control Switch (Unified across all baselines) ---
-domain: 'crafter'              # 'crafter' or 'minigrid'
+domain: 'bipedalwalker'              # 'crafter' or 'minigrid' or 'bipedalwalker'
 
 # --- Domain-Specific Specifications for Sequential Phase Training ---
 domains:
@@ -32,11 +32,24 @@ domains:
     action_norm: 7
     start_idx: 0
 
+  bipedalwalker:
+    n_phases: 3
+    phase_task_names: ["minitask_1", "minitask_2", "minitask_3", "minitask_4", "minitask_5", "minitask_6", "minitask_7", "minitask_8"]
+    phase_task_group: "minitask"
+    phase_task_folder: "minitasks"
+    target_task_name: "target_env_stump_1"
+    target_task_group: "target"
+    target_task_folder: "target_tasks"
+    grid_shape: [1, 1, 24]
+    obs_norm: [1]
+    action_norm: 4
+
 # Override core params for CL stability
 seed: 0
 attention_model:
   n_epochs: 15
   batch_size: 256
   continue_learning: true      # Ensure EWC is active
-  lambda_ewc: 20000            # Shield knowledge from task interference
-  ewc_ratio: 0.9               # Standard buffer sampling ratio
+  lambda_ewc: 0.05            # bipedal:0.05 | crafter and minigrid: 20000
+  ewc_ratio: 0.9              # bipedal:0.9 | crafter and minigrid: 0.9
+  replay_frac: 0.7            # bipedal:0.7 | crafter and minigrid: 3

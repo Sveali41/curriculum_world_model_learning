@@ -85,6 +85,49 @@ class WMRLDataset(Dataset):
             return np.moveaxis(arr, -1, 1)
         return arr
 
+    @staticmethod
+    def _to_minigrid_nchw(arr):
+        """
+        Normalize MiniGrid observations to (N, C, H, W).
+        Accepts either (N, H, W, 3) or already-canonical (N, 3, H, W).
+        """
+        if arr is None:
+            return None
+        if arr.ndim != 4:
+            return arr
+        if arr.shape[-1] == 3 and arr.shape[1] != 3:
+            return np.moveaxis(arr, -1, 1)
+        return arr
+
+    @staticmethod
+    def _sanitize_minigrid_channels(arr, tag="obs"):
+        """
+        Keep MiniGrid discrete channels in valid ranges to prevent one_hot OOB on GPU.
+        Channels: obj[0..10], color[0..5], state[0..3]
+        """
+        if arr is None or arr.ndim != 4 or arr.shape[1] != 3:
+            return arr
+
+        obj = arr[:, 0]
+        color = arr[:, 1]
+        state = arr[:, 2]
+
+        obj_bad = int(np.count_nonzero((obj < 0) | (obj > 10)))
+        color_bad = int(np.count_nonzero((color < 0) | (color > 5)))
+        state_bad = int(np.count_nonzero((state < 0) | (state > 3)))
+        total_bad = obj_bad + color_bad + state_bad
+
+        if total_bad > 0:
+            print(
+                f"[DataModule][MiniGrid] Sanitizing {tag}: "
+                f"obj_bad={obj_bad}, color_bad={color_bad}, state_bad={state_bad}"
+            )
+            arr = arr.copy()
+            np.clip(arr[:, 0], 0, 10, out=arr[:, 0])
+            np.clip(arr[:, 1], 0, 5, out=arr[:, 1])
+            np.clip(arr[:, 2], 0, 3, out=arr[:, 2])
+        return arr
+
     def state_batch_preprocess(self, state):
         obs = np.zeros((state.shape[0], 3, 3, state.shape[-1])) # The mask will extract a 3x3 square around the agent
         for i in range(state.shape[0]):  # Loop over the last dimension (channels)
@@ -123,6 +166,11 @@ class WMRLDataset(Dataset):
         if env_type == 'crafter':
             obs = self._to_crafter_nchw(obs)
             obs_next = self._to_crafter_nchw(obs_next)
+        elif env_type == 'minigrid':
+            obs = self._to_minigrid_nchw(obs)
+            obs_next = self._to_minigrid_nchw(obs_next)
+            obs = self._sanitize_minigrid_channels(obs, tag="current_obs")
+            obs_next = self._sanitize_minigrid_channels(obs_next, tag="current_obs_next")
 
         current_n = len(obs)
         assert current_n == len(obs_next) == len(act), "[BUG] Current lengths inconsistent!"
@@ -218,6 +266,11 @@ class WMRLDataset(Dataset):
             if env_type == 'crafter':
                 r_obs = self._to_crafter_nchw(r_obs)
                 r_obs_next = self._to_crafter_nchw(r_obs_next)
+            elif env_type == 'minigrid':
+                r_obs = self._to_minigrid_nchw(r_obs)
+                r_obs_next = self._to_minigrid_nchw(r_obs_next)
+                r_obs = self._sanitize_minigrid_channels(r_obs, tag="replay_obs")
+                r_obs_next = self._sanitize_minigrid_channels(r_obs_next, tag="replay_obs_next")
 
             # 拼接 (Note: r_obs must have same shape as obs, i.e. already stacked if frame_stack > 1)
             if r_obs.shape[1:] == obs.shape[1:]:
@@ -272,6 +325,14 @@ class WMRLDataset(Dataset):
 
         elif self.hparams.data_type == 'discrete':
             act_f = act.astype(np.int64)
+            if env_type == 'minigrid':
+                act_bad = int(np.count_nonzero((act_f < 0) | (act_f >= int(self.act_norm_values))))
+                if act_bad > 0:
+                    print(
+                        f"[DataModule][MiniGrid] Sanitizing actions: bad={act_bad}, "
+                        f"valid=[0, {int(self.act_norm_values) - 1}]"
+                    )
+                    np.clip(act_f, 0, int(self.act_norm_values) - 1, out=act_f)
             obs_f = obs  # 保留原离散值以便可视化/调试
 
             if env_type == 'crafter':

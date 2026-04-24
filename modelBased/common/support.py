@@ -29,6 +29,9 @@ class Support:
     def interpret_env(self, env, color_array=None, inventory_vec=None):
         if self.cfg.attention_model.env_type == 'crafter':
             return crafter_support.interpret_env(env, self.cfg, inventory_vec=inventory_vec)
+        if self.cfg.attention_model.env_type == 'bipedalwalker':
+            active_width = getattr(getattr(self.cfg, "generator_agent", None), "active_width", None)
+            return bipedalwalker_support.interpret_env(env, active_width=active_width)
         return minigrid_support.interpret_env(env, self.cfg, color_array=color_array)
 
     def collect_data_trainer(

@@ -16,8 +16,43 @@ class HistoryEncoder(nn.Module):
          映射到全局上下文空间，确保非负特征以便 Max-Pooling 逻辑    
     '''
 
-    def __init__(self, context_dim=64, emb_dim=16):
+    def __init__(self, context_dim=64, emb_dim=16, env_type="minigrid"):
         super().__init__()
+        self.env_type = env_type
+
+        if self.env_type == "bipedalwalker":
+            self.layout_emb = nn.Embedding(10, emb_dim)
+            in_channels = emb_dim + 1 + 2
+            self.net = nn.Sequential(
+                nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 64, kernel_size=3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, 64, kernel_size=3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+            )
+            self.pool = nn.AdaptiveMaxPool2d((1, 1))
+            self.local_fc = nn.Sequential(
+                nn.Linear(64, 64),
+                nn.LayerNorm(64),
+                nn.ReLU(inplace=True),
+            )
+            self.global_fc = nn.Sequential(
+                nn.Linear(26, 64),
+                nn.LayerNorm(64),
+                nn.ReLU(inplace=True),
+            )
+            self.fc = nn.Sequential(
+                nn.Linear(64 + 64, 128),
+                nn.LayerNorm(128),
+                nn.ReLU(inplace=True),
+                nn.Linear(128, context_dim),
+                nn.ReLU(),
+            )
+            return
 
         # 1. Embedding 层
         max_object_id = max(OBJECT_TO_IDX.values())
@@ -70,6 +105,24 @@ class HistoryEncoder(nn.Module):
         stats_error: [B, 16] (Inventory errors)
         """
         B, _, H, W = state_grid.shape
+
+        if self.env_type == "bipedalwalker":
+            # in bipedal, we don't use the spatial error heatmap, 
+            # instead we use active map to replace it
+            # stats error: stats_error[:, 0:10] is physical error.
+            # stats_error[:, 10:20] is terrain score (semantic error).
+            layout_ids = state_grid[:, 0].long().clamp_min(0).clamp_max(9)
+            feat_layout = self.layout_emb(layout_ids).permute(0, 3, 1, 2)
+            x = torch.cat([feat_layout, error_heatmap], dim=1)
+            x = self._add_coords(x)
+            x = self.net(x)
+            spatial_features = self.pool(x).flatten(1)
+            if stats_error is None:
+                stats_error = torch.zeros(B, 26, device=state_grid.device)
+            local_ctx = self.local_fc(spatial_features)
+            global_ctx = self.global_fc(stats_error)
+            combined = torch.cat([local_ctx, global_ctx], dim=1)
+            return self.fc(combined)
         
         # 1. Embedding 处理
         feat_obj = self.emb_object(state_grid[:, 0].long()).permute(0, 3, 1, 2)

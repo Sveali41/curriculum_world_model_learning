@@ -77,6 +77,16 @@ def train(cfg: DictConfig):
         val_result = run(val_cfg, net=result["net"])
         val_loss = val_result.get("avg_val_loss", "N/A")
         print(f"\n[Phase 2] Validation loss on dataset 2: {val_loss}")
+        if isinstance(val_loss, list) and len(val_loss) > 0 and isinstance(val_loss[0], dict):
+            metrics = val_loss[0]
+            token_metrics = {
+                k: v for k, v in metrics.items()
+                if k.startswith("val/token_")
+            }
+            if token_metrics:
+                ordered_keys = sorted(token_metrics.keys())
+                summary = ", ".join(f"{k}={float(token_metrics[k]):.6f}" for k in ordered_keys)
+                print(f"[Phase 2] Validation token metrics: {summary}")
 
 def compare_params(net, old_params):
     if old_params is None:
@@ -98,10 +108,6 @@ def run(
     replay_data=None,
     direct_data=None
 ):
-    if bool(getattr(cfg.attention_model, "train_bipedalwalker", False)):
-        with open_dict(cfg):
-            cfg.attention_model.env_type = "bipedalwalker"
-
     if net is None:
         from modelBased.world_model.AttentionWM import AttentionWorldModel
         net = AttentionWorldModel(cfg.attention_model)
@@ -165,7 +171,7 @@ def run(
         precision=32,
         logger=wandb_logger if use_wandb else None,
         max_epochs=cfg.attention_model.n_epochs,
-        accelerator="gpu",
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         gradient_clip_val=1.0,
         callbacks=[early_stop_callback, checkpoint_callback],

@@ -106,7 +106,37 @@ def normalize_obs(x, obs_norm_values):
     else:
         raise TypeError("Input must be a NumPy array or PyTorch tensor.")
 
-    if x.ndim == 3:
+    if x.ndim == 1:
+        if obs_norm_values is None or len(obs_norm_values) not in (1, x.shape[0]):
+            raise ValueError(
+                "Normalization values must be provided and must be either a scalar list or match the feature dimension."
+            )
+        if len(obs_norm_values) == 1:
+            max_val = obs_norm_values[0]
+            if max_val != 0:
+                x /= max_val
+        else:
+            for i in range(x.shape[0]):
+                max_val = obs_norm_values[i]
+                if max_val != 0:
+                    x[i] /= max_val
+
+    elif x.ndim == 2:
+        if obs_norm_values is None or len(obs_norm_values) not in (1, x.shape[1]):
+            raise ValueError(
+                "Normalization values must be provided and must be either a scalar list or match the feature dimension."
+            )
+        if len(obs_norm_values) == 1:
+            max_val = obs_norm_values[0]
+            if max_val != 0:
+                x /= max_val
+        else:
+            for i in range(x.shape[1]):
+                max_val = obs_norm_values[i]
+                if max_val != 0:
+                    x[:, i] /= max_val
+
+    elif x.ndim == 3:
         if obs_norm_values is None or len(obs_norm_values) != x.shape[0]:
             raise ValueError(
                 "Normalization values must be provided and must match the number of channels in the data."
@@ -130,13 +160,43 @@ def normalize_obs(x, obs_norm_values):
                 x[:, i, :, :] /= max_val
         x = x.reshape(bsz, channel, row, col)
     else:
-        raise ValueError("Input must be a 3D or 4D array.")
+        raise ValueError("Input must be a 1D, 2D, 3D or 4D array.")
 
     return x
 
 
 def denormalize_obj(x, obs_norm_values):
-    if x.ndim == 3:
+    if x.ndim == 1:
+        if obs_norm_values is None or len(obs_norm_values) not in (1, x.shape[0]):
+            raise ValueError(
+                "Normalization values must be provided and must be either a scalar list or match the feature dimension."
+            )
+        if len(obs_norm_values) == 1:
+            max_val = obs_norm_values[0]
+            if max_val != 0:
+                x *= max_val
+        else:
+            for i in range(x.shape[0]):
+                max_val = obs_norm_values[i]
+                if max_val != 0:
+                    x[i] *= max_val
+
+    elif x.ndim == 2:
+        if obs_norm_values is None or len(obs_norm_values) not in (1, x.shape[1]):
+            raise ValueError(
+                "Normalization values must be provided and must be either a scalar list or match the feature dimension."
+            )
+        if len(obs_norm_values) == 1:
+            max_val = obs_norm_values[0]
+            if max_val != 0:
+                x *= max_val
+        else:
+            for i in range(x.shape[1]):
+                max_val = obs_norm_values[i]
+                if max_val != 0:
+                    x[:, i] *= max_val
+
+    elif x.ndim == 3:
         if obs_norm_values is None or len(obs_norm_values) != x.shape[0]:
             raise ValueError(
                 "Normalization values must be provided and must match the number of channels in the data."
@@ -160,7 +220,7 @@ def denormalize_obj(x, obs_norm_values):
                 x[:, i, :, :] *= max_val
         x = x.reshape(bsz, channel, row, col)
     else:
-        raise ValueError("Input must be a 3D or 4D array.")
+        raise ValueError("Input must be a 1D, 2D, 3D or 4D array.")
 
     return x
 

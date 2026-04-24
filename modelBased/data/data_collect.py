@@ -14,6 +14,13 @@ from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper
 from domain.bipedalwalker.bipedalwalker_support import (
     wrap_env_from_text as wrap_bipedal_env_from_text,
 )
+from domain.bipedalwalker.bipedalwalker_support import read_layout_from_txt
+from domain.bipedalwalker.bipedal_walker_custom import (
+    TERRAIN_GRASS,
+    TERRAIN_LENGTH,
+    TERRAIN_STARTPAD,
+    TERRAIN_STEP,
+)
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import time
@@ -24,9 +31,216 @@ import os
 import hydra
 from omegaconf import DictConfig
 import numpy as np
+from collections import deque
 from multiprocessing import Pool, get_context
 import copy
 from matplotlib import pyplot as plt
+from gymnasium.wrappers import TimeLimit
+
+
+def _coerce_render_image(img):
+    """
+    Best-effort normalization of render outputs to an image ndarray.
+    Some env wrappers return nested tuples/lists or object arrays.
+    """
+    depth = 0
+    while isinstance(img, (tuple, list)) and len(img) > 0 and depth < 8:
+        img = img[0]
+        depth += 1
+
+    if isinstance(img, np.ndarray) and img.dtype == object and img.size > 0:
+        probe = img.reshape(-1)[0]
+        if isinstance(probe, (tuple, list, np.ndarray)):
+            img = probe
+            depth = 0
+            while isinstance(img, (tuple, list)) and len(img) > 0 and depth < 8:
+                img = img[0]
+                depth += 1
+
+    if not isinstance(img, np.ndarray):
+        try:
+            img = np.asarray(img)
+        except Exception:
+            return None
+
+    if not isinstance(img, np.ndarray):
+        return None
+
+    if img.dtype == object or img.ndim < 2:
+        return None
+
+    return img
+
+
+class BipedalMixedPolicy:
+    expects_raw_obs = True
+
+    def __init__(self, expert_policy, heuristic_policy, expert_ratio=0.5):
+        self.expert_policy = expert_policy
+        self.heuristic_policy = heuristic_policy
+        self.expert_ratio = float(expert_ratio)
+        self.current_policy = heuristic_policy
+
+    def reset(self):
+        # Decide which policy to use for the next episode
+        if np.random.random() < self.expert_ratio:
+            self.current_policy = self.expert_policy
+        else:
+            self.current_policy = self.heuristic_policy
+        
+        if hasattr(self.current_policy, "reset"):
+            return self.current_policy.reset()
+        return None
+
+    def select_action(self, obs, add_noise=True):
+        return self.current_policy.select_action(obs, add_noise=add_noise)
+
+
+class SB3BipedalPolicy:
+    expects_raw_obs = True
+
+    def __init__(self, model, action_space, noise_std=0.15, deterministic=False):
+        self.model = model
+        self.action_space = action_space
+        self.noise_std = float(noise_std)
+        self.deterministic = bool(deterministic)
+
+    def reset(self):
+        # Stateless wrapper to match the heuristic policy interface.
+        return None
+
+    def select_action(self, obs, add_noise=True):
+        action, _ = self.model.predict(obs, deterministic=self.deterministic)
+        action = np.asarray(action, dtype=np.float32).reshape(self.action_space.shape)
+        if add_noise and self.noise_std > 0:
+            action = action + np.random.normal(0.0, self.noise_std, size=action.shape).astype(np.float32)
+        return np.clip(action, self.action_space.low, self.action_space.high)
+
+
+def _resolve_coverage_vis_target(cfg):
+    collect_cfg = cfg.env.collect if hasattr(cfg.env, "collect") else cfg.env
+    filename = getattr(collect_cfg, "visualize_filename", "coverage.png")
+    vis_save_path = getattr(collect_cfg, "visualize_save_path", "trainer/logs/dataset_visualization")
+    env_type = str(getattr(cfg.env, "env_type", "")).lower()
+    data_type = str(getattr(collect_cfg, "data_type", "random")).lower()
+
+    if env_type == "bipedalwalker":
+        stem, ext = os.path.splitext(filename)
+        if data_type and data_type not in stem:
+            if stem.endswith("_coverage"):
+                stem = stem[: -len("_coverage")] + f"_{data_type}_coverage"
+            else:
+                stem = f"{stem}_{data_type}"
+        filename = f"{stem}{ext or '.png'}"
+
+        domain_name = str(getattr(cfg, "domain", env_type))
+        task_group = None
+        if hasattr(cfg, "domains") and domain_name in cfg.domains:
+            task_group = str(getattr(cfg.domains[domain_name], "task_group", ""))
+        if task_group == "target":
+            vis_save_path = os.path.join(
+                PROJECT_ROOT,
+                "trainer",
+                "logs",
+                "dataset_visualization",
+                "target",
+                "bipedal",
+            )
+
+    return filename, vis_save_path
+
+
+def _build_bipedal_behavior_policy(cfg, env):
+    from domain.bipedalwalker.bipedalwalker_support import BipedalHeuristicPolicy
+
+    if not hasattr(cfg, "domains") or "bipedalwalker" not in cfg.domains:
+        print("[Policy] behavior_policy=heuristic | source=default_fallback | prior_weight=0.3")
+        return BipedalHeuristicPolicy(prior_weight=0.3)
+
+    domain_cfg = cfg.domains.bipedalwalker
+    prior_weight = float(getattr(domain_cfg, "bipedal_prior_weight", 0.3))
+
+    # Auto-select: uniform collection -> always use pretrained_sb3 for better coverage
+    collect_cfg = getattr(cfg.env, "collect", cfg.env) if hasattr(cfg, "env") else None
+    data_type = str(getattr(collect_cfg, "data_type", "random")).lower() if collect_cfg else "random"
+    if data_type == "uniform":
+        behavior_policy = "pretrained_sb3"
+        print("[Policy] data_type=uniform -> auto-selecting pretrained_sb3 policy for BipedalWalker.")
+    else:
+        behavior_policy = str(getattr(domain_cfg, "behavior_policy", "heuristic")).lower()
+
+    if behavior_policy == "heuristic":
+        print(
+            "[Policy] behavior_policy=heuristic | "
+            f"prior_weight={prior_weight}"
+        )
+        return BipedalHeuristicPolicy(prior_weight=prior_weight)
+
+    def load_sb3_policy():
+        model_path = getattr(domain_cfg, "sb3_model_path", None)
+        algo_name = str(getattr(domain_cfg, "sb3_algo", "SAC")).upper()
+        deterministic = bool(getattr(domain_cfg, "sb3_deterministic", False))
+        noise_std = float(getattr(domain_cfg, "sb3_noise_std", 0.15))
+
+        try:
+            if algo_name == "SAC":
+                from stable_baselines3 import SAC as SB3Algo
+            elif algo_name == "PPO":
+                from stable_baselines3 import PPO as SB3Algo
+            else:
+                raise ValueError(f"Unsupported SB3 algo for bipedal behavior policy: {algo_name}")
+        except ImportError as exc:
+            raise ImportError(
+                "stable_baselines3 is required for behavior_policy='pretrained_sb3' or 'mix'. "
+                "Install it or use 'heuristic'. "
+                f"Original import error: {exc}"
+            ) from exc
+
+        if model_path:
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"SB3 model not found: {model_path}")
+            model = SB3Algo.load(model_path, device='cpu')
+            source_desc = f"local:{model_path}"
+        else:
+            try: from huggingface_sb3 import load_from_hub
+            except ImportError as exc: raise ImportError("huggingface_sb3 required to auto-download model.")
+            repo_id = getattr(domain_cfg, "sb3_repo_id", "sb3/sac-BipedalWalkerHardcore-v3")
+            filename = getattr(domain_cfg, "sb3_filename", "sac-BipedalWalkerHardcore-v3.zip")
+            custom_objects = {"learning_rate": 0.0, "lr_schedule": lambda _: 0.0, "clip_range": lambda _: 0.0}
+            checkpoint = load_from_hub(repo_id=repo_id, filename=filename)
+            model = SB3Algo.load(checkpoint, custom_objects=custom_objects, device='cpu')
+            source_desc = f"hf:{repo_id}/{filename}"
+
+        print(
+            "[Policy] behavior_policy=pretrained_sb3 | "
+            f"algo={algo_name} | "
+            f"deterministic={deterministic} | "
+            f"noise_std={noise_std} | "
+            f"source={source_desc}"
+        )
+
+        return SB3BipedalPolicy(
+            model=model,
+            action_space=env.action_space,
+            noise_std=noise_std,
+            deterministic=deterministic,
+        )
+
+    if behavior_policy == "pretrained_sb3":
+        return load_sb3_policy()
+
+    if behavior_policy == "mix":
+        expert_ratio = float(getattr(domain_cfg, "expert_ratio", 0.5))
+        expert_policy = load_sb3_policy()
+        heuristic_policy = BipedalHeuristicPolicy(prior_weight=prior_weight)
+        print(
+            "[Policy] behavior_policy=mix | "
+            f"expert_ratio={expert_ratio} | "
+            f"heuristic_prior_weight={prior_weight}"
+        )
+        return BipedalMixedPolicy(expert_policy, heuristic_policy, expert_ratio=expert_ratio)
+
+    return BipedalHeuristicPolicy(prior_weight=prior_weight)
 
 def visualize_env(env, cfg: DictConfig, save_img=False):
     env.reset()[0]
@@ -302,6 +516,7 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     has_carried_key_this_episode = False  # 新增：本轮是否已经捡过钥匙
     step_in_episode = 0  # 当前 episode 中的 step 计数器
     max_x_in_episode = 0.0  # BipedalWalker only: Odometry tracking
+    max_x_global = 0.0  # BipedalWalker only: max distance across the full collection run
     collect_cfg = cfg.env.collect if hasattr(cfg, "env") else cfg.collect
     if hasattr(collect_cfg, "env_type") and collect_cfg.env_type:
         task_name = str(collect_cfg.env_type).lower()
@@ -314,6 +529,7 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     is_minigrid = (not is_crafter) and (not is_bipedal)
     data_type = str(getattr(collect_cfg, "data_type", "")).lower()
     maximum_dataset_size = getattr(collect_cfg, "maximum_dataset_size", None)
+    domain_cfg = getattr(getattr(cfg, "domains", None), "bipedalwalker", None) if is_bipedal else None
 
     # --- 1. Exhaustive Shuffled Queue for 100% Coverage ---
     ground_tiles_queue = []
@@ -336,12 +552,32 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
         ground_tiles_queue.append(pt)
         return pt
 
+    def _maybe_add_bipedal_spawn(reset_kwargs):
+        if not (is_bipedal and data_type == "uniform"):
+            return reset_kwargs
+        fixed_start_ratio = float(getattr(domain_cfg, "uniform_fixed_start_ratio", 0.3))
+        fixed_start_ratio = min(max(fixed_start_ratio, 0.0), 1.0)
+        use_fixed_start = np.random.random() < fixed_start_ratio
+        if use_fixed_start:
+            return reset_kwargs
+
+        max_x = (TERRAIN_LENGTH - 10) * TERRAIN_STEP
+        spawn_x = np.random.uniform(TERRAIN_STARTPAD * TERRAIN_STEP, max_x)
+        reset_kwargs = dict(reset_kwargs)
+        if "options" in reset_kwargs and reset_kwargs["options"] is not None:
+            reset_kwargs["options"] = dict(reset_kwargs["options"])
+        else:
+            reset_kwargs["options"] = {}
+        reset_kwargs["options"]["spawn_x"] = spawn_x
+        return reset_kwargs
+
     # --- Initial Reset ---
     reset_kwargs = {}
     if randomize_inventory and is_crafter:
         sp = get_next_spawn_point()
         if sp: reset_kwargs['agent_pos'] = sp
-    
+    reset_kwargs = _maybe_add_bipedal_spawn(reset_kwargs)
+
     obs = env.reset(**reset_kwargs)[0]
 
     # --- BOOST 1: Randomize the very FIRST episode if needed ---
@@ -370,6 +606,7 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     # Check both collect_cfg and cfg.env for save flags to support older configs
     should_save_vis = getattr(collect_cfg, "save_env_visualize", False) or getattr(cfg.env, "save_visualized_img", False)
     if should_save_vis:
+        raw_img = None
         try:
             try:
                 img = env.get_frame()
@@ -386,15 +623,8 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
                 except Exception:
                     img = env.render()
         
-        # fix: Extract actual image array if nested in tuple
-        while isinstance(img, tuple) or isinstance(img, list):
-            img = img[0]
-            
-        if not isinstance(img, np.ndarray):
-            try:
-                img = np.array(img)
-            except:
-                pass
+        raw_img = img
+        img = _coerce_render_image(img)
         
         # --- save locally ---
         env_vis_path = getattr(collect_cfg, "env_visualize_save_path", getattr(cfg.env, "visualize_save_path", "trainer/logs/env_visualization"))
@@ -403,8 +633,10 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
         save_path = os.path.join(env_vis_path, img_filename)
 
         import matplotlib.pyplot as plt
-        
-        if is_crafter and isinstance(obs, dict) and 'inventory' in obs:
+
+        if img is None:
+            print(f"[Saved Frame Skipped] Unsupported render output type: {type(raw_img)}")
+        elif is_crafter and isinstance(obs, dict) and 'inventory' in obs:
             fig, ax = plt.subplots(figsize=(8, 8))
             ax.imshow(img)
             ax.axis('off')
@@ -424,24 +656,19 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
             plt.tight_layout()
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             plt.close(fig)
+            print(f"[Saved Frame] {save_path}")
         else:
             plt.imsave(save_path, img)
-
-        print(f"[Saved Frame] {save_path}")
+            print(f"[Saved Frame] {save_path}")
 
     # Define meaningful actions (forward, turn_left, turn_right)
     if is_crafter:
         meaningful_actions = list(range(env.action_space.n))
     elif is_bipedal:
         meaningful_actions = None
-        # Initialize the heuristic policy to be used as a 30% prior if no external policy is given
+        # Build the default behavior policy only for BipedalWalker collection.
         if policy is None:
-            from domain.bipedalwalker.bipedalwalker_support import BipedalHeuristicPolicy
-            # Extract prior weight from cfg.domains.bipedalwalker if available, specific only to BipedalWalker
-            prior_weight = 0.3
-            if hasattr(cfg, "domains") and "bipedalwalker" in cfg.domains:
-                prior_weight = getattr(cfg.domains.bipedalwalker, "bipedal_prior_weight", 0.3)
-            bipedal_prior_policy = BipedalHeuristicPolicy(prior_weight=prior_weight)
+            bipedal_prior_policy = _build_bipedal_behavior_policy(cfg, env)
     else:
         meaningful_actions = [
             env.unwrapped.actions.forward,
@@ -455,6 +682,15 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     target_episodes = collect_cfg.episodes
     mini_dataset_size = getattr(collect_cfg, "mini_dataset_size", 0)
     obs_norm_values = getattr(getattr(cfg, "attention_model", None), "obs_norm_values", None)
+    if is_bipedal:
+        stuck_window = int(getattr(domain_cfg, "stuck_window", 40))
+        stuck_x_threshold = float(getattr(domain_cfg, "stuck_x_threshold", 0.25))
+        stuck_action_threshold = float(getattr(domain_cfg, "stuck_action_threshold", 0.05))
+        stuck_reward_threshold = float(getattr(domain_cfg, "stuck_reward_threshold", -0.2))
+        stuck_min_steps = int(getattr(domain_cfg, "stuck_min_steps", 60))
+        recent_hull_x = deque(maxlen=stuck_window)
+        recent_rewards = deque(maxlen=stuck_window)
+        recent_actions = deque(maxlen=stuck_window)
 
     def _build_policy_state(obs_img):
         obs_np = np.asarray(obs_img)
@@ -535,7 +771,7 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
                     act = np.random.choice(meaningful_actions, p=action_probs)
             elif is_bipedal:
                 if policy is None:
-                    # Use the 30% heuristic prior + noise instead of pure sample()
+                    # Use the configured bipedal behavior policy instead of pure random sampling.
                     act = bipedal_prior_policy.select_action(obs_image, add_noise=True)
 
                 else:
@@ -562,6 +798,8 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
             if is_bipedal:
                 current_x = getattr(env.unwrapped, "hull", None).position[0] if hasattr(env.unwrapped, "hull") else 0.0
                 max_x_in_episode = max(max_x_in_episode, current_x)
+                max_x_global = max(max_x_global, current_x)
+                stuck_terminated = False
 
 
             # --- P2E: Override reward with intrinsic if provided ---
@@ -571,10 +809,29 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
                 if policy is not None and hasattr(policy, "record_transition"):
                     policy.record_transition(float(reward), bool(done))
 
+            if is_bipedal:
+                recent_hull_x.append(float(current_x))
+                recent_rewards.append(float(reward))
+                recent_actions.append(np.asarray(act, dtype=np.float32).reshape(-1).copy())
+                if len(recent_hull_x) == stuck_window and step_in_episode >= stuck_min_steps:
+                    x_progress = float(max(recent_hull_x) - min(recent_hull_x))
+                    mean_reward = float(np.mean(recent_rewards))
+                    action_std = float(np.mean(np.std(np.stack(recent_actions, axis=0), axis=0)))
+                    low_progress = x_progress < stuck_x_threshold
+                    low_action_change = action_std < stuck_action_threshold
+                    low_reward = mean_reward < stuck_reward_threshold
+                    if low_progress and (low_action_change or low_reward):
+                        done = True
+                        stuck_terminated = True
+
             if is_minigrid and hasattr(env, "env") and getattr(env.env, "carrying", None) is not None:
                 info['carrying_key'] = (env.env.carrying.type == 'key')
             else:
                 info['carrying_key'] = False
+            if is_bipedal:
+                info['hull_x'] = float(current_x)
+                info['episode_done'] = bool(done or trunc)
+                info['stuck_terminated'] = bool(stuck_terminated) if 'stuck_terminated' in locals() else False
             # check the data
             # if not has_carried_key_this_episode and info['carrying_key']:
             #     tqdm.write(f"[Episode {episodes}] First time carrying key at step {step_in_episode}! Action: {act}")
@@ -643,20 +900,35 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
 
             # Reset environment on episode end
             if done or trunc:
-                info_list.pop()
+                if not is_bipedal:
+                    info_list.pop()
                 episodes += 1
                 pbar.update(1)
                 
                 # --- BipedalWalker Odometry Print ---
                 if is_bipedal:
-                    pbar.write(f"[Episode {episodes}] Finished. Max Travel Distance: {max_x_in_episode:.2f}m")
+                    if info.get("stuck_terminated", False):
+                        pbar.write(
+                            f"[Episode {episodes}] Early stop: stuck detected at step {step_in_episode}. "
+                            f"Hull x={info['hull_x']:.2f}"
+                        )
+                    pbar.write(
+                        f"[Episode {episodes}] Finished. "
+                        f"Episode Max Distance: {max_x_in_episode:.2f}m | "
+                        f"Global Max Distance: {max_x_global:.2f}m"
+                    )
                     max_x_in_episode = 0.0  # Reset
+                    recent_hull_x.clear()
+                    recent_rewards.clear()
+                    recent_actions.clear()
                 
                 # --- BOOST 2: Exhaustive Spawning (Cycling through all tiles) ---
                 reset_kwargs = {}
                 if randomize_inventory and is_crafter:
                     sp = get_next_spawn_point()
                     if sp: reset_kwargs['agent_pos'] = sp
+
+                reset_kwargs = _maybe_add_bipedal_spawn(reset_kwargs)
 
                 obs = env.reset(**reset_kwargs)[0]
                 
@@ -686,6 +958,8 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
                 obs = obs_next
 
     info_list.pop()
+    if is_bipedal:
+        print(f"[RunEnv] Final global max distance across collected data: {max_x_global:.2f}m")
     # Convert collected data to numpy arrays
     obs_np = np.concatenate(obs_list)
     obs_next_np = np.concatenate(obs_next_list)
@@ -721,6 +995,13 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     print(f"Dones shape: {done_np.shape}")
     print(f"Number of episodes started: {episodes}")
     print(f"Unique state-action pairs visited: {len(visit_count)}")
+    if is_minigrid and len(obs_np) > 0:
+        action_vals, action_counts = np.unique(act_np.astype(np.int64), return_counts=True)
+        action_hist = {int(a): int(c) for a, c in zip(action_vals.tolist(), action_counts.tolist())}
+        agent_positions = get_agent_position(np.transpose(obs_np, (0, 3, 1, 2)))
+        unique_agent_positions = int(len(np.unique(agent_positions, axis=0))) if len(agent_positions) > 0 else 0
+        print(f"MiniGrid action histogram: {action_hist}")
+        print(f"MiniGrid unique agent positions: {unique_agent_positions}")
     env.close()
 
     return obs_np, obs_next_np, act_np, rew_np, done_np, info_np, inv_np, inv_next_np
@@ -1241,11 +1522,13 @@ def data_collect(cfg: DictConfig):
             os.environ["SDL_VIDEODRIVER"] = "dummy"
         
         env_path = getattr(cfg.env, "env_path", None)
+        max_steps = getattr(cfg.env, "max_steps", 10000)
         from domain.bipedalwalker.custom_bipedal_env import CustomBipedalEnv
         if env_path and os.path.exists(env_path):
             env = wrap_bipedal_env_from_text(env_path, render_mode=mode)
         else:
             env = CustomBipedalEnv(render_mode=mode)
+        env = TimeLimit(env, max_episode_steps=max_steps)
     else:
         env_path = getattr(cfg.env, "env_path", None)
         max_steps = getattr(cfg.env, "max_steps", 10000)
@@ -1271,23 +1554,26 @@ def data_collect(cfg: DictConfig):
     # coverage visualization
     data_path = cfg.env.collect.data_save_path
     if getattr(cfg.env.collect, "save_coverage_visualize", False) and os.path.exists(data_path):
-        filename = getattr(cfg.env.collect, "visualize_filename", "coverage.png")
-        vis_save_path = getattr(cfg.env.collect, "visualize_save_path", "trainer/logs/dataset_visualization")
+        filename, vis_save_path = _resolve_coverage_vis_target(cfg)
         os.makedirs(vis_save_path, exist_ok=True)
         save_path = os.path.join(vis_save_path, filename)
         data = np.load(data_path, allow_pickle=True)
-        if data["a"].ndim < 4:
-            print(f"[Visualization] Skipped coverage plot for non-grid observation shape: {data['a'].shape}")
-            env.close()
-            return
-
         collect_cfg = cfg.env.collect if hasattr(cfg.env, "collect") else cfg.env
         dataset_type = getattr(collect_cfg, "data_type", "Random")
-        visualize_agent_coverage(
-            data,
-            save_path=save_path,
-            title=f"Agent Position Coverage ({dataset_type})"
-        )
+        if data["a"].ndim == 2 and cfg.env.env_type == "bipedalwalker":
+            layout_source = getattr(cfg.env.collect, "current_layout_str", None) or getattr(cfg.env, "env_path", None)
+            visualize_bipedal_coverage_1d(
+                data,
+                layout_source=layout_source,
+                save_path=save_path,
+                title=f"Bipedal 1D Coverage ({dataset_type})",
+            )
+        else:
+            visualize_agent_coverage(
+                data,
+                save_path=save_path,
+                title=f"Agent Position Coverage ({dataset_type})"
+            )
 
     env.close()
 
@@ -1298,6 +1584,7 @@ def data_collect_api_multiprocess(cfg: DictConfig, env, wandb_run, save_img=Fals
     save_experiments(cfg.env,obs,obs_next, act, rew, done, info)
 
 def data_collect_api(cfg: DictConfig, env, wandb_run, save_img, log_name, max_steps):
+    runtime_bipedal_layout_source = _resolve_runtime_bipedal_layout_source(cfg, env)
     hparam = copy.deepcopy(cfg)
     original_episodes = hparam.env.collect.episodes
 
@@ -1341,7 +1628,19 @@ def data_collect_api(cfg: DictConfig, env, wandb_run, save_img, log_name, max_st
 
         print("[Single-run] Finished collecting. Saving dataset...")
             # jump to the saving section
-        return _finalize_and_save(cfg, env, obs_all, obsn_all, act_all, rew_all, done_all, info_all, inv_all, invn_all)
+        return _finalize_and_save(
+            cfg,
+            env,
+            obs_all,
+            obsn_all,
+            act_all,
+            rew_all,
+            done_all,
+            info_all,
+            inv_all,
+            invn_all,
+            layout_source=runtime_bipedal_layout_source,
+        )
     
 
     # ------------------------------------------------------
@@ -1387,14 +1686,38 @@ def data_collect_api(cfg: DictConfig, env, wandb_run, save_img, log_name, max_st
         round_idx += 1
         save_img = False
 
-    return _finalize_and_save(cfg, env, obs_all, obsn_all, act_all, rew_all, done_all, info_all, inv_all, invn_all)
+    return _finalize_and_save(
+        cfg,
+        env,
+        obs_all,
+        obsn_all,
+        act_all,
+        rew_all,
+        done_all,
+        info_all,
+        inv_all,
+        invn_all,
+        layout_source=runtime_bipedal_layout_source,
+    )
 
 
 
 # ----------------------------------------------------------
 # Helper: final save + visualization
 # ----------------------------------------------------------
-def _finalize_and_save(cfg, env, obs_all, obsn_all, act_all, rew_all, done_all, info_all, inv_all=None, invn_all=None):
+def _finalize_and_save(
+    cfg,
+    env,
+    obs_all,
+    obsn_all,
+    act_all,
+    rew_all,
+    done_all,
+    info_all,
+    inv_all=None,
+    invn_all=None,
+    layout_source=None,
+):
 
     # merge
     obs_all = np.concatenate(obs_all, axis=0)
@@ -1420,21 +1743,26 @@ def _finalize_and_save(cfg, env, obs_all, obsn_all, act_all, rew_all, done_all, 
     # visualization
     data_path = cfg.env.collect.data_save_path
     if cfg.env.collect.save_coverage_visualize and os.path.exists(data_path):
-        filename = getattr(cfg.env.collect, "visualize_filename", None)
-        save_path = os.path.join(cfg.env.collect.visualize_save_path, filename)
+        filename, vis_save_path = _resolve_coverage_vis_target(cfg)
+        os.makedirs(vis_save_path, exist_ok=True)
+        save_path = os.path.join(vis_save_path, filename)
         data = np.load(data_path, allow_pickle=True)
-        if data["a"].ndim < 4:
-            print(f"[Visualization] Skipped coverage plot for non-grid observation shape: {data['a'].shape}")
-            env.close()
-            return obs_all, obsn_all, act_all, rew_all, done_all, info_all
-
         collect_cfg = cfg.env.collect if hasattr(cfg.env, "collect") else cfg.env
         dataset_type = getattr(collect_cfg, "data_type", "Random")
-        visualize_agent_coverage(
-            data,
-            save_path=save_path,
-            title=f"Agent Position Coverage ({dataset_type})"
-        )
+        if data["a"].ndim == 2 and cfg.env.env_type == "bipedalwalker":
+            layout_source = layout_source or _resolve_runtime_bipedal_layout_source(cfg, env)
+            visualize_bipedal_coverage_1d(
+                data,
+                layout_source=layout_source,
+                save_path=save_path,
+                title=f"Bipedal 1D Coverage ({dataset_type})",
+            )
+        else:
+            visualize_agent_coverage(
+                data,
+                save_path=save_path,
+                title=f"Agent Position Coverage ({dataset_type})"
+            )
 
     env.close()
 
@@ -1463,21 +1791,27 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
     else:
         positions = get_agent_position(obs_np)  # (N, 2)
 
-    # 自动推断地图大小
+    # 自动推断地图大小 (Standardized to NCHW from save_experiments)
     if isinstance(obs_np, torch.Tensor):
         obs_np = obs_np.detach().cpu().numpy()
-    if len(obs_np.shape) != 4:
-        raise ValueError(f"Input must be (N, C, H, W), but got {obs_np.shape}")
-    H, W = obs_np.shape[2], obs_np.shape[3]
+    
+    if obs_np.ndim == 4 and obs_np.shape[1] > 8: # If still NHWC for some reason
+        obs_np = ColRowCanl_to_CanlRowCol(obs_np)
+        
+    Height, Width = obs_np.shape[2], obs_np.shape[3]
+    positions = get_agent_position(obs_np)  # Returns (y, x) for NCHW
 
     # -------------------------------
     # Step 2: 统计访问次数
     # -------------------------------
-    heatmap = np.zeros((H, W))
+    heatmap = np.zeros((Height, Width)) 
+    
     for (y, x) in positions:
-        # Ignore boundary water (outermost row/column) for cleaner visualization
-        if 1 <= y < H - 1 and 1 <= x < W - 1:
+        # In NCHW processed by ColRowCanl_to_CanlRowCol, p1 is y, p2 is x
+        if 0 <= y < Height and 0 <= x < Width:
             heatmap[y, x] += 1
+
+    # Heatmap is now naturally (Row, Col) which matches imshow expectation.
 
     # Heatmap is now naturally (Row, Col) which matches imshow expectation.
 
@@ -1558,19 +1892,297 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
         plt.show()
     plt.close()
 
-def visualize_saved_dataset(data_path, save_path, fig_name):
+
+def _extract_bipedal_x_positions_and_episode_max(data):
+    info_np = data.get("f", None)
+    if info_np is None:
+        raise ValueError("Saved dataset does not contain info needed for Bipedal coverage visualization.")
+
+    x_positions = []
+    episode_maxima = []
+    current_max = None
+
+    for item in np.asarray(info_np).reshape(-1):
+        info = item.item() if isinstance(item, np.ndarray) and item.shape == () else item
+        if isinstance(info, (list, tuple)) and len(info) == 1:
+            info = info[0]
+        if not isinstance(info, dict):
+            continue
+        if "hull_x" not in info:
+            continue
+        x_val = float(info["hull_x"])
+        x_positions.append(x_val)
+        current_max = x_val if current_max is None else max(current_max, x_val)
+        if bool(info.get("episode_done", False)):
+            episode_maxima.append(current_max if current_max is not None else x_val)
+            current_max = None
+
+    if current_max is not None:
+        episode_maxima.append(current_max)
+
+    if not x_positions:
+        raise ValueError(
+            "No 'hull_x' values found in dataset info. Re-collect Bipedal data after enabling odometry logging."
+        )
+
+    return np.asarray(x_positions, dtype=np.float32), np.asarray(episode_maxima, dtype=np.float32)
+
+
+def _resolve_bipedal_layout_string(layout_source):
+    if layout_source is None:
+        raise ValueError("Bipedal coverage visualization requires a layout path or a raw layout string.")
+
+    if isinstance(layout_source, os.PathLike):
+        return read_layout_from_txt(layout_source)
+
+    if isinstance(layout_source, str):
+        if os.path.exists(layout_source):
+            return read_layout_from_txt(layout_source)
+        return layout_source.strip()
+
+    raise TypeError(f"Unsupported bipedal layout source type: {type(layout_source)!r}")
+
+
+def _resolve_runtime_bipedal_layout_source(cfg, env=None):
+    collect_cfg = cfg.env.collect if hasattr(cfg.env, "collect") else cfg.env
+    layout_source = getattr(collect_cfg, "current_layout_str", None)
+    if layout_source:
+        return layout_source
+    if env is not None and hasattr(env, "layout_str") and getattr(env, "layout_str", None):
+        return env.layout_str
+    return getattr(cfg.env, "env_path", None)
+
+
+def _compute_bipedal_layout_regions(layout_source):
+    layout_str = _resolve_bipedal_layout_string(layout_source)
+    import re
+
+    tokens = re.findall(r'([RGSPT])(-?\d+\.?\d*)', layout_str.replace(" ", ""))
+    x_cursor = 0.0
+    regions = []
+    active_roughness = None
+    active_roughness_start = None
+
+    def _close_roughness_region(x_end):
+        nonlocal active_roughness, active_roughness_start
+        if active_roughness is None or active_roughness_start is None or x_end <= active_roughness_start:
+            return
+        regions.append(
+            {
+                "type": "roughness",
+                "x_start": active_roughness_start,
+                "x_end": x_end,
+                "value": float(active_roughness),
+            }
+        )
+        active_roughness = None
+        active_roughness_start = None
+
+    for type_char, value_str in tokens:
+        value = float(value_str)
+        if type_char == "R":
+            _close_roughness_region(x_cursor)
+            active_roughness = value
+            active_roughness_start = x_cursor
+            continue
+        if type_char == "G":
+            width = int(value) * TERRAIN_STEP
+            if width > 0:
+                regions.append({"type": "grass", "x_start": x_cursor, "x_end": x_cursor + width})
+            x_cursor += width
+            continue
+        if type_char == "S":
+            width = max(TERRAIN_STEP, float(value) * TERRAIN_STEP)
+            regions.append({"type": "stump", "x_start": x_cursor, "x_end": x_cursor + width})
+            x_cursor += width
+            continue
+        if type_char == "P":
+            width = (int(value) + 2) * TERRAIN_STEP
+            regions.append({"type": "pit", "x_start": x_cursor, "x_end": x_cursor + width})
+            x_cursor += width
+            continue
+        if type_char == "T":
+            stair_width = 4
+            stair_steps = abs(int(value)) if int(value) != 0 else 3
+            width = stair_steps * stair_width * TERRAIN_STEP
+            regions.append({"type": "stairs", "x_start": x_cursor, "x_end": x_cursor + width})
+            x_cursor += width
+
+    _close_roughness_region(x_cursor)
+
+    spawn_x = TERRAIN_STEP * TERRAIN_STARTPAD / 2.0
+    target_x = TERRAIN_STEP * (TERRAIN_LENGTH - TERRAIN_GRASS)
+    return {
+        "layout_str": layout_str,
+        "regions": regions,
+        "spawn_x": spawn_x,
+        "target_x": target_x,
+    }
+
+
+def visualize_bipedal_coverage_1d(data, layout_source, save_path=None, title="Bipedal Coverage"):
+    x_positions, episode_maxima = _extract_bipedal_x_positions_and_episode_max(data)
+    layout_meta = _compute_bipedal_layout_regions(layout_source)
+
+    import matplotlib
+    if save_path:
+        matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    max_data_x = float(np.max(x_positions)) if len(x_positions) > 0 else 0.0
+    plot_max_x = max(max_data_x, float(layout_meta["target_x"])) + TERRAIN_STEP
+    bins = max(20, int(np.ceil(plot_max_x / TERRAIN_STEP)))
+
+    fig, (ax_hist, ax_layout) = plt.subplots(
+        2, 1, figsize=(14, 7.2), sharex=True, gridspec_kw={"height_ratios": [2.1, 1.9]}
+    )
+    ax_hist.set_facecolor("white")
+    ax_layout.set_facecolor("white")
+
+    counts, edges = np.histogram(x_positions, bins=bins, range=(0.0, plot_max_x))
+    counts = counts.astype(np.float32)
+    heat = counts / counts.max() if counts.max() > 0 else counts
+    if counts.max() > 0:
+        heat = np.where(counts > 0, 0.25 + 0.75 * heat, 0.0)
+
+    from matplotlib.colors import LinearSegmentedColormap
+    cmap = LinearSegmentedColormap.from_list(
+        "coverage_white_blue",
+        ["#ffffff", "#d6e9ff", "#7db7ff", "#1f6fd5", "#0b2f6b"],
+    )
+    band_y = 0.0
+    band_h = 1.0
+    for idx in range(len(counts)):
+        if counts[idx] <= 0:
+            continue
+        left = edges[idx]
+        width = edges[idx + 1] - edges[idx]
+        ax_hist.bar(
+            left,
+            band_h,
+            bottom=band_y,
+            width=width,
+            align="edge",
+            color=cmap(float(heat[idx])),
+            edgecolor="none",
+        )
+
+    region_colors = {
+        "grass": "#b8d99b",
+        "stump": "#d62728",
+        "pit": "#1f77b4",
+        "stairs": "#ff7f0e",
+        "roughness": "#7a7a7a",
+    }
+    roughness_values = [float(region["value"]) for region in layout_meta["regions"] if region["type"] == "roughness"]
+    if roughness_values:
+        rough_vmin = min(roughness_values)
+        rough_vmax = max(roughness_values)
+        if np.isclose(rough_vmin, rough_vmax):
+            rough_vmax = rough_vmin + 1e-6
+        rough_norm = matplotlib.colors.Normalize(vmin=rough_vmin, vmax=rough_vmax)
+        rough_cmap = matplotlib.cm.get_cmap("Greys")
+    else:
+        rough_norm = None
+        rough_cmap = None
+
+    region_draw_order = {"grass": 0, "roughness": 1, "pit": 2, "stairs": 3, "stump": 4}
+    for region in sorted(layout_meta["regions"], key=lambda r: (region_draw_order.get(r["type"], 99), r["x_start"])):
+        color = region_colors.get(region["type"], "#999999")
+        label_text = region["type"]
+        if region["type"] == "roughness" and rough_norm is not None and rough_cmap is not None:
+            color = rough_cmap(0.45 + 0.40 * float(rough_norm(region["value"])))
+            label_text = f"R {region['value']:.2f}"
+        width = region["x_end"] - region["x_start"]
+        edgecolor = "#444444"
+        linewidth = 0.8
+        alpha = 0.35
+        y0 = 0.0
+        height = 1.0
+        if region["type"] == "grass":
+            continue
+        elif region["type"] == "roughness":
+            alpha = 0.35
+            y0 = 0.0
+            height = 1.0
+        ax_layout.add_patch(
+            plt.Rectangle(
+                (region["x_start"], y0),
+                width,
+                height,
+                facecolor=color,
+                edgecolor=edgecolor,
+                linewidth=linewidth,
+                alpha=alpha,
+            )
+        )
+    ax_layout.axvline(layout_meta["spawn_x"], color="#444444", linestyle="--", linewidth=1.2)
+    ax_layout.axvline(layout_meta["target_x"], color="#2ca02c", linestyle="--", linewidth=1.6)
+
+    ax_hist.set_ylim(0.0, 1.0)
+    ax_hist.set_yticks([])
+    ax_hist.set_ylabel("Coverage")
+    ax_hist.set_title(title, fontsize=12, fontweight="bold")
+    ax_hist.text(
+        0.01,
+        0.96,
+        f"max visited x = {max_data_x:.2f}m | target x = {layout_meta['target_x']:.2f}m",
+        transform=ax_hist.transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        bbox=dict(facecolor="white", alpha=0.75, edgecolor="none"),
+    )
+
+    ax_hist.set_xlim(0.0, plot_max_x)
+    ax_layout.set_xlim(0.0, plot_max_x)
+    ax_layout.set_ylim(0.0, 1.0)
+    ax_layout.margins(x=0.0, y=0.0)
+    ax_layout.set_yticks([])
+    ax_layout.set_ylabel("Layout")
+    ax_layout.set_xlabel("X Position (m)")
+    ax_layout.hlines(0.50, 0.0, plot_max_x, colors="#9a9a9a", linewidth=1.2)
+    handles = [
+        plt.Line2D([0], [0], color="#444444", linestyle="--", label="spawn"),
+        plt.Line2D([0], [0], color="#2ca02c", linestyle="--", label="target"),
+        plt.Rectangle((0, 0), 1, 1, color=region_colors["stump"], alpha=0.35, label="stump"),
+        plt.Rectangle((0, 0), 1, 1, color=region_colors["pit"], alpha=0.35, label="pit"),
+        plt.Rectangle((0, 0), 1, 1, color=region_colors["stairs"], alpha=0.35, label="stairs"),
+        plt.Rectangle((0, 0), 1, 1, color=region_colors["roughness"], alpha=0.35, label="roughness"),
+    ]
+    ax_layout.legend(handles=handles, loc="upper right", fontsize=9, framealpha=0.85)
+
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"Bipedal 1D coverage saved to {save_path}")
+    else:
+        plt.show()
+    plt.close()
+
+def visualize_saved_dataset(data_path, save_path, fig_name, env_type=None, layout_path=None):
     '''
     Visualize the saved dataset coverage heatmap
     '''
     if os.path.exists(data_path):
         print(f"Visualizing coverage from dataset: {data_path}")
         data = np.load(data_path, allow_pickle=True)
-        # --- use custom filename from config if available ---
-        visualize_agent_coverage(
-            data,
-            save_path=save_path,
-            title=f"Agent Position Coverage ({fig_name})"
-        )
+        if env_type == "bipedalwalker" or data["a"].ndim == 2:
+            if layout_path is None:
+                raise ValueError("layout_path is required for Bipedal 1D coverage visualization.")
+            visualize_bipedal_coverage_1d(
+                data,
+                layout_source=layout_path,
+                save_path=save_path,
+                title=f"Bipedal 1D Coverage ({fig_name})",
+            )
+        else:
+            visualize_agent_coverage(
+                data,
+                save_path=save_path,
+                title=f"Agent Position Coverage ({fig_name})"
+            )
         print(f"Coverage heatmap saved to {save_path}")
 
 if __name__ == "__main__": 

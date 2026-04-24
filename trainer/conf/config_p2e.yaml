@@ -13,13 +13,25 @@ p2e:
   batch_size: 256              # Training batch size for the ensemble
   disag_train_frequency: 1     # Update ensemble every N iterations
   target_type: "latent"        # Objective: "latent" (predict next latent) or "logits" (predict next ID)
-  transitions_per_collection: 4000  # n: transitions collected per rollout on one target 6700
-  updates_per_target: 5             # m: collect/train cycles executed per target
+  transitions_per_collection: 2000  # default n (fallback when per-domain override is absent)
+  updates_per_target: 5             # default m (fallback when per-domain override is absent)
+  # Domain-specific data budget knobs:
+  # total_budget = transitions_per_collection * updates_per_target * num_targets
+  per_domain:
+    minigrid:
+      transitions_per_collection: 1400  # 1400 * 5 * 20 = 140000
+      updates_per_target: 5
+    crafter:
+      transitions_per_collection: 2000
+      updates_per_target: 5
+    bipedalwalker:
+      transitions_per_collection: 2000
+      updates_per_target: 5
   target_order: "sequential"        # sequential | random
 
 # 2. Domain Selection (Configurable via CLI override: domain=minigrid)
 # ----------------------------------------------------------------------
-domain: 'crafter' # 'crafter' or 'minigrid'
+domain: 'minigrid' # 'crafter' or 'minigrid' or 'bipedalwalker'
 
 # 3. Environment/Loop Overrides
 # ----------------------------------------------------------------------

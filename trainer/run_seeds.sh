@@ -4,11 +4,11 @@
 
 cd /home/siyao/phd_file/Research/rlPractice/Curriculum_world_model_learning
 
-for SEED in 0 1 2 3 4; do
+for SEED in 1 2 3 4; do
     echo "==========================================="
-    echo "Running DR Baseline with Seed=$SEED"
+    echo "Running MAC WM Learning with Seed=$SEED"
     echo "==========================================="
-    python trainer/MAC_wm_learning.py seed=$SEED
+    python trainer/p2e_baseline.py seed=$SEED
     echo "[Done] Seed $SEED finished."
     echo ""
 done

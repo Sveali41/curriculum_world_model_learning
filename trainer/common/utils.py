@@ -145,6 +145,12 @@ def collect_data_general(
     env_type = getattr(cfg.attention_model, "env_type", "")
     is_crafter = (env_type == "crafter")
     is_bipedal = (env_type == "bipedalwalker")
+
+    # Sync env_type to cfg.env so _finalize_and_save can dispatch visualization correctly
+    if env_type and not getattr(cfg.env, "env_type", ""):
+        from omegaconf import open_dict
+        with open_dict(cfg.env):
+            cfg.env.env_type = env_type
     
     # -----------------------------
     # 1. Build environment
@@ -166,9 +172,16 @@ def collect_data_general(
     elif is_bipedal and isinstance(env_source, str):
         # Bipedal from layout string (e.g., "G20 S3 P4 T2")
         from domain.bipedalwalker.custom_bipedal_env import CustomBipedalEnv
-        render_mode = "human" if getattr(cfg.env, "visualize", False) else None
+        data_type = str(getattr(cfg.env.collect, "data_type", "")).lower()
+        if getattr(cfg.env, "visualize", False):
+            render_mode = "human"
+        elif getattr(cfg.env.collect, "save_env_visualize", False) and data_type == "random":
+            render_mode = "rgb_array"
+        else:
+            render_mode = None
         env = CustomBipedalEnv(render_mode=render_mode)
         env.set_custom_layout_from_str(env_source)
+        cfg.env.collect.current_layout_str = env_source
 
     elif isinstance(env_source, tuple) and len(env_source) == 2:
         # MiniGrid from minitask strings (layout_str, color_str)
@@ -181,6 +194,10 @@ def collect_data_general(
             render_mode=render_mode,
             max_steps=max_steps,
         ))
+    elif hasattr(env_source, "reset") and hasattr(env_source, "step"):
+        # Accept pre-built env objects, which is how the bipedal UED rollout path
+        # currently passes generator-produced tasks through Support.interpret_env.
+        env = env_source
     else:
         # Fallback for other cases (e.g. direct env objects if supported later)
         if is_crafter:
@@ -189,10 +206,12 @@ def collect_data_general(
              raise ValueError("For BipedalWalker UED, env_source must be a .txt path or a layout string.")
         raise ValueError("env_source must be a .txt filepath or (layout_str, color_str) tuple")
 
+    if is_bipedal and hasattr(env, "layout_str"):
+        cfg.env.collect.current_layout_str = env.layout_str
+
     # -----------------------------
     # 2. Set dataset save paths
     # -----------------------------
-    import os
     from pathlib import Path
     
     data_save_dir = Path(getattr(cfg.env.collect, "data_folder", str(TRAINER_PATH / "data")))
@@ -208,6 +227,7 @@ def collect_data_general(
     cfg.env.collect.visualize_save_path = str(vis_dir)
     
     cfg.env.collect.visualize_filename = f"{save_name}_{explore_type}.png"
+    cfg.env.collect.env_visualize_filename = f"collect_{save_name}_env.png"
     if not recollect_data and os.path.exists(save_path):
         print(f"[Data Collection] Skipped: {save_name} already exists → {save_path}")
         return save_path 
@@ -379,6 +399,10 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
     losses = []
     inv_losses = []
     terrain_losses = []
+    contact_accs = []
+    contact_bces = []
+    is_bipedal = (getattr(cfg.attention_model, "env_type", "") == "bipedalwalker")
+    is_crafter = (getattr(cfg.attention_model, "env_type", "") == "crafter")
 
     try:
         for v in range(VALID_TIMES):
@@ -398,10 +422,14 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
             main_loss = float(metrics.get('avg_val_loss_wm', metrics.get('best_loss', 0.0)))
             t_loss = float(metrics.get('val/terrain_loss', metrics.get('val/ce_loss', main_loss)))
             i_loss = float(metrics.get('val/inventory_loss', metrics.get('val/inv_loss', 0.0)))
+            contact_acc = float(metrics.get('val/contact_acc', 0.0))
+            contact_bce = float(metrics.get('val/contact_bce', 0.0))
             
             losses.append(main_loss)
             terrain_losses.append(t_loss)
             inv_losses.append(i_loss)
+            contact_accs.append(contact_acc)
+            contact_bces.append(contact_bce)
 
             del model
             torch.cuda.empty_cache()
@@ -411,11 +439,105 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
         cfg.attention_model.keep_cell_loss = prev_keep_cell_loss
         cfg.attention_model.data_dir = prev_data_dir
 
-    return {
+    result = {
         'avg_val_loss_wm': float(np.mean(losses)),
-        'terrain_loss': float(np.mean(terrain_losses)),
-        'inventory_loss': float(np.mean(inv_losses))
     }
+    if is_crafter:
+        result['terrain_loss'] = float(np.mean(terrain_losses))
+        result['inventory_loss'] = float(np.mean(inv_losses))
+    if is_bipedal:
+        result['contact_acc'] = float(np.mean(contact_accs))
+        result['contact_bce'] = float(np.mean(contact_bces))
+    return result
+
+
+def validate_on_all_targets(
+    cfg,
+    net,
+    data_save_dir,
+    target_names,
+    val_suffix,
+    phase_name="validation",
+    VALID_TIMES=1,
+    disable_wandb=True,
+):
+    """
+    Unified multi-target validation helper used by baseline/P2E/DR.
+    `target_names` may be bare task names or `.txt` names; `val_suffix` is appended to the base name.
+    Returns aggregated means plus per-target results.
+    """
+    old_use_wandb = getattr(cfg.attention_model, "use_wandb", False)
+    if disable_wandb:
+        cfg.attention_model.use_wandb = False
+
+    losses = []
+    inv_losses = []
+    terrain_losses = []
+    contact_accs = []
+    contact_bces = []
+    per_target = {}
+    valid_count = 0
+    is_bipedal = (getattr(cfg.attention_model, "env_type", "") == "bipedalwalker")
+    is_crafter = (getattr(cfg.attention_model, "env_type", "") == "crafter")
+
+    try:
+        for task_name in target_names:
+            task_base = task_name[:-4] if str(task_name).endswith(".txt") else str(task_name)
+            val_file = f"{task_base}{val_suffix}"
+            val_path = os.path.join(data_save_dir, val_file)
+            if not os.path.exists(val_path):
+                continue
+
+            res = validate_on_target_task(
+                cfg,
+                net,
+                None,
+                data_save_dir,
+                val_file,
+                phase_name=phase_name,
+                VALID_TIMES=VALID_TIMES,
+            )
+            if not res:
+                continue
+
+            l_val = float(res.get("avg_val_loss_wm", 0.0))
+            ce_or_terrain = float(res.get("terrain_loss", 0.0))
+            inv_val = float(res.get("inventory_loss", 0.0))
+            c_acc = float(res.get("contact_acc", 0.0))
+            c_bce = float(res.get("contact_bce", 0.0))
+
+            losses.append(l_val)
+            terrain_losses.append(ce_or_terrain)
+            inv_losses.append(inv_val)
+            contact_accs.append(c_acc)
+            contact_bces.append(c_bce)
+            per_target[task_base] = {
+                "avg_val_loss_wm": l_val,
+                "terrain_loss": ce_or_terrain,
+                "inventory_loss": inv_val,
+                "contact_acc": c_acc,
+                "contact_bce": c_bce,
+            }
+            valid_count += 1
+    finally:
+        if disable_wandb:
+            cfg.attention_model.use_wandb = old_use_wandb
+
+    result = {
+        "valid_count": valid_count,
+        "avg_val_loss_wm": float(np.mean(losses)) if valid_count > 0 else 0.0,
+        "per_target": per_target,
+    }
+    if is_crafter:
+        result["terrain_loss"] = float(np.mean(terrain_losses)) if valid_count > 0 else 0.0
+        result["inventory_loss"] = float(np.mean(inv_losses)) if valid_count > 0 else 0.0
+    elif is_bipedal:
+        result["contact_acc"] = float(np.mean(contact_accs)) if valid_count > 0 else 0.0
+        result["contact_bce"] = float(np.mean(contact_bces)) if valid_count > 0 else 0.0
+    else:
+        result["terrain_loss"] = float(np.mean(terrain_losses)) if valid_count > 0 else 0.0
+        result["inventory_loss"] = float(np.mean(inv_losses)) if valid_count > 0 else 0.0
+    return result
 
 
 def plot_loss_heatmap(
@@ -513,9 +635,14 @@ def extract_loss_map_over_validations(
     loss_list = []
     terrain_loss_list = []
     inv_loss_list = []
+    contact_acc_list = []
+    contact_bce_list = []
     inv_vectors = []
+    bipedal_token_vectors = []
 
-    is_crafter = (getattr(cfg.attention_model, "env_type", "") == "crafter")
+    env_type = getattr(cfg.attention_model, "env_type", "")
+    is_crafter = (env_type == "crafter")
+    is_bipedal = (env_type == "bipedalwalker")
 
     try:
         for _ in range(valid_times):
@@ -544,13 +671,35 @@ def extract_loss_map_over_validations(
             total_l = float(metrics.get('avg_val_loss_wm', metrics.get('best_loss', 0.0)))
             t_l = float(metrics.get('val/terrain_loss', metrics.get('val/ce_loss', total_l)))
             i_l = float(metrics.get('val/inventory_loss', metrics.get('val/inv_loss', 0.0)))
+            c_acc = float(metrics.get('val/contact_acc', 0.0))
+            c_bce = float(metrics.get('val/contact_bce', 0.0))
             
             loss_list.append(total_l)
             terrain_loss_list.append(t_l)
             inv_loss_list.append(i_l)
+            contact_acc_list.append(c_acc)
+            contact_bce_list.append(c_bce)
             inv_vec = getattr(model, "inventory_loss_vector_result", None)
             if inv_vec is not None:
                 inv_vectors.append(np.asarray(inv_vec, dtype=np.float32))
+            if is_bipedal:
+                token_metric_keys = [
+                    "val/token_hull_pose_mse",
+                    "val/token_hull_vel_mse",
+                    "val/token_leg1_hip_mse",
+                    "val/token_leg1_knee_mse",
+                    "val/token_leg1_contact_bce",
+                    "val/token_leg2_hip_mse",
+                    "val/token_leg2_knee_mse",
+                    "val/token_leg2_contact_bce",
+                    "val/token_lidar_near_mse",
+                    "val/token_lidar_far_mse",
+                ]
+                token_vector = np.array(
+                    [float(metrics.get(key, 0.0)) for key in token_metric_keys],
+                    dtype=np.float32,
+                )
+                bipedal_token_vectors.append(token_vector)
 
             # Cleanup
             del model
@@ -574,6 +723,13 @@ def extract_loss_map_over_validations(
             inventory_pattern = np.full(16, avg_inv_total / 10.0, dtype=np.float32)
         
         return {"terrain": avg_loss_map, "inventory": inventory_pattern}, loss_list, terrain_loss_list, inv_loss_list
+
+    if is_bipedal:
+        if len(bipedal_token_vectors) > 0:
+            token_error_vector = np.mean(np.stack(bipedal_token_vectors, axis=0), axis=0).astype(np.float32)
+        else:
+            token_error_vector = np.zeros(10, dtype=np.float32)
+        return {"terrain": avg_loss_map, "inventory": token_error_vector}, loss_list, contact_acc_list, contact_bce_list
     
     return avg_loss_map, loss_list, [], []
 

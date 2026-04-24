@@ -4,6 +4,7 @@ import tempfile
 import torch
 import numpy as np
 import pandas as pd
+import math
 import hydra
 from omegaconf import DictConfig, open_dict
 from pathlib import Path
@@ -19,8 +20,104 @@ from modelBased.world_model import AttentionWM_training
 from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
 from generator.generator_interface import GeneratorInterface
 from trainer.common.utils import (
-    set_seed, validate_on_target_task, convert_trajectories_to_batch
+    set_seed, validate_on_target_task, validate_on_all_targets, convert_trajectories_to_batch
 )
+
+
+def _safe_int_cfg(value, default=0, name="value"):
+    if value is None:
+        print(f"[Config Warning] {name} is None, fallback to {default}.")
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        print(f"[Config Warning] {name}={value} is invalid, fallback to {default}.")
+        return int(default)
+
+
+def _apply_domain_collection_budget(cfg: DictConfig, domain_name: str):
+    """
+    Configure per-rollout collection size from domain-level per-iteration budget.
+    effective_per_rollout = ceil(iter_transition_budget / generator_batch_size)
+    """
+    if not hasattr(cfg, "domains") or domain_name not in cfg.domains:
+        print(f"[Config Warning] Missing domains.{domain_name}; keep existing collection settings.")
+        return
+
+    domain_cfg = cfg.domains[domain_name]
+    with open_dict(cfg):
+        batch_override = getattr(domain_cfg, "generator_batch_size", None)
+        if batch_override is not None:
+            cfg.generator_agent.batch_size = _safe_int_cfg(
+                batch_override,
+                default=getattr(cfg.generator_agent, "batch_size", 8),
+                name=f"domains.{domain_name}.generator_batch_size",
+            )
+
+    batch_size = max(
+        1,
+        _safe_int_cfg(
+            getattr(cfg.generator_agent, "batch_size", 8),
+            default=8,
+            name="generator_agent.batch_size",
+        ),
+    )
+    iter_budget = _safe_int_cfg(
+        getattr(domain_cfg, "iter_transition_budget", None),
+        default=max(
+            1,
+            _safe_int_cfg(
+                getattr(cfg.env.collect, "maximum_dataset_size", 500),
+                default=500,
+                name="env.collect.maximum_dataset_size",
+            ) * batch_size,
+        ),
+        name=f"domains.{domain_name}.iter_transition_budget",
+    )
+    per_rollout_max = max(1, int(math.ceil(iter_budget / batch_size)))
+
+    with open_dict(cfg):
+        cfg.env.collect.maximum_dataset_size = per_rollout_max
+        cfg.env.collect.mini_dataset_size = per_rollout_max
+
+    expected_total = per_rollout_max * batch_size
+    print(
+        f"[Config] Domain budget applied | domain={domain_name} | "
+        f"iter_budget={iter_budget} | batch_size={batch_size} | "
+        f"per_rollout_max={per_rollout_max} | expected_iter_total={expected_total}"
+    )
+
+
+def _ensure_csv_header_compatible(csv_path: Path, expected_columns):
+    """
+    If an existing CSV has a different header, back it up to avoid mixed-schema append.
+    Returns whether the target csv_path should be treated as existing for append.
+    """
+    if (not csv_path.exists()) or csv_path.stat().st_size == 0:
+        return False
+
+    expected_header = ",".join(expected_columns)
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            current_header = f.readline().strip()
+    except Exception:
+        current_header = ""
+
+    if current_header == expected_header:
+        return True
+
+    backup_path = Path(f"{csv_path}.legacy_backup")
+    suffix_idx = 1
+    while backup_path.exists():
+        backup_path = Path(f"{csv_path}.legacy_backup{suffix_idx}")
+        suffix_idx += 1
+
+    os.replace(csv_path, backup_path)
+    print(
+        f"[Logger] Existing CSV header mismatch. Backed up old file to {backup_path} "
+        f"and starting a new summary file."
+    )
+    return False
 
 @hydra.main(version_base=None, config_path="conf", config_name="config_dr")
 def run_dr_baseline_experiment(cfg: DictConfig):
@@ -34,6 +131,13 @@ def run_dr_baseline_experiment(cfg: DictConfig):
     
     domain_name = cfg.domain
     d_cfg = cfg.domains[domain_name]
+    is_bipedal = (domain_name == "bipedalwalker")
+    is_minigrid = (domain_name == "minigrid")
+    val_n_phases = int(getattr(d_cfg, "val_n_phases", getattr(d_cfg, "target_task_count", 20)))
+    val_task_prefix = str(getattr(d_cfg, "val_task_prefix", getattr(d_cfg, "target_task_prefix", "target_task")))
+    val_data_path = str(getattr(d_cfg, "val_data_path", getattr(d_cfg, "target_tasks_folder", "")))
+    val_suffix = str(getattr(d_cfg, "val_suffix", getattr(d_cfg, "target_task_suffix", "_uniform.npz")))
+    val_start_idx = int(getattr(d_cfg, "start_idx", getattr(d_cfg, "target_task_start_idx", 0)))
     
     print(f"\n{'='*80}")
     print(f"### [DR BASEMENT START] Domain: {domain_name.upper()} | Seed: {seed}")
@@ -45,6 +149,9 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         cfg.attention_model.grid_shape = d_cfg.grid_shape
         cfg.attention_model.obs_norm_values = d_cfg.obs_norm
         cfg.attention_model.action_norm_values = d_cfg.action_norm
+        cfg.attention_model.validation_metric = d_cfg.validation_metric
+        cfg.attention_model.data_type = d_cfg.data_type
+    _apply_domain_collection_budget(cfg, domain_name)
 
     # 1. Initialization
     wm = AttentionWorldModel(cfg.attention_model).to(device)
@@ -57,15 +164,30 @@ def run_dr_baseline_experiment(cfg: DictConfig):
     temp_data_dir = Path(cfg.dr_temp_data_dir)
     os.makedirs(temp_data_dir, exist_ok=True)
     summary_csv_path = log_dir / f"dr_summary_{domain_name}.csv"
-    file_exists = summary_csv_path.exists()
+    file_exists = False
 
     old_params, fisher = None, None
-    csv_columns = [
-        "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
-        "gen_val_val_inv_loss", "gen_val_val_ce_loss", "gen_val_avg_val_loss_wm",
-        "target_val_val_inv_loss", "target_val_val_ce_loss", "target_val_avg_val_loss_wm",
-        "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
-    ]
+    if is_minigrid:
+        csv_columns = [
+            "Seed", "Iter", "Gen_Mean_Reward", "Gen_Real_Loss", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
+            "WM_Val_Loss", "Target_WM_Val_Loss", "Valid_Trajs",
+            "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
+        ]
+    elif is_bipedal:
+        csv_columns = [
+            "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
+            "gen_val_contact_acc", "gen_val_contact_bce", "gen_val_avg_val_loss_wm",
+            "target_val_contact_acc", "target_val_contact_bce", "target_val_avg_val_loss_wm",
+            "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
+        ]
+    else:
+        csv_columns = [
+            "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
+            "gen_val_val_inv_loss", "gen_val_val_ce_loss", "gen_val_avg_val_loss_wm",
+            "target_val_val_inv_loss", "target_val_val_ce_loss", "target_val_avg_val_loss_wm",
+            "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
+        ]
+    file_exists = _ensure_csv_header_compatible(summary_csv_path, csv_columns)
 
     # 2. Main Loop
     for iteration in range(cfg.generator_agent.total_iterations):
@@ -79,8 +201,18 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         # (.., raw_loss, ce_loss, inv_loss, div_reward, valid_trajs, solved_count, avg_bfs)
         if isinstance(trajs, tuple) and len(trajs) >= 7:
             gen_val_avg_val_loss_wm = float(trajs[2])
-            gen_val_val_ce_loss = float(trajs[3])
-            gen_val_val_inv_loss = float(trajs[4])
+            aux_metric = float(trajs[3])
+            inv_loss_or_bce = float(trajs[4])
+            if is_bipedal:
+                gen_val_contact_acc = aux_metric
+                gen_val_contact_bce = inv_loss_or_bce
+                gen_val_val_ce_loss = 0.0
+                gen_val_val_inv_loss = 0.0
+            else:
+                gen_val_val_ce_loss = aux_metric
+                gen_val_val_inv_loss = inv_loss_or_bce
+                gen_val_contact_acc = 0.0
+                gen_val_contact_bce = 0.0
             gen_div_reward = float(trajs[5])
             valid_trajs = trajs[6]
             solvable_count = int(trajs[7]) if len(trajs) > 7 else 0
@@ -91,6 +223,8 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             gen_val_avg_val_loss_wm = 0.0
             gen_val_val_ce_loss = 0.0
             gen_val_val_inv_loss = 0.0
+            gen_val_contact_acc = 0.0
+            gen_val_contact_bce = 0.0
             gen_div_reward = 0.0
             valid_trajs = []
             solvable_count = 0
@@ -107,7 +241,14 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         print(f"  [Data] Current batch transitions: {current_transitions}")
         
         # B. Train World Model
-        if iteration % cfg.generator_agent.wm_train_frequency == 0:
+        # [ALIGN] Respect warmup: freeze WM training during warmup (same as MAC)
+        warmup_iters_wm = _safe_int_cfg(
+            getattr(cfg.generator_agent, "warmup_iterations", 0),
+            default=0,
+            name="generator_agent.warmup_iterations",
+        )
+        is_warmup = (iteration < warmup_iters_wm)
+        if (not is_warmup) and (iteration % cfg.generator_agent.wm_train_frequency == 0):
             print("  [Training] Updating World Model...")
             replay_data = fisher_buffer.export_dict() if len(fisher_buffer) > 0 else None
             replay_size = len(replay_data["obs"]) if replay_data is not None and replay_data.get("obs") is not None else 0
@@ -128,20 +269,20 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                     temp_npz_path = tmp_f.name
 
                 save_dict = {
-                    'a': new_batch['obs'],
-                    'b': new_batch['obs_next'],
-                    'c': new_batch['act'],
+                    'a': new_batch['obs'].cpu().numpy() if torch.is_tensor(new_batch['obs']) else new_batch['obs'],
+                    'b': new_batch['obs_next'].cpu().numpy() if torch.is_tensor(new_batch['obs_next']) else new_batch['obs_next'],
+                    'c': new_batch['act'].cpu().numpy() if torch.is_tensor(new_batch['act']) else new_batch['act'],
                 }
                 if new_batch.get('rew') is not None:
-                    save_dict['d'] = new_batch['rew']
+                    save_dict['d'] = new_batch['rew'].cpu().numpy() if torch.is_tensor(new_batch['rew']) else new_batch['rew']
                 if new_batch.get('done') is not None:
-                    save_dict['e'] = new_batch['done']
+                    save_dict['e'] = new_batch['done'].cpu().numpy() if torch.is_tensor(new_batch['done']) else new_batch['done']
                 if new_batch.get('info') is not None:
                     save_dict['f'] = new_batch['info']
                 if new_batch.get('inv') is not None:
-                    save_dict['g'] = new_batch['inv']
+                    save_dict['g'] = new_batch['inv'].cpu().numpy() if torch.is_tensor(new_batch['inv']) else new_batch['inv']
                 if new_batch.get('inv_next') is not None:
-                    save_dict['h'] = new_batch['inv_next']
+                    save_dict['h'] = new_batch['inv_next'].cpu().numpy() if torch.is_tensor(new_batch['inv_next']) else new_batch['inv_next']
 
                 np.savez_compressed(temp_npz_path, **save_dict)
                 cfg.attention_model.data_dir = temp_npz_path
@@ -186,50 +327,51 @@ def run_dr_baseline_experiment(cfg: DictConfig):
 
             
         # C. Validation on Target Tasks (aligned with MAC: validate every iter after warmup)
-        warmup_iters = int(getattr(cfg.generator_agent, "warmup_iterations", 0))
+        warmup_iters = _safe_int_cfg(
+            getattr(cfg.generator_agent, "warmup_iterations", 0),
+            default=0,
+            name="generator_agent.warmup_iterations",
+        )
         if iteration >= (warmup_iters - 1):
-            print(f"  [Validation] Running zero-shot test on all {d_cfg.val_n_phases} targets...")
-            sum_loss, sum_ce, sum_inv, valid_count = 0.0, 0.0, 0.0, 0
-            
-            # Fix: Disable WandB during validation to prevent Hook ReferenceError and run spam
-            old_use_wandb = cfg.attention_model.use_wandb
-            cfg.attention_model.use_wandb = False
+            print(f"  [Validation] Running zero-shot test on all {val_n_phases} targets...")
+            task_indices = range(val_start_idx, val_start_idx + val_n_phases)
+            task_names = [f"{val_task_prefix}{v_idx}" for v_idx in task_indices]
+            val_summary = validate_on_all_targets(
+                cfg,
+                wm,
+                val_data_path,
+                task_names,
+                val_suffix,
+                phase_name=f"dr_iter_{iteration+1}",
+                VALID_TIMES=1,
+            )
 
-            task_indices = range(d_cfg.start_idx, d_cfg.start_idx + d_cfg.val_n_phases)
-            for v_idx in task_indices:
-                v_task = f"{d_cfg.val_task_prefix}{v_idx}"
-                v_file = os.path.join(d_cfg.val_data_path, f"{v_task}{d_cfg.val_suffix}")
-                
-                if not os.path.exists(v_file): continue
-                
-                # Zero-shot validation logic
-                res_v = validate_on_target_task(cfg, wm, None, d_cfg.val_data_path, f"{v_task}{d_cfg.val_suffix}", VALID_TIMES=1)
-
-                
-                if res_v:
-                    l_val = res_v.get('avg_val_loss_wm', res_v.get('best_loss', 0.0))
-                    ce_val = res_v.get('terrain_loss', 0.0)
-                    inv_val = res_v.get('inventory_loss', 0.0)
-                    sum_loss += l_val
-                    sum_ce += ce_val
-                    sum_inv += inv_val
-                    valid_count += 1
-
-            cfg.attention_model.use_wandb = old_use_wandb
-
-            if valid_count > 0:
-                target_val_avg_val_loss_wm = sum_loss / valid_count
-                target_val_val_ce_loss = sum_ce / valid_count
-                target_val_val_inv_loss = sum_inv / valid_count
-                print(f"    -> Results: Avg Loss = {target_val_avg_val_loss_wm:.5f}")
+            if val_summary["valid_count"] > 0:
+                target_val_avg_val_loss_wm = val_summary["avg_val_loss_wm"]
+                if is_bipedal:
+                    target_val_contact_acc = val_summary.get("contact_acc", 0.0)
+                    target_val_contact_bce = val_summary.get("contact_bce", 0.0)
+                    target_val_val_ce_loss = 0.0
+                    target_val_val_inv_loss = 0.0
+                    print(f"    -> Results: Avg Loss = {target_val_avg_val_loss_wm:.5f}")
+                else:
+                    target_val_val_ce_loss = val_summary.get("terrain_loss", 0.0)
+                    target_val_val_inv_loss = val_summary.get("inventory_loss", 0.0)
+                    target_val_contact_acc = 0.0
+                    target_val_contact_bce = 0.0
+                    print(f"    -> Results: Avg Loss = {target_val_avg_val_loss_wm:.5f}")
             else:
                 target_val_avg_val_loss_wm = 0.0
                 target_val_val_ce_loss = 0.0
                 target_val_val_inv_loss = 0.0
+                target_val_contact_acc = 0.0
+                target_val_contact_bce = 0.0
         else:
             target_val_avg_val_loss_wm = 0.0
             target_val_val_ce_loss = 0.0
             target_val_val_inv_loss = 0.0
+            target_val_contact_acc = 0.0
+            target_val_contact_bce = 0.0
 
         # D. Buffer Archiving
         fisher_buffer.add_from_batch(
@@ -238,25 +380,49 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             fisher_buffer_elements_ratio=cfg.attention_model.fisher_buffer_elements_ratio
         )
         print(f"  [Buffer] Archived {current_transitions} transitions. Buffer Size: {len(fisher_buffer)}")
-        row = {
-            "Seed": seed,
-            "Iter": iteration + 1,
-            "Gen_Mean_Reward": 0.0,
-            "Gen_Loss": 0.0,
-            "Gen_Entropy": 0.0,
-            "Gen_Div_Reward": gen_div_reward,
-            "gen_val_val_inv_loss": gen_val_val_inv_loss,
-            "gen_val_val_ce_loss": gen_val_val_ce_loss,
-            "gen_val_avg_val_loss_wm": gen_val_avg_val_loss_wm,
-            "target_val_val_inv_loss": target_val_val_inv_loss,
-            "target_val_val_ce_loss": target_val_val_ce_loss,
-            "target_val_avg_val_loss_wm": target_val_avg_val_loss_wm,
-            "New_Data_Size": current_transitions,
-            "Buffer_Size": len(fisher_buffer),
-            "Solvable_Count": solvable_count,
-            "Avg_Path_Len": avg_path_len,
-        }
-        pd.DataFrame([row], columns=csv_columns).to_csv(
+        if is_minigrid:
+            row_data = {
+                "Seed": seed,
+                "Iter": iteration + 1,
+                "Gen_Mean_Reward": 0.0,
+                "Gen_Real_Loss": 0.0,
+                "Gen_Loss": 0.0,
+                "Gen_Entropy": 0.0,
+                "Gen_Div_Reward": gen_div_reward,
+                # Loss on generated tasks from current generator rollouts.
+                "WM_Val_Loss": gen_val_avg_val_loss_wm,
+                # Zero-shot validation loss on fixed target task suite.
+                "Target_WM_Val_Loss": target_val_avg_val_loss_wm,
+                "Valid_Trajs": len(valid_trajs),
+                "New_Data_Size": current_transitions,
+                "Buffer_Size": len(fisher_buffer),
+                "Solvable_Count": solvable_count,
+                "Avg_Path_Len": avg_path_len,
+            }
+        elif is_bipedal:
+            row_data = {
+                "Seed": seed, "Iter": iteration + 1, "Gen_Mean_Reward": 0.0, "Gen_Loss": 0.0,
+                "Gen_Entropy": 0.0, "Gen_Div_Reward": gen_div_reward,
+                "gen_val_contact_acc": gen_val_contact_acc, "gen_val_contact_bce": gen_val_contact_bce,
+                "gen_val_avg_val_loss_wm": gen_val_avg_val_loss_wm,
+                "target_val_contact_acc": target_val_contact_acc, "target_val_contact_bce": target_val_contact_bce,
+                "target_val_avg_val_loss_wm": target_val_avg_val_loss_wm,
+                "New_Data_Size": current_transitions, "Buffer_Size": len(fisher_buffer),
+                "Solvable_Count": solvable_count, "Avg_Path_Len": avg_path_len,
+            }
+        else:
+            row_data = {
+                "Seed": seed, "Iter": iteration + 1, "Gen_Mean_Reward": 0.0, "Gen_Loss": 0.0,
+                "Gen_Entropy": 0.0, "Gen_Div_Reward": gen_div_reward,
+                "gen_val_val_inv_loss": gen_val_val_inv_loss, "gen_val_val_ce_loss": gen_val_val_ce_loss,
+                "gen_val_avg_val_loss_wm": gen_val_avg_val_loss_wm,
+                "target_val_val_inv_loss": target_val_val_inv_loss, "target_val_val_ce_loss": target_val_val_ce_loss,
+                "target_val_avg_val_loss_wm": target_val_avg_val_loss_wm,
+                "New_Data_Size": current_transitions, "Buffer_Size": len(fisher_buffer),
+                "Solvable_Count": solvable_count, "Avg_Path_Len": avg_path_len,
+            }
+
+        pd.DataFrame([row_data], columns=csv_columns).to_csv(
             summary_csv_path,
             index=False,
             mode="a",

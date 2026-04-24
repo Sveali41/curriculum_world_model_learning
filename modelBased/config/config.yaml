@@ -29,23 +29,36 @@ domains:
 
   bipedalwalker:
     env_type: bipedalwalker
+    task_group: target # target/minitask
+    task_folder: target_tasks # target_tasks/minitasks
+    task_name: bipedal_target_task_16
+    validation_task_group: target
+    validation_task_folder: target_tasks
+    validation_task_name: target_env_stump_1
     max_steps: 1600
     grid_shape: [1, 1, 24]
     attention_mask_size: 5
     obs_norm_values: [1]
     action_norm_values: 4
-    env_path: ${oc.env:TRAINER_PATH}/level/bipedal_walker/minitasks/example_easy.txt
-    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/bipedalwalker_train_random.npz
-    validation_data_dir: null
-    visualize_filename: bipedalwalker_train_random_coverage.png
-    env_visualize_filename: bipedalwalker_train_random_env.png
+    env_path: ${oc.env:TRAINER_PATH}/level/bipedal_walker/${domains.${domain}.task_folder}/${domains.${domain}.task_name}.txt
+    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/bipedalwalker_${domains.${domain}.task_group}_${domains.${domain}.task_name}_${env.collect.data_type}.npz
+    validation_data_dir: ${oc.env:TRAIN_DATASET_PATH}/bipedalwalker_${domains.${domain}.validation_task_group}_${domains.${domain}.validation_task_name}.npz
+    visualize_filename: ${domains.${domain}.task_name}_coverage.png
+    env_visualize_filename: ${domains.${domain}.task_name}_env.png
     bipedal_prior_weight: 0.5  # 30% prior weight for heuristic vs random noise
+    behavior_policy: heuristic # heuristic | pretrained_sb3
+    sb3_algo: SAC
+    sb3_model_path: null
+    sb3_noise_std: 0.15
+    sb3_deterministic: false
+    wm_data_type: norm
+    use_bipedal_attention: true
 
 
 attention_model:
   env_type: ${domains.${domain}.env_type}
-  use_bipedal_attention: False
-  data_type: discrete # 'norm' or 'discrete' 
+  use_bipedal_attention: ${domains.${domain}.use_bipedal_attention}
+  data_type: ${domains.${domain}.wm_data_type} # 'norm' or 'discrete' 
   model_type: Attention       # Attention, Embedding, MLP
   grid_shape: ${domains.${domain}.grid_shape}
   attention_mask_size: ${domains.${domain}.attention_mask_size}
@@ -110,11 +123,11 @@ env:
     stochastic: False     # False = entities frozen (zombie/cow don't move)
     slippery_prob: 0.0     # 0.0 = fully deterministic for initial validation
   collect:
-    data_type: random
+    data_type: random # uniform | random
     uniform_reset_steps: 5000
     episodes: 1000
     mini_dataset_size: 8000
-    maximum_dataset_size: 10000 
+    maximum_dataset_size: 40000 
     data_save_path: ${domains.${domain}.data_save_path}
     save_coverage_visualize: True
     visualize_save_path: ${oc.env:PROJECT_ROOT}/trainer/logs/dataset_visualization
@@ -168,11 +181,3 @@ R_max:
   num_iterations: 1
   exploration_threshold: 10
 
-
-data_collect:
-  level_path: ${oc.env:ENV_PATH}/Grid_11_11.txt #MiniGrid-Dynamic-Obstacles-8x8-v0 # Name of environment, or comma-separate list of environment names to instantiate as each env in the VecEnv.
-  visualize: False # to choose whether your want to see the env during interaction or not
-  episodes: 200 # number of episodes to start 
-  collect:
-    data_train: ${oc.env:TRAIN_DATASET_PATH}/gridworld_Rmax.npz # folder where to save the rollouts
-    visit_count: ${oc.env:TRAIN_DATASET_PATH}/visit_count_Rmax.npz # folder where to save the rollouts

@@ -83,8 +83,42 @@ class BipedalWalkerCustom(BipedalWalker):
     def set_custom_layout(self, layout_list):
         self.custom_layout = layout_list
 
+    def reset(self, *, seed=None, options=None):
+        """
+        Custom reset to support spawning at any x-coordinate via the `options` dictionary.
+        """
+        # Call base reset to rebuild terrain and objects
+        obs, info = super().reset(seed=seed, options=options)
+
+        # Extract spawn_x from options if present
+        spawn_x = options.get("spawn_x") if options is not None else None
+
+        if spawn_x is not None and hasattr(self, "terrain_y"):
+            # Ensure index is within range of recorded terrain heights
+            idx = int(spawn_x / TERRAIN_STEP)
+
+            idx = max(0, min(idx, len(self.terrain_y) - 1))
+            ground_y = self.terrain_y[idx]
+
+            # Move Hull (center mechanism) to spawn_x
+            self.hull.position = (spawn_x, ground_y + 1.2)
+            self.hull.linearVelocity = (0, 0)
+            self.hull.angularVelocity = 0
+
+            # Move legs as well to prevent extreme joint tension on first step
+            for leg in self.legs:
+                leg.position = (spawn_x, ground_y + 0.5)
+                leg.linearVelocity = (0, 0)
+                leg.angularVelocity = 0
+            
+            # 4. Refresh observation to reflect new state by taking a dummy step
+            obs, _, _, _, _ = super().step(np.zeros(4, dtype=np.float32))
+
+        return obs, info
+
     def _generate_terrain(self, hardcore):
         if self.custom_layout is None:
+
             return super()._generate_terrain(hardcore)
 
         GRASS, STUMP, STAIRS, PIT = 0, 1, 2, 3
@@ -159,7 +193,7 @@ class BipedalWalkerCustom(BipedalWalker):
                 if token_counter > 1: y -= 4 * TERRAIN_STEP
 
             elif state == STUMP and oneshot:
-                stump_h = int(param)
+                stump_h = float(param)
                 poly = [(x, y), (x + stump_h * TERRAIN_STEP, y), (x + stump_h * TERRAIN_STEP, y + stump_h * TERRAIN_STEP), (x, y + stump_h * TERRAIN_STEP)]
                 self.fd_polygon.shape.vertices = poly
                 t = self.world.CreateStaticBody(fixtures=self.fd_polygon)

@@ -23,16 +23,20 @@ class GeneratorPPO:
         gamma=0.99,
         K_epochs=10,   # Keep K_epochs=10 high to learn efficiently from safe steps
         eps_clip=0.2,
+        entropy_coef=0.02,
         num_actions=11,
         # ratio=0.25, # removed
         top_k_features=16,
         ablation_type="none",
+        env_type="minigrid",
 
     ):
         self.gamma = gamma
         self.eps_clip = eps_clip
-        self.K_epochs = K_epochs
+        self.K_epochs = int(K_epochs)
+        self.entropy_coef = entropy_coef
         self.context_dim = context_dim
+        self.env_type = env_type
         # self.ratio = ratio # removed
         self.top_k_features = top_k_features
 
@@ -43,19 +47,24 @@ class GeneratorPPO:
         if ablation_type == "no_history":
             self.encoder = None  # No history encoder needed for this ablation
         else:
-            self.encoder = HistoryEncoder(context_dim=context_dim,    
-            emb_dim=his_emb_dim).to(device)
+            self.encoder = HistoryEncoder(
+                context_dim=context_dim,
+                emb_dim=his_emb_dim,
+                env_type=env_type,
+            ).to(device)
 
         self.policy = MapEditorActorCritic(
-            context_dim=context_dim,
             num_actions=num_actions,
+            context_dim=context_dim,
             ablation_type=ablation_type,
+            env_type=env_type,
         ).to(device)
 
         self.policy_old = MapEditorActorCritic(
-            context_dim=context_dim,
             num_actions=num_actions,
+            context_dim=context_dim,
             ablation_type=ablation_type,
+            env_type=env_type,
         ).to(device)
 
         self.policy_old.load_state_dict(self.policy.state_dict())
@@ -110,6 +119,9 @@ class GeneratorPPO:
         """
         # 使用更新后的 HistoryEncoder 提取每个样本的综合失败特征
         ctx = self.encoder(prev_map, terrain_heat, stats_heat) # [B, context_dim]
+
+        if self.env_type == "bipedalwalker":
+            return F.normalize(ctx, p=2, dim=1)
         
         # 跨 Batch 取并集 (Max-Pooling)
         v_ctx, _ = torch.max(ctx, dim=0, keepdim=True) # [1, context_dim]
@@ -134,18 +146,25 @@ class GeneratorPPO:
         if self.encoder is None:   
             ctx = None
             global_ctx = None
+            phs = torch.zeros((B, 16), device=device)
         else:
             if prev_data is None:
                 # 初始状态：空地图、空热图、空背包热图
                 H, W = base_map.size(2), base_map.size(3)
                 pm = torch.zeros((1, 3, H, W), device=device)
                 pht = torch.zeros((1, 1, H, W), device=device)
-                phs = torch.zeros((1, 16), device=device)
+                stats_dim = 26 if self.env_type == "bipedalwalker" else 16
+                phs = torch.zeros((1, stats_dim), device=device)
                 global_ctx = self._compute_global_context_dual(pm, pht, phs)
             else:
                 pm, pht, phs = prev_data
                 global_ctx = self._compute_global_context_dual(pm, pht, phs)
-            ctx = global_ctx.repeat(B, 1)
+            if global_ctx.size(0) == B:
+                ctx = global_ctx
+            else:
+                ctx = global_ctx.repeat(B, 1)
+            if phs.size(0) == 1 and B > 1:
+                phs = phs.repeat(B, 1)
 
         action, stats_act, map_logp, stats_logp, value, topk_mask, topk_stats_mask = self.policy_old.act(
             base_map, ctx, mask, max_edits_layout, max_stats_edit_ratio=max_edits_stats, stats_heat=phs
@@ -173,7 +192,8 @@ class GeneratorPPO:
             B, _, H, W = curr_map.shape
             self.buffer["prev_map"].append(torch.zeros((B, 3, H, W)))
             self.buffer["prev_heat"].append(torch.zeros((B, 1, H, W)))
-            self.buffer["stats_heat"].append(torch.zeros((B, 16)))
+            stats_dim = 26 if self.env_type == "bipedalwalker" else 16
+            self.buffer["stats_heat"].append(torch.zeros((B, stats_dim)))
         else:
             pm, pht, phs = prev_data
             self.buffer["prev_map"].append(pm.cpu())
@@ -248,9 +268,14 @@ class GeneratorPPO:
             for i in range(self.K_epochs):
                 if self.encoder is None:
                     ctx = None
+                    eval_stats_heat = prev_heat_stats
                 else:
                     global_ctx = self._compute_global_context_dual(prev_map, prev_heat_terrain, prev_heat_stats)
-                    ctx = global_ctx.repeat(curr_map.size(0), 1)
+                    if global_ctx.size(0) == curr_map.size(0):
+                        ctx = global_ctx
+                    else:
+                        ctx = global_ctx.repeat(curr_map.size(0), 1)
+                    eval_stats_heat = prev_heat_stats
 
                 # action_tuple: (terrain_action, stats_action)
                 logp_terrain, logp_stats, value, entropy = self.policy.evaluate(
@@ -260,7 +285,7 @@ class GeneratorPPO:
                     mask,
                     target_topk_mask=topk_mask,
                     target_stats_topk_mask=stats_topk_mask,
-                    stats_heat=prev_heat_stats,
+                    stats_heat=eval_stats_heat,
                 )
 
                 # Joint LogProb
@@ -276,10 +301,10 @@ class GeneratorPPO:
                 # 4. 损失函数组合
                 # - Policy Loss: 让奖励高的动作概率变大
                 # - Value Loss: 让 Critic 估分更准 (MSE)
-                # - Entropy Loss: 不要太大，否则会强迫生成器永远随机乱下棋 (Reduced from 0.8 to 0.05 for convergence)
+                # - Entropy Loss: 不要太大，否则会强迫生成器永远随机乱下棋 (Reduced from 0.05 to 0.01 for stability)
                 loss_policy = -torch.min(surr1, surr2).mean()
                 loss_value = 0.5 * self.mse(value, rewards)
-                loss_entropy = -0.05 * entropy.mean()
+                loss_entropy = -self.entropy_coef * entropy.mean()
 
                 total_loss = loss_policy + loss_value + loss_entropy
                 

@@ -1,4 +1,5 @@
 import os
+import csv
 import torch
 from torch import nn
 import pytorch_lightning as pl
@@ -54,7 +55,11 @@ class AttentionWorldModel(pl.LightningModule):
         self.env_type = hparams.env_type
         self.frame_stack = getattr(hparams, "frame_stack", 1)
         self.use_bipedal_flag = bool(getattr(hparams, "use_bipedal_attention", False))
-        self.is_bipedal = bool(self.use_bipedal_flag or self.env_type == "bipedalwalker")
+        # Keep a single explicit flag for the vector-state BipedalWalker path.
+        # Some call sites check `self.is_bipedal`, so define it before first use.
+        self.is_bipedal = (self.env_type == "bipedalwalker") or self.use_bipedal_flag
+        print(f"[AttentionWM Init] env_type: {self.env_type} | data_type: {self.data_type} | val_metric: {getattr(self.hparams, 'validation_metric', 'mse')}")
+        
         MODEL_MAPPING = {
             'attention': AttentionWM_support.AttentionModule,
             'embedding': Embedding_support.EmbeddingModule,
@@ -81,6 +86,15 @@ class AttentionWorldModel(pl.LightningModule):
             utils.load_model_weight(self.model, hparams.model_save_path)
         self.loss = nn.MSELoss() # nn.SmoothL1Loss()
         self.visual_func = minigrid_utils.Visualization(hparams)
+        self.train_token_loss_accumulator = {}
+        self.train_token_acc_accumulator = {}
+        self.train_token_loss_csv_path = None
+        self.bipedal_token_loss_weights = dict(getattr(hparams, "bipedal_token_loss_weights", {}))
+        if self.is_bipedal and hasattr(self.model, "bipedal_token_specs"):
+            self.train_token_loss_csv_path = os.path.join(
+                os.path.dirname(hparams.model_save_path),
+                "bipedal_train_token_losses.csv",
+            )
         self.save_hyperparameters(hparams)
 
 
@@ -90,6 +104,9 @@ class AttentionWorldModel(pl.LightningModule):
         old_params = {k: v.clone().detach().cpu() 
               for k, v in self.state_dict().items()}
         return old_params
+
+    def get_bipedal_token_weight(self, token_name: str) -> float:
+        return float(self.bipedal_token_loss_weights.get(token_name, 1.0))
     
     # def load_old_params(self, old_params):
     #     """加载旧参数并应用到当前模型"""
@@ -279,6 +296,20 @@ class AttentionWorldModel(pl.LightningModule):
                     pred, _, s_inv_pred = self(s_obs, s_act, s_info, inv=s_inv)
                     loss_dict = self.loss_function_weight(pred, s_obs_next, s_obs_masked, obs_prev=s_obs)
                     loss_sample = loss_dict['loss_obs']
+
+                    if self.is_bipedal and isinstance(s_inv_pred, dict) and "contact_logits" in s_inv_pred:
+                        contact_bce_total = torch.zeros((), device=device, dtype=torch.float32)
+                        token_spec_map = dict(getattr(self.model, "bipedal_token_specs", []))
+                        for token_name in getattr(self.model, "contact_token_names", set()):
+                            token_indices = token_spec_map[token_name]
+                            next_contact_target = (s_obs[:, token_indices] + s_obs_next[:, token_indices]).clamp(0.0, 1.0)
+                            contact_logits = s_inv_pred["contact_logits"][token_name]
+                            token_bce = F.binary_cross_entropy_with_logits(
+                                contact_logits,
+                                next_contact_target,
+                            )
+                            contact_bce_total = contact_bce_total + self.get_bipedal_token_weight(token_name) * token_bce
+                        loss_sample = loss_sample + contact_bce_total
                     
                     if self.env_type == 'crafter' and s_inv_pred is not None and s_inv_next is not None:
                         if s_inv is not None:
@@ -500,15 +531,12 @@ class AttentionWorldModel(pl.LightningModule):
         Returns:
             feat: (B, N, embed_dim) spatial token features after conv+positional encoding
         """
-        if getattr(self, "is_bipedal", False) and hasattr(self.model, "state_tokenizer"):
+        if getattr(self, "is_bipedal", False) and hasattr(self.model, "tokenize_bipedal_state"):
             with torch.no_grad() if not self.training else torch.enable_grad():
                 if state.ndim == 1:
                     state = state.unsqueeze(0)
                 state = state.float()
-                B = state.shape[0]
-                x = state.view(B, self.model.num_tokens, self.model.token_dim)
-                x = self.model.state_tokenizer(x)
-                x = x + self.model.pos_embedding
+                x = self.model.tokenize_bipedal_state(state)
             return x
 
         if not hasattr(self.model, 'conv1'):
@@ -558,8 +586,8 @@ class AttentionWorldModel(pl.LightningModule):
     def forward(self, state, action, info, inv=None):
         out = self.model(state, action, info, inv=inv)
         if len(out) == 3:
-            next_state_pred, attentionWeight, inv_pred = out
-            return next_state_pred, attentionWeight, inv_pred
+            next_state_pred, attentionWeight, aux_pred = out
+            return next_state_pred, attentionWeight, aux_pred
         else:
             # Fallback for MLP or older models that only return 2 items
             next_state_pred, attentionWeight = out
@@ -572,7 +600,14 @@ class AttentionWorldModel(pl.LightningModule):
         return loss
     
 
-    def loss_function_weight(self, next_observations_predict, next_observations_true, obs_masked=None, obs_prev=None):
+    def loss_function_weight(
+        self,
+        next_observations_predict,
+        next_observations_true,
+        obs_masked=None,
+        obs_prev=None,
+        force_weighted: bool = False,
+    ):
         """
         Custom Loss with tiered aggressive weighting:
         - If use_weighted_loss is True:
@@ -581,9 +616,20 @@ class AttentionWorldModel(pl.LightningModule):
         - Else: 1.0 (Standard CE/MSE)
         """
         device = next_observations_predict.device 
-        use_weighted_loss = getattr(self.hparams, "use_weighted_loss", False)
+        use_weighted_loss = force_weighted or getattr(self.hparams, "use_weighted_loss", False)
         if self.is_bipedal:
-            loss = F.mse_loss(next_observations_predict, next_observations_true)
+            weighted_losses = []
+            for token_name, token_indices in getattr(self.model, "bipedal_token_specs", []):
+                if token_name in getattr(self.model, "contact_token_names", set()):
+                    continue
+                token_loss = F.mse_loss(
+                    next_observations_predict[:, token_indices],
+                    next_observations_true[:, token_indices],
+                )
+                weighted_losses.append(self.get_bipedal_token_weight(token_name) * token_loss)
+            loss = torch.stack(weighted_losses).sum() if weighted_losses else F.mse_loss(
+                next_observations_predict, next_observations_true
+            )
             return {"loss_obs": loss}
         
         # 1. Base Loss (MSE for MiniGrid, CrossEntropy for Crafter)
@@ -718,7 +764,7 @@ class AttentionWorldModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         # —— 前向 & 主损失 —— #
         obs, act, obs_next, info, elements_mask, agent_pos, inv, inv_next = self.preprocess_batch(batch, True)
-        obs_pred, attentionWeight, inv_pred = self(obs, act, info, inv=inv)
+        obs_pred, attentionWeight, aux_pred = self(obs, act, info, inv=inv)
 
         # [NEW] Crafter WM Visualization (Only in LAST EPOCH to save time)
         is_last_epoch = False
@@ -759,8 +805,28 @@ class AttentionWorldModel(pl.LightningModule):
             from domain.crafter.crafter_support import crafter_classification_loss
             raw_ce = crafter_classification_loss(obs_pred, obs_next, reduction='mean')
         else:
-            raw_mse = F.mse_loss(obs_pred, obs_next)
+            if self.is_bipedal and hasattr(self.model, "contact_indices"):
+                contact_indices = self.model.contact_indices
+                continuous_mask = torch.ones(obs_pred.size(1), dtype=torch.bool, device=obs_pred.device)
+                continuous_mask[contact_indices] = False
+                raw_mse = F.mse_loss(obs_pred[:, continuous_mask], obs_next[:, continuous_mask])
+            else:
+                raw_mse = F.mse_loss(obs_pred, obs_next)
             raw_ce = None
+            if self.is_bipedal and hasattr(self.model, "bipedal_token_specs"):
+                for token_name, token_indices in self.model.bipedal_token_specs:
+                    if token_name in getattr(self.model, "contact_token_names", set()):
+                        contact_logits = aux_pred["contact_logits"][token_name]
+                        next_contact_target = (obs[:, token_indices] + obs_next[:, token_indices]).clamp(0.0, 1.0)
+                        token_loss = F.binary_cross_entropy_with_logits(contact_logits, next_contact_target)
+                        token_pred = (torch.sigmoid(contact_logits) >= 0.5).float()
+                        token_acc = (token_pred == next_contact_target).float().mean()
+                        log_name = f"train/token_{token_name}_bce"
+                        self.train_token_acc_accumulator[token_name].append(float(token_acc.detach().cpu()))
+                    else:
+                        token_loss = F.mse_loss(obs_pred[:, token_indices], obs_next[:, token_indices])
+                        log_name = f"train/token_{token_name}_mse"
+                    self.train_token_loss_accumulator[token_name].append(float(token_loss.detach().cpu()))
         
         # —— raw EWC（未乘 λ）—— #
         ewc_raw = self.ewc_loss()
@@ -771,9 +837,32 @@ class AttentionWorldModel(pl.LightningModule):
         # —— 合成总损失 —— #
         ewc_term = self.lambda_ewc * ewc_raw
         loss_total = weighted_obs_loss + ewc_term
+        if self.is_bipedal and aux_pred is not None and "contact_logits" in aux_pred:
+            contact_bce_total = torch.zeros((), device=obs.device, dtype=obs.dtype)
+            total_contact_correct = torch.zeros((), device=obs.device, dtype=obs.dtype)
+            total_contact_count = torch.zeros((), device=obs.device, dtype=obs.dtype)
+            for token_name in getattr(self.model, "contact_token_names", set()):
+                token_indices = dict(self.model.bipedal_token_specs)[token_name]
+                next_contact_target = (obs[:, token_indices] + obs_next[:, token_indices]).clamp(0.0, 1.0)
+                contact_logits = aux_pred["contact_logits"][token_name]
+                token_bce = F.binary_cross_entropy_with_logits(
+                    contact_logits,
+                    next_contact_target,
+                )
+                token_pred = (torch.sigmoid(contact_logits) >= 0.5).float()
+                total_contact_correct = total_contact_correct + (token_pred == next_contact_target).float().sum()
+                total_contact_count = total_contact_count + torch.tensor(
+                    next_contact_target.numel(), device=obs.device, dtype=obs.dtype
+                )
+                contact_bce_total = contact_bce_total + self.get_bipedal_token_weight(token_name) * token_bce
+            loss_total = loss_total + contact_bce_total
+            contact_acc = total_contact_correct / total_contact_count.clamp_min(1.0)
+            self.log("train/contact_bce", contact_bce_total.detach(), on_step=True, on_epoch=True)
+            self.log("train/contact_acc", contact_acc.detach(), on_step=True, on_epoch=True)
         
         # Add inventory MSE loss dynamically if applicable
-        if self.env_type == 'crafter' and inv_pred is not None and inv_next is not None:
+        if self.env_type == 'crafter' and aux_pred is not None and inv_next is not None:
+            inv_pred = aux_pred
             if inv is not None:
                 inv_diff = torch.abs(inv_next - inv).float()
                 inv_weights = 1.0 + (inv_diff > 1e-5).float() * 20.0
@@ -812,8 +901,65 @@ class AttentionWorldModel(pl.LightningModule):
 
         return loss_total
 
-    
-   
+    def on_train_epoch_start(self):
+        if self.is_bipedal and hasattr(self.model, "bipedal_token_specs"):
+            self.train_token_loss_accumulator = {
+                token_name: [] for token_name, _ in self.model.bipedal_token_specs
+            }
+            self.train_token_acc_accumulator = {
+                token_name: [] for token_name, _ in self.model.bipedal_token_specs
+                if token_name in getattr(self.model, "contact_token_names", set())
+            }
+
+    def on_train_epoch_end(self):
+        if not (self.is_bipedal and hasattr(self.model, "bipedal_token_specs")):
+            return
+        if self.train_token_loss_csv_path is None:
+            return
+
+        os.makedirs(os.path.dirname(self.train_token_loss_csv_path), exist_ok=True)
+        token_names = [token_name for token_name, _ in self.model.bipedal_token_specs]
+        row = {
+            "epoch": int(self.current_epoch),
+            "global_step": int(self.global_step),
+        }
+        for token_name in token_names:
+            values = self.train_token_loss_accumulator.get(token_name, [])
+            row[token_name] = float(np.mean(values)) if values else 0.0
+        for token_name in getattr(self.model, "contact_token_names", set()):
+            acc_values = self.train_token_acc_accumulator.get(token_name, [])
+            row[f"{token_name}_acc"] = float(np.mean(acc_values)) if acc_values else 0.0
+
+        csv_fieldnames = [
+            "epoch",
+            "global_step",
+            *token_names,
+            *[f"{token_name}_acc" for token_name in getattr(self.model, "contact_token_names", set())],
+        ]
+        file_exists = os.path.exists(self.train_token_loss_csv_path)
+        if file_exists:
+            with open(self.train_token_loss_csv_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                existing_fieldnames = reader.fieldnames or []
+                existing_rows = list(reader)
+            if existing_fieldnames != csv_fieldnames:
+                normalized_rows = []
+                for existing_row in existing_rows:
+                    normalized_rows.append({
+                        field: existing_row.get(field, "")
+                        for field in csv_fieldnames
+                    })
+                with open(self.train_token_loss_csv_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=csv_fieldnames)
+                    writer.writeheader()
+                    writer.writerows(normalized_rows)
+
+        with open(self.train_token_loss_csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
     def validation_step(self, batch, batch_idx):
         obs, act, obs_next, info, elements_mask, agent_position, inv, inv_next = self.preprocess_batch(batch)
         obs_pred, attention_weight, inv_pred = self(obs, act, info, inv=inv)
@@ -830,7 +976,7 @@ class AttentionWorldModel(pl.LightningModule):
         #             f"pred={pred_val:.4f}, true={true_val:.4f}")
         
         # 将loss映射回全局并保存到列表中
-        if getattr(self.hparams, "keep_cell_loss", False):
+        if getattr(self.hparams, "keep_cell_loss", False) and not getattr(self, 'is_bipedal', False):
             loss_map = self.compute_cell_loss(obs_pred, obs_next)
             batch_size = loss_map.shape[0]
             for i in range(batch_size):
@@ -843,6 +989,19 @@ class AttentionWorldModel(pl.LightningModule):
   
         if obs_next.dtype != obs_pred.dtype:
             obs_next = obs_next.float()
+            
+        if getattr(self.hparams, "keep_cell_loss", False) and getattr(self, 'is_bipedal', False):
+            if not hasattr(self, 'bipedal_semantic_acc'):
+                self.bipedal_semantic_acc = []
+            with torch.no_grad():
+                hull_err = F.mse_loss(obs_pred[:, 0:4], obs_next[:, 0:4], reduction='none').mean(dim=1)
+                leg1_err = F.mse_loss(obs_pred[:, 4:8], obs_next[:, 4:8], reduction='none').mean(dim=1)
+                leg2_err = F.mse_loss(obs_pred[:, 9:13], obs_next[:, 9:13], reduction='none').mean(dim=1)
+                lidar_err = F.mse_loss(obs_pred[:, 14:24], obs_next[:, 14:24], reduction='none').mean(dim=1)
+                contact_err = F.mse_loss(obs_pred[:, [8, 13]], obs_next[:, [8, 13]], reduction='none').mean(dim=1)
+                
+                batch_semantic = torch.stack([hull_err, leg1_err, leg2_err, lidar_err, contact_err], dim=1) # [B, 5]
+                self.bipedal_semantic_acc.append(batch_semantic.cpu())
         
         # [NEW] Crafter WM Visualization for Validation (Dataset 2)
         if self.visualizationFlag and (not self.is_bipedal) and batch_idx == 0:
@@ -873,8 +1032,56 @@ class AttentionWorldModel(pl.LightningModule):
 
             self.log("val/ce_loss", val_ce, on_step=False, on_epoch=True)
         else:
-            raw_mse = F.mse_loss(obs_pred, obs_next)
+            val_metric = str(getattr(self.hparams, "validation_metric", "mse")).lower()
+            if self.is_bipedal and hasattr(self.model, "contact_indices"):
+                contact_indices = self.model.contact_indices
+                continuous_mask = torch.ones(obs_pred.size(1), dtype=torch.bool, device=obs_pred.device)
+                continuous_mask[contact_indices] = False
+                raw_mse = F.mse_loss(obs_pred[:, continuous_mask], obs_next[:, continuous_mask])
+            else:
+                raw_mse = F.mse_loss(obs_pred, obs_next)
             loss_val = raw_mse
+            # Optional: weighted validation metric for MiniGrid comparison.
+            # Keep default behavior unchanged unless validation_metric explicitly requests it.
+            if (self.env_type == "minigrid") and (val_metric == "mse_weighted"):
+                weighted_res = self.loss_function_weight(
+                    obs_pred,
+                    obs_next,
+                    elements_mask,
+                    obs_prev=obs,
+                    force_weighted=True,
+                )
+                weighted_val = weighted_res["loss_obs"]
+                loss_val = weighted_val
+                self.log("val/mse_weighted", weighted_val, on_step=False, on_epoch=True)
+                
+                # Debugging magnitude discrepancy (First batch only to avoid spam)
+                if batch_idx == 0:
+                    print(f"[AttentionWM Val Debug] RAW MSE: {raw_mse.item():.6f} | WEIGHTED MSE: {weighted_val.item():.6f} | Ratio: {weighted_val.item()/max(1e-6, raw_mse.item()):.2f}")
+            if self.is_bipedal and hasattr(self.model, "bipedal_token_specs"):
+                total_contact_bce = torch.zeros((), device=obs.device, dtype=obs.dtype)
+                total_contact_correct = torch.zeros((), device=obs.device, dtype=obs.dtype)
+                total_contact_count = torch.zeros((), device=obs.device, dtype=obs.dtype)
+                for token_name, token_indices in self.model.bipedal_token_specs:
+                    if token_name in getattr(self.model, "contact_token_names", set()):
+                        contact_logits = inv_pred["contact_logits"][token_name]
+                        next_contact_target = (obs[:, token_indices] + obs_next[:, token_indices]).clamp(0.0, 1.0)
+                        token_loss = F.binary_cross_entropy_with_logits(contact_logits, next_contact_target)
+                        token_pred = (torch.sigmoid(contact_logits) >= 0.5).float()
+                        token_acc = (token_pred == next_contact_target).float().mean()
+                        self.log(f"val/token_{token_name}_bce", token_loss, on_step=False, on_epoch=True)
+                        self.log(f"val/token_{token_name}_acc", token_acc, on_step=False, on_epoch=True)
+                        total_contact_bce = total_contact_bce + token_loss
+                        total_contact_correct = total_contact_correct + (token_pred == next_contact_target).float().sum()
+                        total_contact_count = total_contact_count + torch.tensor(
+                            next_contact_target.numel(), device=obs.device, dtype=obs.dtype
+                        )
+                    else:
+                        token_loss = F.mse_loss(obs_pred[:, token_indices], obs_next[:, token_indices])
+                        self.log(f"val/token_{token_name}_mse", token_loss, on_step=False, on_epoch=True)
+                self.log("val/contact_bce", total_contact_bce, on_step=False, on_epoch=True)
+                contact_acc = total_contact_correct / total_contact_count.clamp_min(1.0)
+                self.log("val/contact_acc", contact_acc, on_step=False, on_epoch=True)
 
         # No longer logging redundant "val_loss" here as we log "avg_val_loss_wm" at epoch end.
 
@@ -889,9 +1096,11 @@ class AttentionWorldModel(pl.LightningModule):
         if getattr(self.hparams, "keep_cell_loss", False):
             self.loss_accumulator = [[[] for _ in range(self.col)] for _ in range(self.row)]
             self.inventory_loss_accumulator = []
+            if getattr(self, "is_bipedal", False):
+                self.bipedal_semantic_acc = []
 
     def on_validation_epoch_end(self):
-        if getattr(self.hparams, "keep_cell_loss", False):
+        if getattr(self.hparams, "keep_cell_loss", False) and not getattr(self, 'is_bipedal', False):
             avg_loss_map = torch.zeros((self.row, self.col), device=self.device)
             for y in range(self.row):
                 for x in range(self.col):
@@ -899,6 +1108,13 @@ class AttentionWorldModel(pl.LightningModule):
                     avg_loss_map[y, x] = sum(vals) / len(vals) if vals else 0
 
             self.loss_map_result = avg_loss_map.cpu().numpy()
+        elif getattr(self.hparams, "keep_cell_loss", False) and getattr(self, 'is_bipedal', False):
+            if hasattr(self, "bipedal_semantic_acc") and len(self.bipedal_semantic_acc) > 0:
+                stacked_sem = torch.cat(self.bipedal_semantic_acc, dim=0) # [Total_Samples, 5]
+                avg_sem = stacked_sem.mean(dim=0).numpy().astype(np.float32) # [5]
+                self.loss_map_result = avg_sem.reshape(1, 5)
+            else:
+                self.loss_map_result = np.zeros((1, 5), dtype=np.float32)
             if self.env_type == 'crafter':
                 if len(self.inventory_loss_accumulator) > 0:
                     stacked = torch.stack(self.inventory_loss_accumulator, dim=0)  # [num_batches, 16]

@@ -29,8 +29,12 @@ class MapEditorActorCritic(nn.Module):
         max_state_id=3,
         context_dim=64,
         ablation_type="none",
+        env_type="minigrid",
     ):
         super().__init__()
+        self.env_type = str(env_type).lower()
+        self.is_bipedal = ("bipedal" in self.env_type)
+        self.is_crafter = ("crafter" in self.env_type)
 
         # === 1. Embedding Layers ===
         self.emb_dim_obj = 16
@@ -40,10 +44,16 @@ class MapEditorActorCritic(nn.Module):
         self.emb_obj = nn.Embedding(max_obj_id + 1, self.emb_dim_obj)
         self.emb_color = nn.Embedding(max_color_id + 1, self.emb_dim_color)
         self.emb_state = nn.Embedding(max_state_id + 1, self.emb_dim_state)
+        
+        # If bipedal, channel 1 (terrain error) is continuous. 
+        # We adjust in_channels accordingly.
+        actual_col_dim = 1 if self.is_bipedal else self.emb_dim_color
+        actual_sta_dim = 1 if self.is_bipedal else self.emb_dim_state
+        
         self.ablation_type = ablation_type
 
         # === 2. Input Channels ===
-        base_in_channels = (self.emb_dim_obj + self.emb_dim_color + self.emb_dim_state) + 2  
+        base_in_channels = (self.emb_dim_obj + actual_col_dim + actual_sta_dim) + 2  
         if self.ablation_type == "no_history":
             total_in_channels = base_in_channels 
         else:
@@ -72,8 +82,11 @@ class MapEditorActorCritic(nn.Module):
         # B. Stats Head (32 Buttons Config: 2 rows x 16 slots)
         self.num_stats_slots = 32 
         self.num_stats_actions = 2 # (0: Off, 1: On)
+        
+        # Bipedal uses 26-dim stats heat, MiniGrid/Crafter still use 16
+        stats_in_dim = 26 if self.is_bipedal else 16
         self.stats_actor = nn.Sequential(
-            nn.Linear(hidden_dim + 16, 256),
+            nn.Linear(hidden_dim + stats_in_dim, 256),
             nn.LayerNorm(256),
             nn.ReLU(),
             nn.Linear(256, self.num_stats_slots * self.num_stats_actions)
@@ -107,10 +120,24 @@ class MapEditorActorCritic(nn.Module):
         return xx / w_denom * 2 - 1, yy / h_denom * 2 - 1
 
     def forward_features(self, base_map_vec, context_vec):
+        """
+        Compresses spatial map features and global context vectors into a unified unified representation 
+        using feature concatenation and residual processing.
+        base_map_vec: (B, 3, H, W)
+        context_vec: (B, context_dim)
+        return: (B, hidden_dim, H, W)
+        """
         B, _, H, W = base_map_vec.shape
         feat_obj = self.emb_obj(base_map_vec[:, 0].long()).permute(0, 3, 1, 2)
-        feat_col = self.emb_color(base_map_vec[:, 1].long()).permute(0, 3, 1, 2)
-        feat_sta = self.emb_state(base_map_vec[:, 2].long()).permute(0, 3, 1, 2)
+        
+        if self.is_bipedal:
+            # Channel 1: Raw Terrain Error Heatmap
+            # Channel 2: Zeros (or other continuous signal if added)
+            feat_col = base_map_vec[:, 1:2]
+            feat_sta = base_map_vec[:, 2:3]
+        else:
+            feat_col = self.emb_color(base_map_vec[:, 1].long()).permute(0, 3, 1, 2)
+            feat_sta = self.emb_state(base_map_vec[:, 2].long()).permute(0, 3, 1, 2)
         xx, yy = self.get_coordinate_channels(B, H, W, base_map_vec.device)
         
         if self.ablation_type == "no_history" or context_vec is None:
@@ -170,21 +197,33 @@ class MapEditorActorCritic(nn.Module):
         action_logprob = dist.log_prob(action)
 
         # B. Stats (32 Piano Buttons) Sampling
-        # [Fix 1] Use MaxPool instead of AvgPool to capture the presence of sparse objects
-        global_vec = F.adaptive_max_pool2d(features, (1, 1)).view(B, -1)
-        if stats_heat is None:
-            stats_heat = torch.zeros(B, 16, device=map_vec.device)
-        global_vec = torch.cat([global_vec, stats_heat], dim=1)
-        
-        logits_stats = self.stats_actor(global_vec).view(B, self.num_stats_slots, self.num_stats_actions)
-        topk_stats_mask = self._get_stats_topk_mask(logits_stats, max_stats_edit_ratio)
-        # [Fix 2] Remove Hard Masking on logits to fix the DEAD GRADIENT issue. 
-        # Let PPO learn natively without 1e9 jumping discontinuities.
-        # logits_stats[:, :, 0].masked_fill_(~topk_stats_mask, 1e9)
-        # logits_stats[:, :, 1].masked_fill_(~topk_stats_mask, -1e9)
-        stats_dist = Categorical(logits=logits_stats)
-        stats_action = stats_dist.sample()
-        stats_logprob = stats_dist.log_prob(stats_action).sum(dim=-1)
+        # Bipedal does not use stats actions for environment editing.
+        # Keep stats branch as a strict no-op to avoid injecting noise into PPO logprob.
+        if self.is_bipedal:
+            stats_action = torch.zeros(
+                (B, self.num_stats_slots), device=map_vec.device, dtype=torch.long
+            )
+            stats_logprob = torch.zeros(B, device=map_vec.device, dtype=logits.dtype)
+            topk_stats_mask = torch.zeros(
+                (B, self.num_stats_slots), device=map_vec.device, dtype=torch.bool
+            )
+        else:
+            # [Fix 1] Use MaxPool instead of AvgPool to capture the presence of sparse objects
+            global_vec = F.adaptive_max_pool2d(features, (1, 1)).view(B, -1)
+            if stats_heat is None:
+                sh_dim = 26 if self.is_bipedal else 16
+                stats_heat = torch.zeros(B, sh_dim, device=map_vec.device)
+            global_vec = torch.cat([global_vec, stats_heat], dim=1)
+            
+            logits_stats = self.stats_actor(global_vec).view(B, self.num_stats_slots, self.num_stats_actions)
+            topk_stats_mask = self._get_stats_topk_mask(logits_stats, max_stats_edit_ratio)
+            # [Fix 2] Remove Hard Masking on logits to fix the DEAD GRADIENT issue.
+            # Let PPO learn natively without 1e9 jumping discontinuities.
+            # logits_stats[:, :, 0].masked_fill_(~topk_stats_mask, 1e9)
+            # logits_stats[:, :, 1].masked_fill_(~topk_stats_mask, -1e9)
+            stats_dist = Categorical(logits=logits_stats)
+            stats_action = stats_dist.sample()
+            stats_logprob = stats_dist.log_prob(stats_action).sum(dim=-1)
 
         value = self.critic(features)
         return (
@@ -221,20 +260,25 @@ class MapEditorActorCritic(nn.Module):
         dist_entropy = dist.entropy().mean()
 
         # B. Stats Eval
-        # [Fix 1] MaxPool matching the inference code above
-        global_vec = F.adaptive_max_pool2d(features, (1, 1)).view(B, -1)
-        if stats_heat is None:
-            stats_heat = torch.zeros(B, 16, device=map_vec.device)
-        global_vec = torch.cat([global_vec, stats_heat], dim=1)
-        
-        logits_stats = self.stats_actor(global_vec).view(B, self.num_stats_slots, self.num_stats_actions)
-        # [Fix 2] Removed evaluation target hard masking matching inference
-        # if target_stats_topk_mask is not None:
-        #     logits_stats[:, :, 0].masked_fill_(~target_stats_topk_mask, 1e9)
-        #     logits_stats[:, :, 1].masked_fill_(~target_stats_topk_mask, -1e9)
-        stats_dist = Categorical(logits=logits_stats)
-        stats_logprobs = stats_dist.log_prob(stats_action).sum(dim=-1)
-        stats_entropy = stats_dist.entropy().mean()
+        if self.is_bipedal:
+            stats_logprobs = torch.zeros(B, device=map_vec.device, dtype=logits.dtype)
+            stats_entropy = torch.zeros((), device=map_vec.device, dtype=logits.dtype)
+        else:
+            # [Fix 1] MaxPool matching the inference code above
+            global_vec = F.adaptive_max_pool2d(features, (1, 1)).view(B, -1)
+            if stats_heat is None:
+                stats_heat_dim = 26 if self.is_bipedal else 16
+                stats_heat = torch.zeros(B, stats_heat_dim, device=map_vec.device)
+            global_vec = torch.cat([global_vec, stats_heat], dim=1)
+            
+            logits_stats = self.stats_actor(global_vec).view(B, self.num_stats_slots, self.num_stats_actions)
+            # [Fix 2] Removed evaluation target hard masking matching inference
+            # if target_stats_topk_mask is not None:
+            #     logits_stats[:, :, 0].masked_fill_(~target_stats_topk_mask, 1e9)
+            #     logits_stats[:, :, 1].masked_fill_(~target_stats_topk_mask, -1e9)
+            stats_dist = Categorical(logits=logits_stats)
+            stats_logprobs = stats_dist.log_prob(stats_action).sum(dim=-1)
+            stats_entropy = stats_dist.entropy().mean()
 
         value = self.critic(features)
         total_entropy = dist_entropy + stats_entropy

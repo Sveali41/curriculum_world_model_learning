@@ -117,6 +117,7 @@ class ActorCritic(nn.Module):
             action_mean = self.actor(state)
             cov_mat = torch.diag(self.action_var).unsqueeze(dim=0)
             dist = MultivariateNormal(action_mean, cov_mat)
+            action = dist.sample()
         else:
             action_probs = self.actor(state)
 

@@ -6,36 +6,14 @@ defaults:
   - _self_
 
 # --- Control Switch ---
-domain: 'crafter'             # Options: 'crafter' or 'minigrid'
+domain: 'minigrid'             # Options: 'crafter' or 'minigrid' or 'bipedal'
 
 # --- Force Random Exploration (DR core) ---
 generator_agent:
   agent_type: 'random'         # No adversarial, just random maps
-  total_iterations: 50
+  total_iterations: 30 # 30 minigrid 50 bipedal 
   wm_train_frequency: 1
   warmup_iterations: 0         # No need to warm up random
-
-# --- Domain-Specific Overrides ---
-domains:
-  crafter:
-    val_n_phases: 20 # might need to add more after the trail testing
-    val_task_prefix: "crafter_target_task_"
-    val_data_path: ${domains.crafter.target_tasks_folder}
-    val_suffix: "_uniform.npz"
-    grid_shape: [2, 31, 31]
-    obs_norm: [20, 5, 0]
-    action_norm: 17
-    start_idx: 1
-    
-  minigrid:
-    val_n_phases: 20
-    val_task_prefix: "target_task"
-    val_data_path: ${domains.minigrid.target_tasks_folder}
-    val_suffix: "_test_uniform.npz"
-    grid_shape: [3, 0, 0]
-    obs_norm: [10, 5, 3]
-    action_norm: 7
-    start_idx: 0
 
 # Logger settings
 dr_log_dir: ${oc.env:TRAINER_PATH}/logs/results_dr/

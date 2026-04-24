@@ -1,0 +1,59 @@
+# trainer/conf/config_target_baseline.yaml
+# Configuration specifically for the Target Baseline Experiment
+
+defaults:
+  - config_mac                 # Inherit WM, EWC, Buffer from unified config
+  - _self_
+
+# --- Control Switch (Unified across all baselines) ---
+domain: 'minigrid'              # 'crafter' or 'minigrid' or 'bipedalwalker'
+
+# --- Domain-Specific Specifications for Sequential Phase Training ---
+domains:
+  crafter:
+    n_phases: 20
+    task_prefix: "crafter_target_task_"
+    data_path: ${oc.env:TRAINER_PATH}/data/crafter/target_tasks/
+    train_suffix: "_random.npz"
+    val_suffix: "_uniform.npz"
+    grid_shape: [2, 31, 31]
+    obs_norm: [20, 5, 0]
+    action_norm: 17
+    start_idx: 1
+    target_dataset_size: 20000
+    data_type: discrete
+    validation_metric: "ce"
+    
+  minigrid:
+    n_phases: 20
+    task_prefix: "target_task"
+    data_path: ${oc.env:TRAINER_PATH}/data/minigrid/target_tasks/
+    train_suffix: "_test_random.npz"
+    val_suffix: "_test_uniform.npz"
+    grid_shape: [3, 0, 0]
+    obs_norm: [11, 6, 3]
+    action_norm: 7
+    start_idx: 0
+    target_dataset_size: 7000
+    data_type: discrete
+    validation_metric: "mse_weighted"
+
+  bipedalwalker:
+    n_phases: 20
+    task_prefix: "bipedal_target_task_"
+    data_path: ${oc.env:TRAINER_PATH}/data/bipedalwalker/target_tasks/
+    train_suffix: "_random.npz"
+    val_suffix: "_uniform.npz"
+    grid_shape: [1, 1, 24]
+    obs_norm: [1]
+    action_norm: 4
+    start_idx: 1
+    target_dataset_size: 10000
+    data_type: norm
+
+# Override core params for CL stability
+seed: 0
+attention_model:
+  continue_learning: true      # Ensure EWC is active
+  ewc_ratio: 0.9              # bipedal:0.9 | crafter and minigrid: 0.9
+  replay_frac: 0.7            # bipedal:0.7 | crafter and minigrid: 3

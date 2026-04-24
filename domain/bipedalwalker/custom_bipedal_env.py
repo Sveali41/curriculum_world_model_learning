@@ -21,6 +21,7 @@ class CustomBipedalEnv(gym.Wrapper):
         super().__init__(env)
         
         self.layout_list = None
+        self.layout_str = None
 
     def set_custom_layout_from_str(self, layout_str: str):
         """
@@ -30,6 +31,7 @@ class CustomBipedalEnv(gym.Wrapper):
         """
         if not layout_str or layout_str.upper() == "TARGET":
             self.layout_list = None
+            self.layout_str = None
             self.env.unwrapped.custom_layout = None
             return
 
@@ -37,6 +39,7 @@ class CustomBipedalEnv(gym.Wrapper):
         # Matches: R1.2, G20, S1.5, T-3, P4
         tokens = re.findall(r'([RGSPT])(-?\d+\.?\d*)', layout_str.replace(" ", ""))
         self.layout_list = [(t, float(v)) for t, v in tokens]
+        self.layout_str = layout_str
         
         # Inject into the unwrapped engine
         self.env.unwrapped.custom_layout = self.layout_list

@@ -69,11 +69,17 @@ class BipedalHeuristicPolicy:
         # If any object detected within ~1.0m, we boost the lift.
         lidar_s_base = 14
         front_lidar = s[lidar_s_base + 4 : lidar_s_base + 10]
-        has_obstacle_ahead = (self.np.min(front_lidar) < 0.5)
+        min_dist = self.np.min(front_lidar)
+        
+        # Calculate obstacle intensity weight (0.0 at 0.8m, 1.0 at 0.0m proximity)
+        obstacle_weight = self.np.clip(1.25 * (0.8 - min_dist), 0.0, 1.0)
 
         if self.state == self.STAY_ON_ONE_LEG:
-            hip_targ[self.moving_leg] = 1.1 + (0.3 if has_obstacle_ahead else 0.0)
-            knee_targ[self.moving_leg] = -1.2 if has_obstacle_ahead else -0.6
+            # Proportional lift: Base 1.1 + variable boost based on obstacle closeness
+            hip_targ[self.moving_leg] = 1.1 + (0.6 * obstacle_weight)
+            # Proportional knee contraction: Base -0.6 + variable boost
+            knee_targ[self.moving_leg] = -0.6 - (1.0 * obstacle_weight)
+
             self.supporting_knee_angle += 0.03
             if s[2] > self.SPEED:
                 self.supporting_knee_angle += 0.03
@@ -131,3 +137,10 @@ class BipedalHeuristicPolicy:
             #    a = random_a
 
         return self.np.clip(a, -1.0, 1.0)
+
+def interpret_env(grid_1d_np, active_width=None):
+    from generator.bipedal_env_designer import bipedal_array_to_layout_str
+    
+    layout_str = bipedal_array_to_layout_str(grid_1d_np, active_width=active_width)
+    print(f"[Bipedal UED] Generated layout: {layout_str}")
+    return layout_str, None

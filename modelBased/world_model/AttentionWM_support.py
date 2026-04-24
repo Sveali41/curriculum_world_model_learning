@@ -189,18 +189,68 @@ class AttentionModule(nn.Module):
             if self.is_bipedal:
                 self.state_dim = int(grid_shape[-1]) if len(grid_shape) > 0 else 24
                 self.action_dim = 4
-                self.token_dim = 3
-                if self.state_dim % self.token_dim != 0:
+                if self.state_dim != 24:
                     raise ValueError(
-                        f"Bipedal state_dim={self.state_dim} must be divisible by token_dim={self.token_dim}"
+                        f"Bipedal state_dim must be 24, got {self.state_dim}"
                     )
-                self.num_tokens = self.state_dim // self.token_dim
-                self.state_tokenizer = nn.Linear(self.token_dim, embed_dim)
+                self.bipedal_token_specs = [
+                    ("hull_pose", [0, 1]),
+                    ("hull_vel", [2, 3]),
+                    ("leg1_hip", [4, 5]),
+                    ("leg1_knee", [6, 7]),
+                    ("leg1_contact", [8]),
+                    ("leg2_hip", [9, 10]),
+                    ("leg2_knee", [11, 12]),
+                    ("leg2_contact", [13]),
+                    ("lidar_near", [14, 15, 16, 17, 18]),
+                    ("lidar_far", [19, 20, 21, 22, 23]),
+                ]
+                self.contact_token_names = {"leg1_contact", "leg2_contact"}
+                self.contact_indices = [8, 13]
+                self.num_tokens = len(self.bipedal_token_specs)
+                self.token_name_to_idx = {
+                    name: idx for idx, (name, _) in enumerate(self.bipedal_token_specs)
+                }
+                self.token_encoders = nn.ModuleDict({
+                    name: nn.Linear(len(indices), embed_dim)
+                    for name, indices in self.bipedal_token_specs
+                })
                 self.action_fc = nn.Linear(self.action_dim, embed_dim)
                 self.pos_embedding = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))
                 nn.init.trunc_normal_(self.pos_embedding, std=0.02)
+                self.token_type_embedding = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))
+                nn.init.trunc_normal_(self.token_type_embedding, std=0.02)
                 self.context_fc = nn.Linear(self.state_dim, embed_dim)
-                self.token_head = nn.Linear(embed_dim, self.token_dim)
+                self.token_heads = nn.ModuleDict({
+                    name: nn.Linear(embed_dim, len(indices))
+                    for name, indices in self.bipedal_token_specs
+                    if name not in self.contact_token_names
+                })
+                self.contact_context_specs = {
+                    "leg1_contact": [
+                        "leg1_contact",
+                        "leg1_hip",
+                        "leg1_knee",
+                        "hull_vel",
+                        "lidar_near",
+                    ],
+                    "leg2_contact": [
+                        "leg2_contact",
+                        "leg2_hip",
+                        "leg2_knee",
+                        "hull_vel",
+                        "lidar_near",
+                    ],
+                }
+                self.contact_heads = nn.ModuleDict({
+                    name: nn.Sequential(
+                        nn.Linear(embed_dim * len(self.contact_context_specs[name]), embed_dim),
+                        nn.ReLU(inplace=True),
+                        nn.Linear(embed_dim, 1),
+                    )
+                    for name, indices in self.bipedal_token_specs
+                    if name in self.contact_token_names
+                })
             else:
                 self.input_channel = grid_shape[0] * frame_stack
                 self.action_fc = nn.Linear(1, embed_dim)
@@ -240,6 +290,40 @@ class AttentionModule(nn.Module):
         
         self.dropout_conv = nn.Dropout(p=0.1)
 
+    def tokenize_bipedal_state(self, state):
+        # Ensure state is (Batch, 24) even if it comes as (Batch, 1, 24)
+        if state.ndim == 3:
+            state = state.squeeze(1)
+            
+        token_feats = []
+        for name, indices in self.bipedal_token_specs:
+            token_x = state[..., indices]
+            token_x = self.token_encoders[name](token_x)
+            token_feats.append(token_x)
+
+        x = torch.stack(token_feats, dim=1) # (Batch, NumTokens, EmbedDim)
+        x = x + self.pos_embedding + self.token_type_embedding
+        return x
+
+    def decode_bipedal_tokens(self, token_features, state):
+        batch_size = token_features.size(0)
+        out = state.new_zeros(batch_size, self.state_dim)
+        contact_logits = {}
+        for token_idx, (name, indices) in enumerate(self.bipedal_token_specs):
+            if name in self.contact_token_names:
+                context_names = self.contact_context_specs[name]
+                context_features = [
+                    token_features[:, self.token_name_to_idx[token_name], :]
+                    for token_name in context_names
+                ]
+                contact_context = torch.cat(context_features, dim=-1)
+                logits = self.contact_heads[name](contact_context)
+                contact_logits[name] = logits
+            else:
+                pred = self.token_heads[name](token_features[:, token_idx, :])
+                out[:, indices] = pred
+        return out, contact_logits
+
 
     def forward(self, state, action, info, inv=None):
         orginal_dim = state.ndim
@@ -253,9 +337,7 @@ class AttentionModule(nn.Module):
             state = state.float()
             action = action.float()
             B = state.size(0)
-            x = state.view(B, self.num_tokens, self.token_dim)
-            x = self.state_tokenizer(x)
-            x = x + self.pos_embedding
+            x = self.tokenize_bipedal_state(state)
 
             action_emb = self.action_fc(action).unsqueeze(1).expand(-1, self.num_tokens, -1)
             context_emb = self.context_fc(state).unsqueeze(1).expand(-1, self.num_tokens, -1)
@@ -268,11 +350,11 @@ class AttentionModule(nn.Module):
                 x, attn_weights = layer(x)
 
             x = self.res_mlp(x)
-            x_out = self.token_head(x).reshape(B, self.state_dim)
+            x_out, contact_logits = self.decode_bipedal_tokens(x, state)
 
             if orginal_dim == 1:
                 x_out = x_out.squeeze(0)
-            return x_out, attn_weights, None
+            return x_out, attn_weights, {"contact_logits": contact_logits}
 
         if orginal_dim == 3:  # 单个样本
             state = state.unsqueeze(0)

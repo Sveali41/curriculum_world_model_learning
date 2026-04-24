@@ -8,10 +8,73 @@ import os
 
 
 class FisherReplayBuffer:
-    def __init__(self, max_size):
+    def __init__(self, max_size, contact_positive_ratio=0.5):
         self.buffer = []
         self.max_size = max_size
         self.mask_size = 3  # Cross mask size
+        self.contact_positive_ratio = contact_positive_ratio  # Ratio of contact=1 samples in label-balanced sampling
+
+    @staticmethod
+    def _sample_at(samples: Dict, index: int) -> Dict:
+        item = {}
+        for key, value in samples.items():
+            if value is None:
+                continue
+            try:
+                item[key] = value[index]
+            except Exception:
+                continue
+        return item
+
+    @staticmethod
+    def _pad_single_map_to_shape(arr: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+        """
+        Pad/crop one map sample to target (H, W), supporting HWC or CHW layout.
+        Non-image tensors are returned unchanged.
+        """
+        if not isinstance(arr, np.ndarray) or arr.ndim != 3:
+            return arr
+
+        max_h, max_w = target_shape
+
+        # HWC: (H, W, C) with small C (2/3/4)
+        if arr.shape[-1] <= 4 and arr.shape[0] > 4:
+            h, w, _ = arr.shape
+            out = arr[:max_h, :max_w, :]
+            pad_h = max_h - out.shape[0]
+            pad_w = max_w - out.shape[1]
+            if pad_h > 0 or pad_w > 0:
+                out = np.pad(out, ((0, max(pad_h, 0)), (0, max(pad_w, 0)), (0, 0)), mode='constant', constant_values=0)
+            return out
+
+        # CHW: (C, H, W) with small C (2/3/4)
+        if arr.shape[0] <= 4 and arr.shape[-1] > 4:
+            _, h, w = arr.shape
+            out = arr[:, :max_h, :max_w]
+            pad_h = max_h - out.shape[1]
+            pad_w = max_w - out.shape[2]
+            if pad_h > 0 or pad_w > 0:
+                out = np.pad(out, ((0, 0), (0, max(pad_h, 0)), (0, max(pad_w, 0))), mode='constant', constant_values=0)
+            return out
+
+        return arr
+
+    def harmonize_buffer_map_shape(self, target_shape: tuple[int, int]) -> int:
+        """
+        In-place pad/crop existing replay samples (obs/obs_next) to target shape.
+        Returns number of sample fields changed.
+        """
+        changed = 0
+        for sample in self.buffer:
+            for k in ("obs", "obs_next"):
+                if k not in sample:
+                    continue
+                old = sample[k]
+                new = self._pad_single_map_to_shape(old, target_shape)
+                if isinstance(old, np.ndarray) and isinstance(new, np.ndarray) and new.shape != old.shape:
+                    sample[k] = new
+                    changed += 1
+        return changed
 
     def compute_proxy_score_batch(
         self,
@@ -205,7 +268,7 @@ class FisherReplayBuffer:
 
         return near_mask  # (B,)
 
-    def update_combined(self, samples, current_sample_ratio=0.5, fisher_buffer_elements_ratio=0.5, target_shape=None):
+    def update_combined(self, samples, current_sample_ratio=0.5, fisher_buffer_elements_ratio=0.9, target_shape=None):
         """
         综合插入策略（基于当前 sample 数量）：
         1) 从 samples 中抽取 ratio 百分比数据
@@ -224,69 +287,134 @@ class FisherReplayBuffer:
 
         # === Part 1: key/door 样本 ===
         obs = samples['obs']
+        is_vector_obs = (
+            (isinstance(obs, np.ndarray) and obs.ndim == 2) or
+            (isinstance(obs, torch.Tensor) and obs.ndim == 2)
+        )
         
-        # --- [Auto-Padding Logic] ---
-        # Ensure all maps are padded to target_shape to support diverse env sizes
-        if target_shape is not None:
+        # --- [Optional Padding Logic] ---
+        # Only pad when target_shape is explicitly provided.
+        # This avoids silently mangling NHWC data (e.g., MiniGrid rollouts from run_env).
+        if target_shape is not None and isinstance(obs, np.ndarray) and not is_vector_obs:
             MAX_H, MAX_W = target_shape
-        else:
-             # Default: No padding if target_shape is not specified
-             # Just use the shape of the input maps
-             if isinstance(obs, np.ndarray):
-                if obs.ndim == 4: # (B, C, H, W)
-                    MAX_H, MAX_W = obs.shape[2], obs.shape[3]
-                else: # (B, H, W, C)
-                    MAX_H, MAX_W = obs.shape[1], obs.shape[2]
-             else:
-                # Fallback purely for safety if type is weird, though unlikely code path
-                MAX_H, MAX_W = 8, 8
-        
-        def pad_maps(maps_array):
-            # maps_array shape: (B, C, H, W) or (B, H, W, C)
-            # Assuming (B, 3, H, W) based on codebase convention
-            if maps_array.shape[2] == MAX_H and maps_array.shape[3] == MAX_W:
-                return maps_array
+
+            def _detect_layout(arr: np.ndarray) -> str:
+                # Returns "nchw" or "nhwc" for 4-D arrays.
+                if arr.ndim != 4:
+                    raise ValueError(f"Expected 4D array for layout detection, got shape={arr.shape}")
+                # Common case: NHWC image tensors (B, H, W, C) where C is small (2/3/4)
+                if arr.shape[-1] <= 4 and arr.shape[1] > 4:
+                    return "nhwc"
+                # Common case: NCHW image tensors (B, C, H, W) where C is small (2/3/4)
+                if arr.shape[1] <= 4 and arr.shape[-1] > 4:
+                    return "nchw"
+                # Fallback: treat as NCHW (historical default in this module).
+                return "nchw"
+
+            def pad_maps(maps_array: np.ndarray) -> np.ndarray:
+                layout = _detect_layout(maps_array)
+                if layout == "nhwc":
+                    _, H, W, _ = maps_array.shape
+                    pad_h = MAX_H - H
+                    pad_w = MAX_W - W
+                    if pad_h < 0 or pad_w < 0:
+                        return maps_array[:, :MAX_H, :MAX_W, :]
+                    if pad_h == 0 and pad_w == 0:
+                        return maps_array
+                    return np.pad(
+                        maps_array,
+                        ((0, 0), (0, pad_h), (0, pad_w), (0, 0)),
+                        mode="constant",
+                        constant_values=0,
+                    )
+
+                # layout == "nchw"
+                _, _, H, W = maps_array.shape
+                pad_h = MAX_H - H
+                pad_w = MAX_W - W
+                if pad_h < 0 or pad_w < 0:
+                    return maps_array[:, :, :MAX_H, :MAX_W]
+                if pad_h == 0 and pad_w == 0:
+                    return maps_array
+                return np.pad(
+                    maps_array,
+                    ((0, 0), (0, 0), (0, pad_h), (0, pad_w)),
+                    mode="constant",
+                    constant_values=0,
+                )
+
+            samples['obs'] = pad_maps(samples['obs'])
+            if isinstance(samples.get('obs_next', None), np.ndarray):
+                samples['obs_next'] = pad_maps(samples['obs_next'])
+            obs = samples['obs']
+
+        if is_vector_obs:
+            obs_tensor = torch.tensor(obs) if not isinstance(obs, torch.Tensor) else obs
+            if obs_tensor.shape[-1] == 24:
+                # BipedalWalker explicitly: indices 18-24 corresponds to front lidar sensors
+                lidar_readings = obs_tensor[..., 18:24]
+                # A min distance below 0.8 typically means there's an obstacle ahead (stump, stairs, pit edge)
+                near_mask = lidar_readings.min(dim=-1)[0] < 0.8
                 
-            B, C, H, W = maps_array.shape
-            pad_h = MAX_H - H
-            pad_w = MAX_W - W
-            
-            if pad_h < 0 or pad_w < 0:
-                 # print(f"[Warning] Map size ({H}, {W}) larger than max ({MAX_H}, {MAX_W}). Cropping!")
-                 return maps_array[:, :, :MAX_H, :MAX_W]
-                 
-            # Pad H and W dimensions (last two)
-            # Tuple format for np.pad: ((before_1, after_1), ... (before_N, after_N))
-            # (0,0) for B, (0,0) for C, (0, pad_h) for H, (0, pad_w) for W
-            padded = np.pad(maps_array, ((0,0), (0,0), (0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
-            return padded
+                # [NEW] Contact label mask (Index 8 is leg_1, Index 13 is leg_2)
+                contact_mask = (obs_tensor[..., 8] > 0.5) | (obs_tensor[..., 13] > 0.5)
+                no_contact_mask = ~contact_mask
 
-        if isinstance(obs, np.ndarray):
-            obs = pad_maps(obs)
-            samples['obs'] = obs
-            
-        if isinstance(samples['obs_next'], np.ndarray):
-             samples['obs_next'] = pad_maps(samples['obs_next'])
-
-        obs_tensor = torch.tensor(obs) if not isinstance(obs, torch.Tensor) else obs
-        try:
-            near_elements_mask = self.get_agent_near_elements_mask(obs_tensor)
-            near_indices_all = torch.where(near_elements_mask)[0].cpu().numpy()
-        except Exception as e:
-            print("Error computing near_elements_mask:", e)
-            near_indices_all = np.array([], dtype=int)
+                near_indices_all = torch.where(near_mask)[0].cpu().numpy()
+                contact_indices_all = torch.where(contact_mask)[0].cpu().numpy()
+                no_contact_indices_all = torch.where(no_contact_mask)[0].cpu().numpy()
+            else:
+                near_indices_all = np.array([], dtype=int)
+                contact_indices_all = np.array([], dtype=int)
+                no_contact_indices_all = np.array([], dtype=int)
+        else:
+            obs_tensor = torch.tensor(obs) if not isinstance(obs, torch.Tensor) else obs
+            try:
+                near_elements_mask = self.get_agent_near_elements_mask(obs_tensor)
+                near_indices_all = torch.where(near_elements_mask)[0].cpu().numpy()
+            except Exception as e:
+                print("Error computing near_elements_mask:", e)
+                near_indices_all = np.array([], dtype=int)
 
         elements_quota = int(total_quota * fisher_buffer_elements_ratio)
         elements_selected = []
         if len(near_indices_all) > 0 and elements_quota > 0:
             pick_n = min(elements_quota, len(near_indices_all))
             elements_selected = np.random.choice(near_indices_all, pick_n, replace=False).tolist()
-        # === Part 2: 剩余 quota 从其他样本中随机选择 ===
+        
+        # === Part 2: 剩余 quota 从其他样本中随机选择 (加入接触标签平衡) ===
         remaining_quota = total_quota - len(elements_selected)
         total_indices = list(range(total_len))
         non_elements_pool = [i for i in total_indices if i not in elements_selected]
-        random.shuffle(non_elements_pool)
-        random_selected = non_elements_pool[:remaining_quota]
+        
+        random_selected = []
+        if is_vector_obs and 'contact_indices_all' in locals() and len(contact_indices_all) > 0:
+            # 将候选池划分为 有接触(Contact=1) 和 无接触(Contact=0)
+            pool_contact = [i for i in non_elements_pool if i in contact_indices_all]
+            pool_no_contact = [i for i in non_elements_pool if i in no_contact_indices_all]
+            random.shuffle(pool_contact)
+            random.shuffle(pool_no_contact)
+            
+            # 按配置比例采样：contact_positive_ratio 给有接触的，剩余给无接触的
+            contact_quota = int(remaining_quota * self.contact_positive_ratio)
+            pick_c = min(contact_quota, len(pool_contact))
+            # 如果某一方不够，把配额让给另一方
+            pick_nc = min(remaining_quota - pick_c, len(pool_no_contact))
+            # 再反过来补偿一遍，防止无接触的一方也不够但有接触的还有剩余
+            pick_c = min(remaining_quota - pick_nc, len(pool_contact)) 
+            
+            random_selected.extend(pool_contact[:pick_c])
+            random_selected.extend(pool_no_contact[:pick_nc])
+            
+            # 如果还有剩余，随机兜底
+            leftover = remaining_quota - len(random_selected)
+            if leftover > 0:
+                left_pool = [i for i in non_elements_pool if i not in random_selected]
+                random.shuffle(left_pool)
+                random_selected.extend(left_pool[:leftover])
+        else:
+            random.shuffle(non_elements_pool)
+            random_selected = non_elements_pool[:remaining_quota]
 
         # === 合并采样并打乱 ===
         all_selected_indices = elements_selected + random_selected
@@ -294,18 +422,7 @@ class FisherReplayBuffer:
 
         selected = []
         for i in all_selected_indices:
-            item = {
-                'obs': samples['obs'][i],
-                'act': samples['act'][i],
-                'obs_next': samples['obs_next'][i]
-            }
-            if 'info' in samples and samples['info'] is not None:
-                item['info'] = samples['info'][i]
-            if 'inv' in samples and samples['inv'] is not None:
-                item['inv'] = samples['inv'][i]
-            if 'inv_next' in samples and samples['inv_next'] is not None:
-                item['inv_next'] = samples['inv_next'][i]
-            selected.append(item)
+            selected.append(self._sample_at(samples, i))
 
         self.buffer.extend(selected)
 

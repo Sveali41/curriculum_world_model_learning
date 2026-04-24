@@ -119,6 +119,11 @@ class DiversityModule(nn.Module):
             ).to(self.device)
             # Joint Embedding Dim: 64 (Map) + 16 (Inv) = 80
             self.joint_dim = 64 + 16
+        elif self.env_type == 'bipedalwalker':
+            self.num_obj_types = 10
+            self.num_colors = 0
+            self.inv_encoder = None
+            self.joint_dim = 64
         else:
             # MiniGrid
             self.num_obj_types = 11 
@@ -129,15 +134,24 @@ class DiversityModule(nn.Module):
         # 输入通道数 = 物体类别数 + 颜色/方向数
         input_channels = self.num_obj_types + self.num_colors 
         
-        # === 2. 地图编码器 CNN ===
-        self.encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(32 * input_h * input_w, 64) 
-        ).to(self.device)
+        # === 2. 地图编码器 CNN (或 MLP) ===
+        if self.env_type == 'bipedalwalker':
+            # Bipedal is just 1x5 with 10 one-hot classes = 50 dims. MLP is enough.
+            self.encoder = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(input_channels * input_h * input_w, 32),
+                nn.ReLU(),
+                nn.Linear(32, 64)
+            ).to(self.device)
+        else:
+            self.encoder = nn.Sequential(
+                nn.Conv2d(input_channels, 16, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(16, 32, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Flatten(),
+                nn.Linear(32 * input_h * input_w, 64) 
+            ).to(self.device)
 
         for m in self.encoder:
             if isinstance(m, (nn.Conv2d, nn.Linear)):
@@ -157,11 +171,15 @@ class DiversityModule(nn.Module):
         obj_ids_clean = obj_ids.clone()
         if self.env_type == 'crafter':
             obj_ids_clean[obj_ids_clean == 9] = 0 # Crafter Agent (9) -> Grass (0)
-        else:
+        elif self.env_type != 'bipedalwalker':
             obj_ids_clean[obj_ids_clean == 10] = 1 # MiniGrid Agent (10) -> Empty (1)
 
         # One-Hot 编码 (注意: F.one_hot 第一个维是 B，输出是 [B, H, W, N])
         obj_oh = F.one_hot(obj_ids_clean, num_classes=self.num_obj_types).permute(0, 3, 1, 2).float()
+        
+        if self.env_type == 'bipedalwalker':
+            return obj_oh
+            
         col_oh = F.one_hot(col_ids, num_classes=self.num_colors).permute(0, 3, 1, 2).float()
         
         return torch.cat([obj_oh, col_oh], dim=1)

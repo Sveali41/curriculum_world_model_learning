@@ -21,8 +21,17 @@ from generator.data.env_dataset_support import generate_envs_dataset, is_reachab
 from modelBased.common import utils
 
 
+def _get_env_visualize(cfg) -> bool:
+    """Read optional env.visualize safely for OmegaConf struct configs."""
+    try:
+        from omegaconf import OmegaConf
+        return bool(OmegaConf.select(cfg, "env.visualize", default=False))
+    except Exception:
+        return False
+
+
 def wrap_env(env_layout, cfg):
-    render_mode = "human" if cfg.env.visualize else None
+    render_mode = "human" if _get_env_visualize(cfg) else None
     layout_string = generate_obj_map(env_layout, cfg.training_generator.map_element)
     color_string = generate_color_map(layout_string)
     print("layout_string: ", layout_string)
@@ -38,7 +47,7 @@ def wrap_env(env_layout, cfg):
 
 
 def wrap_env_from_text(file_path, max_steps, cfg):
-    render_mode = "human" if cfg.env.visualize else None
+    render_mode = "human" if _get_env_visualize(cfg) else None
     env = FullyObsWrapper(
         CustomMiniGridEnv(
             txt_file_path=file_path,
