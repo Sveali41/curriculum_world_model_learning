@@ -16,7 +16,7 @@ for SEED in 0 1 2 3 4; do
     
     # 2. Run Target Random Baseline
     echo "[Target] Starting random baseline collection and training..."
-    python trainer/target_baseline_experiment.py seed=$SEED
+    python3 trainer/target_baseline_experiment.py seed=$SEED
 
     # # 3. run dr baseline experiment
     # echo "[DR] Starting random baseline collection and training..."
@@ -39,7 +39,7 @@ for SEED in 0 1 2 3 4; do
     
     # 1. Run Plan-to-Explore Baseline
     echo "[P2E] Starting exploration and training..."
-    python trainer/p2e_baseline.py seed=$SEED
+    python3 trainer/p2e_baseline.py seed=$SEED
     
     # 2. Run Target Random Baseline
     # echo "[Target] Starting random baseline collection and training..."
