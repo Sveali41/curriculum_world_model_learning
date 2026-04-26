@@ -1,5 +1,3 @@
-import sys
-sys.path.append('/home/siyao/project/rlPractice/MiniGrid')
 import torch
 import numpy as np
 import pytorch_lightning as pl

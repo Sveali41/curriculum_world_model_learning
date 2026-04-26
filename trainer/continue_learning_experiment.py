@@ -8,7 +8,7 @@ from omegaconf import OmegaConf, open_dict
 from hydra import initialize, compose
 
 # Add project root to path
-PROJECT_ROOT = "/home/siyao/phd_file/Research/rlPractice/Curriculum_world_model_learning"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(PROJECT_ROOT)
 
 from modelBased.data.data_collect import data_collect

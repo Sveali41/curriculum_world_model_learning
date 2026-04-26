@@ -272,6 +272,8 @@ def p2e_baseline_experiment(cfg: DictConfig):
     def _save_p2e_coverage(obs_batch, phase_name: str):
         if domain == "bipedalwalker" or obs_batch is None or len(obs_batch) == 0:
             return
+        if not bool(getattr(cfg.env.collect, "save_coverage_visualize", False)):
+            return
         coverage_dir = TRAINER_PATH / "logs" / "dataset_visualization" / "p2e" / domain
         coverage_dir.mkdir(parents=True, exist_ok=True)
         save_path = coverage_dir / f"{phase_name}_coverage.png"

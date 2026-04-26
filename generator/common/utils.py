@@ -1,6 +1,4 @@
 import torch
-import sys  
-sys.path.append('/home/siyao/project/rlPractice/MiniGrid')
 import random
 import re
 

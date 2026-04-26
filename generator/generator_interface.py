@@ -403,7 +403,6 @@ class GeneratorInterface:
         }
         self.bipedal_history.append(record)
         self._last_bipedal_memory = self._build_bipedal_history_feature()
-        print(f"[Debug Context] History Size: {len(self.bipedal_history)} | Phys Err Mean: {np.mean(self._last_bipedal_memory[0:10]):.4f} | Sem Err Mean: {np.mean(self._last_bipedal_memory[10:20]):.4f}")
 
     def _default_stats(self):
         default_stats = np.zeros(16, dtype=np.float32)
@@ -766,10 +765,6 @@ class GeneratorInterface:
                         if 0 < ua < 10:  # Ignore 0 (Grass) so it doesn't soak up the error
                             sem_err[ua] = base_loss
                     
-                    # Debug: Confirm attribution is happening
-                    if i == 0:
-                        print(f"[Debug Attribution] Actions: {used_actions} | Loss: {base_loss:.4f} | SemErr[UA]: {sem_err[used_actions[0]] if len(used_actions)>0 else 0}")
-                    
                     # 2. Physical (10-dim)
                     # Handle cases where errors['inventory'] might be empty or wrong size
                     raw_phys = np.asarray(errors["inventory"], dtype=np.float32).reshape(-1)
@@ -814,7 +809,6 @@ class GeneratorInterface:
                 if len(bipedal_token_error_records) > 0
                 else np.zeros(20, dtype=np.float32)
             )
-            print(f"[Debug Loop] Bipedal History Update | Phys Err Mean: {np.mean(mean_token_errors[0:10]):.6f} | Sem Err Mean: {np.mean(mean_token_errors[10:20]):.6f}")
             self._update_bipedal_history(final_maps_for_history, token_errors=mean_token_errors)
 
         mean_avg_ep_len = float(np.mean(all_avg_ep_lens)) if len(all_avg_ep_lens) > 0 else 0.0
@@ -830,8 +824,6 @@ class GeneratorInterface:
         import traceback
 
         env_type = str(getattr(self.cfg.attention_model, "env_type", "")).lower()
-        print(f"[GeneratorInterface] Rollout start | env_type={env_type} | iter={iter} | idx={idx}")
-
         try:
              # Use the modernized support.interpret_env
              # Note: For MiniGrid, stats_np is ignored by its version of support/interpret
@@ -1231,14 +1223,6 @@ class GeneratorInterface:
             )
             reward = float(np.clip(reward, -reward_clip, reward_clip))
 
-            print(
-                "[Reward Bipedal] "
-                f"contact_bce={contact_bce:.3f} | "
-                f"total_loss={total_loss:.3f} | "
-                f"div={div_score:.3f} | "
-                f"survival={survival_ratio:.2f}(×{w_survival}) | "
-                f"final_reward={reward:.3f}"
-            )
             return reward
 
         # Crafter: No BFS, Pure adversarial reward loop. 
@@ -1267,12 +1251,6 @@ class GeneratorInterface:
             )
             reward = float(np.clip(reward, -reward_clip, reward_clip))
 
-            print(
-                f"[Reward] ce={ce_term:.3f} | inv={inv_term:.3f} | "
-                f"div={div_score:.3f} | "
-                f"inv_slots_changed={inv_diversity} | "
-                f"inv_change_bonus={inv_change_bonus:.3f}"
-            )
             return reward
             
         # Minigrid: continuous reward without hard solved gate.

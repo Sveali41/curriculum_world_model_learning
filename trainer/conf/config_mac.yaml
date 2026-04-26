@@ -163,10 +163,10 @@ env:
     env_visualize_save_path: ${domains.${domain}.env_visualize_folder}
     env_visualize_filename: ued_env.png
     # visualize the env and layout of the env
-    save_env_visualize: true # visualize env layout
+    save_env_visualize: false # visualize env layout
     visualize_save_path: ${domains.${domain}.dataset_visualize_folder}
     visualize_filename: ued_dataset.png
-    save_coverage_visualize: true # visualize the exploration coverage
+    save_coverage_visualize: false # visualize the exploration coverage
     current_layout_str: null      # bipedal-only: runtime layout string for UED coverage visualization
     maximum_dataset_size: 500
     max_steps: 80000              # max steps per data collection episode
@@ -183,8 +183,8 @@ attention_model:
   n_cpu: 0
   embed_dim: 128
   num_heads: 1
-  n_epochs: 15
-  lr: 1e-4
+  n_epochs: 30
+  lr: 3e-4
   wd: 1e-5                     # weight decay - required by AttentionWorldModel
   obs_norm_values: ${domains.${domain}.obs_norm}
   action_norm_values: ${domains.${domain}.action_norm}

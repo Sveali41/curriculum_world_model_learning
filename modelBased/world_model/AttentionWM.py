@@ -465,25 +465,6 @@ class AttentionWorldModel(pl.LightningModule):
                 num_layers = len([n for n, p in self.named_parameters() if p.requires_grad])
                 total = total / (num_layers * 2.0)
 
-        # [DEBUG]
-        if self.global_step % 100 == 0:
-             print(f"[EWC DEBUG] Step {self.global_step}")
-             if self.fisher is None: print("  -> self.fisher is None")
-             if self.old_params is None: print("  -> self.old_params is None")
-             if self.fisher and self.old_params:
-                 keys_f = set(self.fisher.keys())
-                 keys_o = set(self.old_params.keys())
-                 common = keys_f.intersection(keys_o)
-                 print(f"  -> Common keys: {len(common)}")
-                 if len(common) > 0:
-                     k = list(common)[0]
-                     p = dict(self.named_parameters())[k]
-                     p_old = self.old_params[k].to(device)
-                     diff = (p - p_old).norm()
-                     print(f"  -> Sample param '{k}' diff: {diff.item()}")
-                     print(f"  -> Count accumulated: {count}")
-                     print(f"  -> Total EWC calculated: {total.item()}")
-
         return total  # 注意：这里不乘 lambda
     
     def accumulate_loss(self, loss_map, agent_pos):
@@ -667,7 +648,7 @@ class AttentionWorldModel(pl.LightningModule):
                  change_mask = (next_observations_true.abs() > 1e-6).any(dim=1, keepdim=True).float()
                  state_change_mask = torch.zeros_like(change_mask)
 
-            weights = 1.0 + (change_mask * 5.0) + (state_change_mask * 10.0)
+            weights = 1.0 + (change_mask * 10.0) + (state_change_mask * 50.0)
             
             if obs_masked is not None:
                  if obs_masked.ndim == 3:
@@ -675,7 +656,7 @@ class AttentionWorldModel(pl.LightningModule):
                  else:
                      static_mask = obs_masked.float()
                  interaction_mask = change_mask * static_mask
-                 weights = weights + (interaction_mask * 20.0)
+                 weights = weights + (interaction_mask * 100.0)
 
         # 5. Weighted Mean
         if torch.is_tensor(weights) and weights.ndim > raw_error_map.ndim:
@@ -890,15 +871,6 @@ class AttentionWorldModel(pl.LightningModule):
         self.log("train/ewc_term", ewc_term.detach(), on_step=True, on_epoch=True)
         self.log("train/loss_total", loss_total.detach(), on_step=True, on_epoch=True)
 
-        if self.global_step % 100 == 0:
-            ce_str = f", CE: {raw_ce.item():.6f}" if raw_ce is not None else ""
-            print(f"[Step {self.global_step}] "
-                f"Raw MSE: {raw_mse.item():.6f}, "
-                f"Weighted Loss: {weighted_obs_loss.item():.6f}"
-                f"{ce_str}, "
-                f"EWC: {ewc_raw.item():.6f}, "
-                f"Total: {loss_total.item():.6f}")
-
         return loss_total
 
     def on_train_epoch_start(self):
@@ -1055,9 +1027,6 @@ class AttentionWorldModel(pl.LightningModule):
                 loss_val = weighted_val
                 self.log("val/mse_weighted", weighted_val, on_step=False, on_epoch=True)
                 
-                # Debugging magnitude discrepancy (First batch only to avoid spam)
-                if batch_idx == 0:
-                    print(f"[AttentionWM Val Debug] RAW MSE: {raw_mse.item():.6f} | WEIGHTED MSE: {weighted_val.item():.6f} | Ratio: {weighted_val.item()/max(1e-6, raw_mse.item()):.2f}")
             if self.is_bipedal and hasattr(self.model, "bipedal_token_specs"):
                 total_contact_bce = torch.zeros((), device=obs.device, dtype=obs.dtype)
                 total_contact_correct = torch.zeros((), device=obs.device, dtype=obs.dtype)

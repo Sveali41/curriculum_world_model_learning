@@ -149,7 +149,7 @@ def run(
         monitor=metric_to_monitor,
         min_delta=0.00,
         patience=15,
-        verbose=True,
+        verbose=False,
         mode="min"
     )
     try:
@@ -163,7 +163,7 @@ def run(
         mode="min",
         dirpath=tmp_dir,
         filename="att-{epoch:02d}-{avg_val_loss_wm:.5f}",
-        verbose=True
+        verbose=False
     )
 
     # trainer
@@ -176,6 +176,7 @@ def run(
         gradient_clip_val=1.0,
         callbacks=[early_stop_callback, checkpoint_callback],
         deterministic=False,
+        enable_progress_bar=True,
     )
 
 
@@ -200,9 +201,7 @@ def run(
 
     else:
         # ===== training =====
-        print("freeze_weight is False, proceeding to trainer.fit()")
         trainer.fit(net, datamodule)
-        print("Trainer fit completed!")
 
         # 保存旧参数
         old_params = net.save_old_params()

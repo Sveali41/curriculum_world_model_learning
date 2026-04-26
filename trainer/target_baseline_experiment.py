@@ -230,6 +230,9 @@ def run_target_baseline_experiment(cfg: DictConfig):
             if not hasattr(col_cfg, "env"):
                 with open_dict(col_cfg):
                     col_cfg.env = OmegaConf.create({})
+            base_collect_cfg = getattr(getattr(cfg, "env", None), "collect", None)
+            save_coverage_visualize = bool(getattr(base_collect_cfg, "save_coverage_visualize", False))
+            save_env_visualize = bool(getattr(base_collect_cfg, "save_env_visualize", False))
             with open_dict(col_cfg.env):
                 col_cfg.env.env_type = domain_name  # Required by _finalize_and_save for visualization dispatch
                 col_cfg.env.collect = OmegaConf.create({
@@ -242,8 +245,8 @@ def run_target_baseline_experiment(cfg: DictConfig):
                     "env_visualize_save_path": os.path.join(str(TRAINER_PATH), "logs", "env_visualization", "target", "bipedal" if is_bipedal else domain_name),
                     "visualize_filename": f"{current_task}_random_coverage{'_seed'+str(seed) if not is_bipedal else ''}.png",
                     "env_visualize_filename": f"{current_task}_random_env{'_seed'+str(seed) if not is_bipedal else ''}.png",
-                    "save_coverage_visualize": True,
-                    "save_env_visualize": True
+                    "save_coverage_visualize": save_coverage_visualize,
+                    "save_env_visualize": save_env_visualize
                 })
             
             level_folder = "bipedal_walker" if is_bipedal else domain_name
