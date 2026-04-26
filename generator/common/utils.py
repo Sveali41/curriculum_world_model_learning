@@ -51,8 +51,21 @@ def interpret_color_map(color_layout, color_map):
     if hasattr(color_layout, "detach"):
         color_layout = color_layout.detach().cpu()
 
-    # reverse: color_name -> char
-    color_name_to_char = {v: k for k, v in color_map.items()}
+    # Prefer canonical color initials. The config may contain duplicate aliases
+    # such as W/E/S -> grey and R/L -> red; reversing it directly makes output
+    # depend on insertion order and can produce confusing color maps.
+    color_name_to_char = {
+        "red": "R",
+        "green": "G",
+        "blue": "B",
+        "purple": "M",
+        "yellow": "Y",
+        "grey": "W",
+    }
+    color_name_to_char.update({
+        v: k for k, v in color_map.items()
+        if v not in color_name_to_char
+    })
 
     h, w = color_layout.shape
     lines = []

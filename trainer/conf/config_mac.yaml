@@ -4,7 +4,7 @@
 
 # 1. Domain-Specific Overrides (Categorized for ease of management)
 # ----------------------------------------------------------------------
-domain: 'bipedalwalker' # 'crafter' OR 'minigrid' OR 'bipedalwalker'
+domain: 'minigrid' # 'crafter' OR 'minigrid' OR 'bipedalwalker'
 
 # [Internal Taxonomy] Do not edit these directly unless adding a new domain
 domains:
@@ -25,6 +25,7 @@ domains:
     env_visualize_folder: ${oc.env:TRAINER_PATH}/logs/env_visualization/ued/crafter/
     dataset_visualize_folder: ${oc.env:TRAINER_PATH}/logs/dataset_visualization/ued/crafter/
     map_elements: { "grass": "G", "water": "W", "tree": "T", "stone": "R", "coal": "C", "iron": "I", "table": "X", "furnace": "U", "agent": "A", "diamond": "O", "cow": "M", "plant": "t" }
+    color_elements: {}
     data_type: discrete
     use_bipedal_attention: false
     # Data collection budget for MAC/DR (per training iteration).
@@ -33,7 +34,8 @@ domains:
     generator_batch_size: 8
     max_edits_layout: 0.6
     max_edits_inventory: 0.5
-    lambda_ewc: 20000.0
+    replay_frac: 0.8
+    lambda_ewc: 30000 #20000.0
     validation_metric: "mse"
     reward:
       ce: 7.0
@@ -60,17 +62,19 @@ domains:
     mini_tasks_temp_root: ${oc.env:TRAINER_PATH}/data/minigrid/mini_tasks_temp/
     env_visualize_folder: ${oc.env:TRAINER_PATH}/logs/env_visualization/ued/minigrid/
     dataset_visualize_folder: ${oc.env:TRAINER_PATH}/logs/dataset_visualization/ued/minigrid/
-    map_elements: { "wall": "W", "goal": "G", "door": "O", "key": "K", "lava": "L", "empty": "E", "floor": "F", "agent": "S", "ball": "B", "box": "X", "unseen": "?" }
+    map_elements: { "wall": "W", "goal": "G", "door": "O", "key": "K", "lava": "L", "empty": "E", "floor": "F", "agent": "S", "unseen": "?" }
+    color_elements: { "R": "red", "G": "green", "B": "blue", "Y": "yellow", "W": "grey", "L": "red", "E": "grey", "S": "grey" }
     data_type: discrete
     use_bipedal_attention: false
     # Data collection budget for MAC/DR (per training iteration).
     # Example: 1400 with batch=8 -> each rollout collects 175 transitions.
-    iter_transition_budget: 4667
+    iter_transition_budget: 3500 # 3500*40 = 140000
     generator_batch_size: 8
-    max_edits_layout: 0.5
+    max_edits_layout: 0.4
     # MiniGrid does not use inventory edits; keep this as 0.0 to disable.
     max_edits_inventory: 0.0
-    lambda_ewc: 20000.0
+    replay_frac: 0.7
+    lambda_ewc: 2000.0 # larger-> protect old memory and smaller-> new knowledge
     validation_metric: "mse_weighted"
 
   bipedalwalker:
@@ -91,13 +95,15 @@ domains:
     env_visualize_folder: ${oc.env:TRAINER_PATH}/logs/env_visualization/ued/bipedal/
     dataset_visualize_folder: ${oc.env:TRAINER_PATH}/logs/dataset_visualization/ued/bipedal/
     map_elements: {}
+    color_elements: {}
     data_type: norm
     use_bipedal_attention: true
     # Data collection budget for MAC/DR (per training iteration).
-    iter_transition_budget: 1000
+    iter_transition_budget: 4000
     generator_batch_size: 8
     max_edits_layout: 1.0
     max_edits_inventory: 0.0
+    replay_frac: 0.7
     lambda_ewc: 0.05
     validation_metric: "mse"
     reward:
@@ -140,6 +146,7 @@ training_generator:
   batch_size: 1
   lr: 8e-4
   map_element: ${domains.${domain}.map_elements}
+  color_element: ${domains.${domain}.color_elements}
   env_path: ${oc.env:TRAINER_PATH}/level/level.txt
 
 env:
@@ -173,16 +180,16 @@ attention_model:
   grid_shape: ${domains.${domain}.grid_shape}
   attention_mask_size: ${domains.${domain}.attention_mask}
   batch_size: 64
-  n_cpu: 2
+  n_cpu: 0
   embed_dim: 128
   num_heads: 1
-  n_epochs: 8
-  lr: 5e-5
+  n_epochs: 15
+  lr: 1e-4
   wd: 1e-5                     # weight decay - required by AttentionWorldModel
   obs_norm_values: ${domains.${domain}.obs_norm}
   action_norm_values: ${domains.${domain}.action_norm}
-  valid_values_obj: [1, 2, 4, 5, 8, 10]
-  valid_values_color: [0, 1, 5]
+  valid_values_obj: [1, 2, 4, 5, 8, 9, 10]
+  valid_values_color: [0, 1, 2, 4, 5]
   valid_values_state: [0, 1, 2, 3]
   use_wandb: False
   keep_cell_loss: false
@@ -203,13 +210,12 @@ attention_model:
 
   # Validation metric
   validation_metric: ${domains.${domain}.validation_metric}
-
   # Continual Learning / EWC Shielding
   continue_learning: true
   fisher_buffer_size: 500000
-  current_sample_ratio: 0.3
+  current_sample_ratio: 0.6
   fisher_buffer_elements_ratio: 0.8
-  replay_frac: 0.7 # The amount of replay data = amount of new data * this parameter. (bipedal:0.7 | discrete_grids: 3)
+  replay_frac: ${domains.${domain}.replay_frac} # replay amount = new_data_size * replay_frac
   fisher_beta: 0.3
   # Domain-specific EWC strength (reads from domains.${domain}.lambda_ewc)
   lambda_ewc: ${domains.${domain}.lambda_ewc}
@@ -242,7 +248,6 @@ generator_agent:
   wm_train_frequency: 1
   map_height: ${domains.${domain}.h}
   map_width: ${domains.${domain}.w}
-  active_width: ${domains.${domain}.active_w}  # bipedal-only: effective editable width for UED layout generation
   agent_type: 'ppo'
   warmup_iterations: 10
   div_k: 10
@@ -255,6 +260,7 @@ ablation:
   type: "none"
 
 seed: 0
+force_fresh_start: true         # Set to true to delete old model and start from scratch
 
 # Temporary NPZ path used during MAC WM retraining
 mac_temp_data_dir: ${domains.${domain}.mini_tasks_temp_root}mac/

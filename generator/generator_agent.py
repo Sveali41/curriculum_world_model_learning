@@ -146,24 +146,29 @@ class GeneratorPPO:
         if self.encoder is None:   
             ctx = None
             global_ctx = None
-            phs = torch.zeros((B, 16), device=device)
+            phs = None
         else:
             if prev_data is None:
                 # 初始状态：空地图、空热图、空背包热图
                 H, W = base_map.size(2), base_map.size(3)
                 pm = torch.zeros((1, 3, H, W), device=device)
                 pht = torch.zeros((1, 1, H, W), device=device)
-                stats_dim = 26 if self.env_type == "bipedalwalker" else 16
-                phs = torch.zeros((1, stats_dim), device=device)
+                phs = None if self.env_type == "minigrid" else torch.zeros(
+                    (1, 26 if self.env_type == "bipedalwalker" else 16), device=device
+                )
                 global_ctx = self._compute_global_context_dual(pm, pht, phs)
             else:
-                pm, pht, phs = prev_data
+                if len(prev_data) == 2:
+                    pm, pht = prev_data
+                    phs = None
+                else:
+                    pm, pht, phs = prev_data
                 global_ctx = self._compute_global_context_dual(pm, pht, phs)
             if global_ctx.size(0) == B:
                 ctx = global_ctx
             else:
                 ctx = global_ctx.repeat(B, 1)
-            if phs.size(0) == 1 and B > 1:
+            if phs is not None and phs.size(0) == 1 and B > 1:
                 phs = phs.repeat(B, 1)
 
         action, stats_act, map_logp, stats_logp, value, topk_mask, topk_stats_mask = self.policy_old.act(
@@ -195,11 +200,20 @@ class GeneratorPPO:
             stats_dim = 26 if self.env_type == "bipedalwalker" else 16
             self.buffer["stats_heat"].append(torch.zeros((B, stats_dim)))
         else:
-            pm, pht, phs = prev_data
+            if len(prev_data) == 2:
+                pm, pht = prev_data
+                phs = None
+            else:
+                pm, pht, phs = prev_data
             self.buffer["prev_map"].append(pm.cpu())
             # We rename prev_heat internally to match dual streams
             self.buffer["prev_heat"].append(pht.cpu())
-            self.buffer["stats_heat"].append(phs.cpu())
+            if phs is None:
+                B = pm.size(0)
+                stats_dim = 26 if self.env_type == "bipedalwalker" else 16
+                self.buffer["stats_heat"].append(torch.zeros((B, stats_dim)))
+            else:
+                self.buffer["stats_heat"].append(phs.cpu())
 
     def clear_buffer(self):
         for k in self.buffer:

@@ -391,7 +391,7 @@ def run_target_baseline_experiment(cfg: DictConfig):
         print(f"  [Buffer] Archiving {current_task} data...")
         fisher_buffer.add_from_npz(
             train_path,
-            current_sample_ratio=cfg.attention_model.ewc_ratio,
+            current_sample_ratio=cfg.attention_model.current_sample_ratio,
             target_shape=fisher_target_shape if domain_name == "minigrid" else None,
         )
         torch.cuda.empty_cache()

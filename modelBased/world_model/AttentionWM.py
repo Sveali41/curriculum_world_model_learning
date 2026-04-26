@@ -466,7 +466,7 @@ class AttentionWorldModel(pl.LightningModule):
                 total = total / (num_layers * 2.0)
 
         # [DEBUG]
-        if self.global_step % 1000 == 0:
+        if self.global_step % 100 == 0:
              print(f"[EWC DEBUG] Step {self.global_step}")
              if self.fisher is None: print("  -> self.fisher is None")
              if self.old_params is None: print("  -> self.old_params is None")
@@ -667,7 +667,7 @@ class AttentionWorldModel(pl.LightningModule):
                  change_mask = (next_observations_true.abs() > 1e-6).any(dim=1, keepdim=True).float()
                  state_change_mask = torch.zeros_like(change_mask)
 
-            weights = 1.0 + (change_mask * 10.0) + (state_change_mask * 50.0)
+            weights = 1.0 + (change_mask * 5.0) + (state_change_mask * 10.0)
             
             if obs_masked is not None:
                  if obs_masked.ndim == 3:
@@ -675,7 +675,7 @@ class AttentionWorldModel(pl.LightningModule):
                  else:
                      static_mask = obs_masked.float()
                  interaction_mask = change_mask * static_mask
-                 weights = weights + (interaction_mask * 100.0)
+                 weights = weights + (interaction_mask * 20.0)
 
         # 5. Weighted Mean
         if torch.is_tensor(weights) and weights.ndim > raw_error_map.ndim:
@@ -890,7 +890,7 @@ class AttentionWorldModel(pl.LightningModule):
         self.log("train/ewc_term", ewc_term.detach(), on_step=True, on_epoch=True)
         self.log("train/loss_total", loss_total.detach(), on_step=True, on_epoch=True)
 
-        if self.global_step % 1000 == 0:
+        if self.global_step % 100 == 0:
             ce_str = f", CE: {raw_ce.item():.6f}" if raw_ce is not None else ""
             print(f"[Step {self.global_step}] "
                 f"Raw MSE: {raw_mse.item():.6f}, "

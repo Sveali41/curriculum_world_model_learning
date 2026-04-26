@@ -153,8 +153,18 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         cfg.attention_model.data_type = d_cfg.data_type
     _apply_domain_collection_budget(cfg, domain_name)
 
+    # [NEW] Force Fresh Start (Delete existing checkpoint if requested)
+    ckpt_path = cfg.attention_model.model_save_path
+    if getattr(cfg, "force_fresh_start", False):
+        if os.path.exists(ckpt_path):
+            os.remove(ckpt_path)
+            print(f"[Fresh Start] Deleted existing checkpoint: {ckpt_path}")
+        else:
+            print(f"[Fresh Start] No checkpoint found to delete at: {ckpt_path}")
+
     # 1. Initialization
     wm = AttentionWorldModel(cfg.attention_model).to(device)
+
     # DR usually generates random maps via GeneratorInterface (agent_type='random')
     generator = GeneratorInterface(wm, device, cfg, agent_type='random')
     fisher_buffer = FisherReplayBuffer(max_size=cfg.attention_model.fisher_buffer_size)
@@ -169,8 +179,15 @@ def run_dr_baseline_experiment(cfg: DictConfig):
     old_params, fisher = None, None
     if is_minigrid:
         csv_columns = [
-            "Seed", "Iter", "Gen_Mean_Reward", "Gen_Real_Loss", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
-            "WM_Val_Loss", "Target_WM_Val_Loss", "Valid_Trajs",
+            "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
+            "gen_val_avg_val_loss_wm", "target_val_avg_val_loss_wm",
+            "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
+        ]
+    elif not is_bipedal: # Crafter or others
+        csv_columns = [
+            "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
+            "gen_val_val_inv_loss", "gen_val_val_ce_loss", "gen_val_avg_val_loss_wm",
+            "target_val_val_inv_loss", "target_val_val_ce_loss", "target_val_avg_val_loss_wm",
             "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
         ]
     elif is_bipedal:
@@ -180,14 +197,24 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             "target_val_contact_acc", "target_val_contact_bce", "target_val_avg_val_loss_wm",
             "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
         ]
-    else:
-        csv_columns = [
-            "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
-            "gen_val_val_inv_loss", "gen_val_val_ce_loss", "gen_val_avg_val_loss_wm",
-            "target_val_val_inv_loss", "target_val_val_ce_loss", "target_val_avg_val_loss_wm",
-            "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
-        ]
     file_exists = _ensure_csv_header_compatible(summary_csv_path, csv_columns)
+
+    # 1.5 Load existing model if available (Resume logic)
+    ckpt_path = cfg.attention_model.model_save_path
+    if os.path.exists(ckpt_path):
+        print(f"[System] Found existing checkpoint at {ckpt_path}. Loading weights for resume...")
+        try:
+            ckpt = torch.load(ckpt_path, weights_only=False)
+            if 'state_dict' in ckpt:
+                wm.load_state_dict(ckpt['state_dict'])
+            else:
+                wm.load_state_dict(ckpt)
+            old_params = wm.save_old_params()
+            print("[System] Model weights loaded successfully.")
+        except Exception as e:
+            print(f"[Warning] Failed to load existing model: {e}. Starting from scratch.")
+    else:
+        print(f"[System] No existing checkpoint found at {ckpt_path}. Starting from scratch.")
 
     # 2. Main Loop
     for iteration in range(cfg.generator_agent.total_iterations):
@@ -382,22 +409,12 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         print(f"  [Buffer] Archived {current_transitions} transitions. Buffer Size: {len(fisher_buffer)}")
         if is_minigrid:
             row_data = {
-                "Seed": seed,
-                "Iter": iteration + 1,
-                "Gen_Mean_Reward": 0.0,
-                "Gen_Real_Loss": 0.0,
-                "Gen_Loss": 0.0,
-                "Gen_Entropy": 0.0,
-                "Gen_Div_Reward": gen_div_reward,
-                # Loss on generated tasks from current generator rollouts.
-                "WM_Val_Loss": gen_val_avg_val_loss_wm,
-                # Zero-shot validation loss on fixed target task suite.
-                "Target_WM_Val_Loss": target_val_avg_val_loss_wm,
-                "Valid_Trajs": len(valid_trajs),
-                "New_Data_Size": current_transitions,
-                "Buffer_Size": len(fisher_buffer),
-                "Solvable_Count": solvable_count,
-                "Avg_Path_Len": avg_path_len,
+                "Seed": seed, "Iter": iteration + 1, "Gen_Mean_Reward": 0.0, "Gen_Loss": 0.0,
+                "Gen_Entropy": 0.0, "Gen_Div_Reward": gen_div_reward,
+                "gen_val_avg_val_loss_wm": gen_val_avg_val_loss_wm,
+                "target_val_avg_val_loss_wm": target_val_avg_val_loss_wm,
+                "New_Data_Size": current_transitions, "Buffer_Size": len(fisher_buffer),
+                "Solvable_Count": solvable_count, "Avg_Path_Len": avg_path_len,
             }
         elif is_bipedal:
             row_data = {

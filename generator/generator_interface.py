@@ -20,11 +20,15 @@ ACTION_TABLE_MINIGRID = {
     1: ("key", "yellow"),
     2: ("key", "red"),
     3: ("key", "blue"),
-    4: ("door", "yellow"),
-    5: ("door", "red"),
-    6: ("door", "blue"),
-    7: ("lava", None),
-    8: ("empty", None),
+    4: ("key", "green"),
+    5: ("door", "yellow"),
+    6: ("door", "red"),
+    7: ("door", "blue"),
+    8: ("door", "green"),
+    9: ("wall", None),
+    10: ("lava", None),
+    11: ("empty", None),
+    12: ("goal", None),
 }
 
 class GeneratorInterface:
@@ -66,7 +70,10 @@ class GeneratorInterface:
         elif self.is_bipedal:
             self.map_height = 1
             self.map_width = int(getattr(hparams, "map_width", 5))  # Default 5 slots
-            self.active_bipedal_width = int(getattr(hparams, "active_width", self.map_width))
+            bipedal_domain_cfg = getattr(getattr(cfg, "domains", None), "bipedalwalker", None)
+            self.active_bipedal_width = int(
+                getattr(bipedal_domain_cfg, "active_w", self.map_width)
+            )
             self.seeder = BipedalPCGSeeder(width=self.map_width)
             self.ACTION_TABLE = ACTION_TABLE_BIPEDAL
         else:
@@ -75,6 +82,9 @@ class GeneratorInterface:
             self.map_width = hparams.map_width
             self.seeder = MinigridPCGSeeder(height=self.map_height, width=self.map_width)
             self.ACTION_TABLE = ACTION_TABLE_MINIGRID
+            # Keep start/goal fixed from base map, editor edits around them.
+            self.minigrid_anchor_start = True
+            self.minigrid_goal_fallback = False
 
         if agent_type == 'random':
             self.ppo = RandomGeneratorAgent(num_actions=len(self.ACTION_TABLE), device=device)
@@ -229,6 +239,113 @@ class GeneratorInterface:
             f"Unexpected base map shape {grid_np.shape}; expected (*, {self.map_height}, {self.map_width})"
         )
 
+    def _anchor_minigrid_start(self, grid_np):
+        """
+        Put one start tile on the base map when missing.
+        """
+        if self.is_crafter or self.is_bipedal:
+            return grid_np
+        if not getattr(self, "minigrid_anchor_start", True):
+            return grid_np
+
+        out = np.array(grid_np, copy=True)
+        if np.any(out == self.OBJ_START):
+            return out
+
+        wall_id = OBJECT_TO_IDX["wall"]
+        lava_id = OBJECT_TO_IDX["lava"]
+        empty_id = self.OBJ_EMPTY
+        h, w = out.shape
+
+        candidates = np.argwhere(out == empty_id)
+        if len(candidates) == 0:
+            candidates = np.argwhere((out != wall_id) & (out != lava_id))
+        if len(candidates) == 0:
+            return out
+
+        # Prefer boundary-adjacent free cells for stable starts.
+        edge = []
+        for y, x in candidates:
+            if y == 1 or x == 1 or y == h - 2 or x == w - 2:
+                edge.append((y, x))
+        pick_pool = edge if len(edge) > 0 else [tuple(p) for p in candidates]
+        sy, sx = random.choice(pick_pool)
+        out[sy, sx] = self.OBJ_START
+        return out
+
+    def _anchor_minigrid_terminals(self, grid_np):
+        """
+        Ensure MiniGrid base map has exactly one start and one reachable goal.
+        Extra starts/goals are removed.
+        """
+        if self.is_crafter or self.is_bipedal:
+            return grid_np
+
+        out = np.array(grid_np, copy=True)
+        out = self._anchor_minigrid_start(out)
+
+        wall_id = OBJECT_TO_IDX["wall"]
+        lava_id = OBJECT_TO_IDX["lava"]
+        h, w = out.shape
+
+        # Keep exactly one start.
+        start_positions = np.argwhere(out == self.OBJ_START)
+        if len(start_positions) == 0:
+            return out
+        sy, sx = tuple(start_positions[0])
+        for py, px in start_positions[1:]:
+            out[py, px] = self.OBJ_EMPTY
+        out[sy, sx] = self.OBJ_START
+
+        # BFS distance map from start through passable cells.
+        dist = np.full((h, w), -1, dtype=np.int64)
+        q = deque([(sy, sx)])
+        dist[sy, sx] = 0
+        while q:
+            y, x = q.popleft()
+            for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                ny, nx = y + dy, x + dx
+                if not (0 <= ny < h and 0 <= nx < w):
+                    continue
+                if dist[ny, nx] >= 0:
+                    continue
+                if out[ny, nx] in (wall_id, lava_id):
+                    continue
+                dist[ny, nx] = dist[y, x] + 1
+                q.append((ny, nx))
+
+        # Keep one existing reachable goal if possible.
+        goal_positions = np.argwhere(out == self.OBJ_GOAL)
+        keep_goal = None
+        for gy, gx in goal_positions:
+            if dist[gy, gx] > 0:
+                keep_goal = (int(gy), int(gx))
+                break
+
+        # Otherwise place goal on farthest reachable non-start tile.
+        if keep_goal is None:
+            candidates = np.argwhere(dist > 0)
+            if len(candidates) > 0:
+                dvals = dist[candidates[:, 0], candidates[:, 1]]
+                gy, gx = candidates[int(np.argmax(dvals))]
+                keep_goal = (int(gy), int(gx))
+            else:
+                # Degenerate case: start is isolated. Open one neighbor and place goal.
+                for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    ny, nx = sy + dy, sx + dx
+                    if 0 < ny < h - 1 and 0 < nx < w - 1:
+                        out[ny, nx] = self.OBJ_EMPTY
+                        keep_goal = (ny, nx)
+                        break
+
+        # Remove all previous goals and set exactly one.
+        for gy, gx in goal_positions:
+            out[gy, gx] = self.OBJ_EMPTY
+        if keep_goal is not None:
+            out[keep_goal[0], keep_goal[1]] = self.OBJ_GOAL
+
+        return out
+
     def _build_bipedal_history_feature(self):
         if not self.is_bipedal or len(self.bipedal_history) == 0:
             return np.zeros(26, dtype=np.float32)
@@ -305,7 +422,9 @@ class GeneratorInterface:
                 grid = batch_grid[0]
             else:
                 grid = self.seeder.generate()
-            base_maps.append(self._normalize_base_map(grid))
+            norm_grid = self._normalize_base_map(grid)
+            norm_grid = self._anchor_minigrid_terminals(norm_grid)
+            base_maps.append(norm_grid)
             base_stats.append(self._default_stats())
         return base_maps, base_stats
 
@@ -327,6 +446,7 @@ class GeneratorInterface:
         raw_scalar_losses, div_rewards = [], []
         raw_ce_losses, raw_inv_losses = [], []
         solved_count = 0
+        bfs_count = 0
         total_bfs_dist = 0.0
 
         base_ids_np = base_ids.detach().cpu().numpy()
@@ -335,7 +455,7 @@ class GeneratorInterface:
         base_stats_np = np.stack(base_stats)
 
         for i in range(self.batch_size):
-            final_map_obj, _ = self._apply_action(base_ids_np[i], actions_np[i], mask=mask[i, 0].cpu().numpy())
+            final_map_obj, final_map_col = self._apply_action(base_ids_np[i], actions_np[i], mask=mask[i, 0].cpu().numpy())
             final_stats = base_stats_np[i].copy()
 
             if self.is_crafter and getattr(self.cfg.generator_agent, "random_stats_actions", False):
@@ -352,8 +472,8 @@ class GeneratorInterface:
                         else:
                             final_stats[slot] += 5
 
-            final_map_2ch = np.stack([final_map_obj, np.zeros_like(final_map_obj)], axis=0)
-            res_rollout = self._rollout_combined(final_map_obj, final_stats, iteration, i, old_params=old_params)
+            final_map_2ch = np.stack([final_map_obj, final_map_col], axis=0)
+            res_rollout = self._rollout_combined(final_map_obj, final_stats, iteration, i, old_params=old_params, color_np=final_map_col)
             traj, errors, raw_loss_val, solved = res_rollout[0], res_rollout[1], res_rollout[2], res_rollout[3]
             errors = self._normalize_rollout_errors(errors)
 
@@ -366,12 +486,24 @@ class GeneratorInterface:
                 if is_connected:
                     solved_count += 1
                     total_bfs_dist += conn_stats.get('max_dist', 0)
-            else:
+                    bfs_count += 1
+            elif self.is_bipedal:
                 if solved:
                     solved_count += 1
-                    total_bfs_dist += 1.0
+                    total_bfs_dist += res_rollout[8] if len(res_rollout) > 8 else 1.0
+                    bfs_count += 1
+            else:
+                shortest_dist = res_rollout[8] if len(res_rollout) > 8 else 0.0
+                if shortest_dist > 0:
+                    total_bfs_dist += shortest_dist
+                    bfs_count += 1
+                if solved:
+                    solved_count += 1
 
             is_connected_final = is_connected if self.is_crafter else solved
+            mg_reach_ratio, mg_norm_dist = (0.0, 0.0)
+            if (not self.is_crafter) and (not self.is_bipedal):
+                mg_reach_ratio, mg_norm_dist = self._minigrid_path_metrics(final_map_obj)
             r_div = self.diversity.get_reward(torch.tensor(final_map_2ch).unsqueeze(0).to(self.device), inventory_vec=final_stats)
             div_rewards.append(r_div)
             reward = self._calculate_reward(
@@ -382,6 +514,8 @@ class GeneratorInterface:
                 inv_diversity=inv_changed_slots,
                 ce_loss=t_loss_batch,
                 inv_loss=i_loss_batch,
+                minigrid_reach_ratio=mg_reach_ratio,
+                minigrid_norm_dist=mg_norm_dist,
             )
 
             if not traj or 'obs' not in traj:
@@ -393,7 +527,7 @@ class GeneratorInterface:
             if traj and 'obs' in traj:
                 valid_trajs.append(traj)
 
-        avg_bfs = total_bfs_dist / max(1, solved_count) if solved_count > 0 else 0.0
+        avg_bfs = total_bfs_dist / max(1, bfs_count) if bfs_count > 0 else 0.0
         mean_raw_loss = np.mean(raw_scalar_losses) if len(raw_scalar_losses) > 0 else 0.0
         mean_ce_loss = np.mean(raw_ce_losses) if len(raw_ce_losses) > 0 else 0.0
         mean_inv_loss = np.mean(raw_inv_losses) if len(raw_inv_losses) > 0 else 0.0
@@ -423,6 +557,7 @@ class GeneratorInterface:
         for i in range(num_elites):
             obj_map_np, h_dict, stats_np = self.elite_buffer[i]
             obj_map_np = self._normalize_base_map(obj_map_np)
+            obj_map_np = self._anchor_minigrid_terminals(obj_map_np)
             base_maps.append(obj_map_np)
             base_stats.append(stats_np)
 
@@ -444,6 +579,7 @@ class GeneratorInterface:
                 grid = self.seeder.generate()
 
             grid = self._normalize_base_map(grid)
+            grid = self._anchor_minigrid_terminals(grid)
             base_maps.append(grid)
             base_stats.append(self._default_stats())
 
@@ -485,7 +621,7 @@ class GeneratorInterface:
         ppo_input_context = (
             torch.cat(context_maps),
             torch.cat(context_heats_terrain),
-            torch.cat(context_heats_stats) if (self.is_crafter or self.is_bipedal) else None
+            torch.cat(context_heats_stats) if (self.is_crafter or self.is_bipedal) else None,
         )
         heat_terrain_spatial = ppo_input_context[1].squeeze(1).float()
         curr_map = torch.stack([base_ids.float(), heat_terrain_spatial, zeros], dim=1)
@@ -503,6 +639,7 @@ class GeneratorInterface:
         bipedal_token_error_records = []
         all_avg_ep_lens = []
         solved_count = 0
+        bfs_count = 0
         total_bfs_dist = 0.0
 
         base_ids_np = base_ids.detach().cpu().numpy()
@@ -511,7 +648,7 @@ class GeneratorInterface:
         base_stats_np = np.stack(base_stats)
 
         for i in range(self.batch_size):
-            final_map_obj, _ = self._apply_action(base_ids_np[i], actions_np[i], mask=mask[i, 0].cpu().numpy())
+            final_map_obj, final_map_col = self._apply_action(base_ids_np[i], actions_np[i], mask=mask[i, 0].cpu().numpy())
             final_stats = base_stats_np[i].copy()
 
             if self.is_crafter and getattr(self.cfg.generator_agent, "random_stats_actions", False):
@@ -528,8 +665,8 @@ class GeneratorInterface:
                         else:
                             final_stats[slot] += 5
 
-            final_map_3ch = np.stack([final_map_obj, np.zeros_like(final_map_obj), np.zeros_like(final_map_obj)], axis=0)
-            res_rollout = self._rollout_combined(final_map_obj, final_stats, iteration, i, old_params=old_params)
+            final_map_3ch = np.stack([final_map_obj, final_map_col, np.zeros_like(final_map_obj)], axis=0)
+            res_rollout = self._rollout_combined(final_map_obj, final_stats, iteration, i, old_params=old_params, color_np=final_map_col)
             traj, errors, raw_loss_val, solved = res_rollout[0], res_rollout[1], res_rollout[2], res_rollout[3]
             errors = self._normalize_rollout_errors(errors)
             t_loss_batch = res_rollout[4] if len(res_rollout) > 4 else raw_loss_val
@@ -543,12 +680,24 @@ class GeneratorInterface:
                 if is_connected:
                     solved_count += 1
                     total_bfs_dist += conn_stats.get('max_dist', 0)
-            else:
+                    bfs_count += 1
+            elif self.is_bipedal:
                 if solved:
                     solved_count += 1
-                    total_bfs_dist += 1.0
+                    total_bfs_dist += res_rollout[8] if len(res_rollout) > 8 else 1.0
+                    bfs_count += 1
+            else:
+                shortest_dist = res_rollout[8] if len(res_rollout) > 8 else 0.0
+                if shortest_dist > 0:
+                    total_bfs_dist += shortest_dist
+                    bfs_count += 1
+                if solved:
+                    solved_count += 1
 
             is_connected_final = is_connected if self.is_crafter else solved
+            mg_reach_ratio, mg_norm_dist = (0.0, 0.0)
+            if (not self.is_crafter) and (not self.is_bipedal):
+                mg_reach_ratio, mg_norm_dist = self._minigrid_path_metrics(final_map_obj)
             r_div = self.diversity.get_reward(torch.tensor(final_map_3ch).unsqueeze(0).to(self.device), inventory_vec=final_stats)
             div_rewards.append(r_div)
             reward = self._calculate_reward(
@@ -560,6 +709,8 @@ class GeneratorInterface:
                 ce_loss=t_loss_batch,
                 inv_loss=i_loss_batch,
                 avg_ep_len=avg_ep_len,
+                minigrid_reach_ratio=mg_reach_ratio,
+                minigrid_norm_dist=mg_norm_dist,
             )
 
             if not traj or 'obs' not in traj:
@@ -568,9 +719,11 @@ class GeneratorInterface:
 
             cm = ppo_input_context[0][i:i+1]
             cht = ppo_input_context[1][i:i+1]
-            chs_dim = 26 if self.is_bipedal else 16
-            chs = ppo_input_context[2][i:i+1] if ppo_input_context[2] is not None else torch.zeros((1, chs_dim), device=self.device)
-            prev_data_i = (cm, cht, chs)
+            if ppo_input_context[2] is None:
+                prev_data_i = (cm, cht)
+            else:
+                chs = ppo_input_context[2][i:i+1]
+                prev_data_i = (cm, cht, chs)
 
             raw_scalar_losses.append(raw_loss_val)
             raw_ce_losses.append(t_loss_batch)
@@ -602,7 +755,7 @@ class GeneratorInterface:
                     
                     # [BUG FIX] Only consider actions within the `active_width` (e.g. first 6 slots).
                     # Otherwise, Grass (0) from the 18 static uneditable slots is ALWAYS included!
-                    active_w = getattr(self.cfg.generator_agent, "active_width", 6)
+                    active_w = getattr(self, "active_bipedal_width", 6)
                     current_actions = actions_np[i].flatten()[:active_w]
                     used_actions = np.unique(current_actions)
                     
@@ -642,9 +795,12 @@ class GeneratorInterface:
                     next_heats_stats.append(torch.tensor(errors['inventory'], device=self.device).unsqueeze(0))
 
         if len(next_maps) > 0:
-            self.prev_data = (torch.cat(next_maps), torch.cat(next_heats_terrain), torch.cat(next_heats_stats))
+            if self.is_crafter or self.is_bipedal:
+                self.prev_data = (torch.cat(next_maps), torch.cat(next_heats_terrain), torch.cat(next_heats_stats))
+            else:
+                self.prev_data = (torch.cat(next_maps), torch.cat(next_heats_terrain))
 
-        avg_bfs = total_bfs_dist / max(1, solved_count) if solved_count > 0 else 0.0
+        avg_bfs = total_bfs_dist / max(1, bfs_count) if bfs_count > 0 else 0.0
         mean_raw_loss = np.mean(raw_scalar_losses) if len(raw_scalar_losses) > 0 else 0.0
         mean_ce_loss = np.mean(raw_ce_losses) if len(raw_ce_losses) > 0 else 0.0
         mean_inv_loss = np.mean(raw_inv_losses) if len(raw_inv_losses) > 0 else 0.0
@@ -670,7 +826,7 @@ class GeneratorInterface:
             return self._step_random(old_params, iteration=iteration)
         return self._step_policy(old_params, iteration=iteration)
 
-    def _rollout_combined(self, map_np, stats_np, iter, idx, old_params=None):
+    def _rollout_combined(self, map_np, stats_np, iter, idx, old_params=None, color_np=None):
         import traceback
 
         env_type = str(getattr(self.cfg.attention_model, "env_type", "")).lower()
@@ -683,7 +839,7 @@ class GeneratorInterface:
                  interpreted = self.support.interpret_env(map_np, inventory_vec=stats_np)
                  env_source = interpreted[0] if isinstance(interpreted, tuple) else interpreted
              elif env_type == "minigrid":
-                 interpreted = self.support.interpret_env(map_np)
+                 interpreted = self.support.interpret_env(map_np, color_array=color_np)
                  if isinstance(interpreted, tuple) and len(interpreted) == 2:
                      # collect_data_general expects (layout_str, color_str) for MiniGrid.
                      env_source = interpreted
@@ -745,15 +901,89 @@ class GeneratorInterface:
                  print(f"[GeneratorInterface] Validation failed for {save_name}: {e}")
                  traceback.print_exc()
 
-             return traj, error_dict, mean_loss, solved, mean_aux_metric, mean_inv_loss, inv_changed_slots, avg_ep_len
+             # [NEW] Compute theoretical shortest path for MiniGrid reporting
+             shortest_dist = 0.0
+             if env_type == "minigrid":
+                 _, shortest_dist = check_solvability(map_np)
+
+             return traj, error_dict, mean_loss, solved, mean_aux_metric, mean_inv_loss, inv_changed_slots, avg_ep_len, shortest_dist
         except Exception as e:
              print(f"[GeneratorInterface] Rollout failed for env_type={env_type}, iter={iter}, idx={idx}: {e}")
              traceback.print_exc()
              return {}, {"terrain": np.zeros((self.map_height, self.map_width)), "inventory": np.zeros(16)}, 0.0, False, 0.0, 0.0, 0, 0.0
 
+    def _ensure_minigrid_goal(self, obj, mask=None):
+        """
+        DR's MiniGrid seeder creates only wall/empty canvases, while `_apply_action`
+        guarantees an agent but does not otherwise create a goal. Add one on a
+        reachable empty tile so generated environments can terminate successfully.
+        """
+        if self.is_crafter or self.is_bipedal:
+            return obj
+        if np.any(obj == self.OBJ_GOAL):
+            return obj
+
+        agent_positions = np.argwhere(obj == self.OBJ_START)
+        if len(agent_positions) == 0:
+            return obj
+
+        wall_id = OBJECT_TO_IDX["wall"]
+        lava_id = OBJECT_TO_IDX["lava"]
+        empty_id = self.OBJ_EMPTY
+        start = tuple(agent_positions[0])
+        h, w = obj.shape
+
+        dist = np.full((h, w), -1, dtype=np.int64)
+        queue = deque([start])
+        dist[start] = 0
+        while queue:
+            y, x = queue.popleft()
+            for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                ny, nx = y + dy, x + dx
+                if not (0 <= ny < h and 0 <= nx < w):
+                    continue
+                if dist[ny, nx] >= 0:
+                    continue
+                if obj[ny, nx] in (wall_id, lava_id):
+                    continue
+                dist[ny, nx] = dist[y, x] + 1
+                queue.append((ny, nx))
+
+        candidates = np.argwhere((obj == empty_id) & (dist > 0))
+        if len(candidates) == 0:
+            candidates = np.argwhere((obj == empty_id) & (np.arange(h)[:, None] > 0))
+        if len(candidates) == 0:
+            candidates = np.argwhere((obj != wall_id) & (obj != lava_id) & (obj != self.OBJ_START))
+        if len(candidates) == 0:
+            return obj
+
+        candidate_dists = dist[candidates[:, 0], candidates[:, 1]]
+        # Prefer farthest reachable tile; if all are unreachable, fall back to the first candidate.
+        best_idx = int(np.argmax(candidate_dists))
+        gy, gx = candidates[best_idx]
+        obj[gy, gx] = self.OBJ_GOAL
+        return obj
+
+    def _enforce_single_minigrid_goal(self, obj):
+        """
+        Keep at most one goal tile for MiniGrid maps.
+        Extra goals are converted to empty.
+        """
+        if self.is_crafter or self.is_bipedal:
+            return obj
+        goal_positions = np.argwhere(obj == self.OBJ_GOAL)
+        if len(goal_positions) <= 1:
+            return obj
+        out = np.array(obj, copy=True)
+        # Keep the first goal and clear the rest.
+        for gy, gx in goal_positions[1:]:
+            out[gy, gx] = self.OBJ_EMPTY
+        return out
+
     def _apply_action(self, base_map, act, mask=None):
         # Local terrain modification logic (Spatial Head)
         obj = base_map.copy()
+        color = np.zeros_like(obj)
         H, W = obj.shape
         
         # Track limits for restricted items
@@ -768,6 +998,9 @@ class GeneratorInterface:
             # Initialize counts with existing items on base map
             for r_id in restricted_limits:
                 counts[r_id] = np.sum(obj == r_id)
+        elif (not self.is_crafter) and (not self.is_bipedal):
+            # MiniGrid terminals are fixed by base map + immutable mask.
+            restricted_limits = {}
 
         for i in range(H):
             for j in range(W):
@@ -787,11 +1020,13 @@ class GeneratorInterface:
                 val = self.ACTION_TABLE.get(a)
                 
                 if val is not None: 
+                    color_name = None
                     # MiniGrid action table may encode (object_name, color_name).
-                    # The current rollout path uses object map only, so convert tuple
-                    # to the corresponding object index and ignore color metadata.
+                    # Preserve both object and color so generated DR maps match
+                    # target color distributions.
                     if isinstance(val, tuple):
                         obj_name = val[0] if len(val) > 0 else None
+                        color_name = val[1] if len(val) > 1 else None
                         if isinstance(obj_name, str):
                             val = OBJECT_TO_IDX.get(obj_name, None)
                         elif obj_name is None:
@@ -804,6 +1039,10 @@ class GeneratorInterface:
                         if val is None:
                             continue
 
+                    if (not self.is_crafter) and (not self.is_bipedal) and int(val) == self.OBJ_GOAL:
+                        # Goal is fixed by the base map; editor cannot relocate it.
+                        continue
+
                     # Enforce restriction limits
                     if self.is_crafter and val in restricted_limits:
                         if counts[val] >= restricted_limits[val]:
@@ -811,6 +1050,11 @@ class GeneratorInterface:
                         counts[val] += 1
                     
                     obj[i, j] = val
+                    if color_name is not None:
+                        color[i, j] = COLOR_TO_IDX.get(color_name, 0)
+
+                    # No hard rollback on unsolvable edits:
+                    # MiniGrid agent learns solvability through reward signal.
         
         # Mandatory Agent Placement Fallback (Ensures environment can always start)
         if not self.is_bipedal and not np.any(obj == self.OBJ_START):
@@ -828,13 +1072,25 @@ class GeneratorInterface:
             if len(pick_list) > 0:
                 spawn_r, spawn_c = random.choice(pick_list)
                 obj[spawn_r, spawn_c] = self.OBJ_START
+
+        if (not self.is_crafter) and (not self.is_bipedal):
+            # Safety net for legacy maps entering this path.
+            obj = self._anchor_minigrid_terminals(obj)
                 
-        return obj, np.zeros_like(obj)
+        return obj, color
 
     def _normalize_rollout_errors(self, err_dict, H=None, W=None):
         if H is None: H = self.map_height
         if W is None: W = self.map_width
         inventory = np.zeros(16, dtype=np.float32)
+
+        def _normalize_terrain_array(arr):
+            terrain = np.asarray(arr, dtype=np.float32)
+            if terrain.shape == (H, W):
+                return terrain
+            if terrain.size == H * W:
+                return terrain.reshape(H, W)
+            return np.zeros((H, W), dtype=np.float32)
         
         if self.is_bipedal:
             # --- [Bipedal Custom Logic] ---
@@ -856,9 +1112,9 @@ class GeneratorInterface:
         # Original Spatial logic for Minigrid/Crafter
         if isinstance(err_dict, np.ndarray):
             # Already spatial (e.g. from Crafter validation heatmap)
-            return {"terrain": err_dict, "inventory": inventory}
+            return {"terrain": _normalize_terrain_array(err_dict), "inventory": inventory}
         if isinstance(err_dict, dict):
-            terrain = err_dict.get("terrain", np.zeros((H, W), dtype=np.float32))
+            terrain = _normalize_terrain_array(err_dict.get("terrain", np.zeros((H, W), dtype=np.float32)))
             inv = err_dict.get("inventory", inventory)
             inv = np.asarray(inv, dtype=np.float32).reshape(-1)
             if inv.size < 16:
@@ -868,7 +1124,77 @@ class GeneratorInterface:
             return {"terrain": terrain, "inventory": inv}
         return {"terrain": np.zeros((H, W), dtype=np.float32), "inventory": inventory}
 
-    def _calculate_reward(self, raw_loss, div_score, solved, is_warmup, inv_diversity=0, ce_loss=None, inv_loss=None, avg_ep_len=200.0):
+    def _minigrid_path_metrics(self, grid_obj_np):
+        """
+        Continuous MiniGrid difficulty signals (no hard solved gate):
+        - reach_ratio: reachable free cells / all free cells
+        - norm_dist: shortest path to goal normalized by (H+W-2), 0 if unreachable
+        """
+        if self.is_crafter or self.is_bipedal:
+            return 0.0, 0.0
+
+        obj = np.asarray(grid_obj_np)
+        if obj.ndim != 2:
+            return 0.0, 0.0
+
+        H, W = obj.shape
+        wall_id = OBJECT_TO_IDX["wall"]
+        lava_id = OBJECT_TO_IDX["lava"]
+        start_positions = np.argwhere(obj == self.OBJ_START)
+        if len(start_positions) == 0:
+            return 0.0, 0.0
+        sy, sx = map(int, start_positions[0])
+
+        passable = (obj != wall_id) & (obj != lava_id)
+        passable_count = int(passable.sum())
+        if passable_count <= 0:
+            return 0.0, 0.0
+
+        dist = np.full((H, W), -1, dtype=np.int64)
+        q = deque([(sy, sx)])
+        dist[sy, sx] = 0
+
+        while q:
+            y, x = q.popleft()
+            for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                ny, nx = y + dy, x + dx
+                if not (0 <= ny < H and 0 <= nx < W):
+                    continue
+                if dist[ny, nx] >= 0:
+                    continue
+                if not passable[ny, nx]:
+                    continue
+                dist[ny, nx] = dist[y, x] + 1
+                q.append((ny, nx))
+
+        reachable_count = int((dist >= 0).sum())
+        reach_ratio = float(reachable_count / max(passable_count, 1))
+
+        goal_positions = np.argwhere(obj == self.OBJ_GOAL)
+        shortest_dist = 0.0
+        if len(goal_positions) > 0:
+            gy, gx = map(int, goal_positions[0])
+            d = int(dist[gy, gx])
+            if d > 0:
+                shortest_dist = float(d)
+
+        dist_norm_denom = float(max(H + W - 2, 1))
+        norm_dist = float(np.clip(shortest_dist / dist_norm_denom, 0.0, 1.0))
+        return reach_ratio, norm_dist
+
+    def _calculate_reward(
+        self,
+        raw_loss,
+        div_score,
+        solved,
+        is_warmup,
+        inv_diversity=0,
+        ce_loss=None,
+        inv_loss=None,
+        avg_ep_len=200.0,
+        minigrid_reach_ratio=0.0,
+        minigrid_norm_dist=0.0,
+    ):
         if is_warmup:
             w_survival = float(getattr(self.bipedal_reward_cfg, "survival", 0.08)) if self.is_bipedal else 0.0
             return 1.0 + div_score * 5.0 + w_survival * avg_ep_len
@@ -949,14 +1275,12 @@ class GeneratorInterface:
             )
             return reward
             
-        # Minigrid: Strict solvability required (Walls are immutable obstacles).
-        # Regret-based reward for curricular difficulty
-        # If not connected/solved, penalize heavily to avoid exploiting "stuck" states
-        if not solved: return -5.0 + 2.0 * div_score
-        
-        # PPO requires smooth advantage curves.
-        reward_loss = raw_loss * 10.0
-        return reward_loss + 2.0 * div_score + 10.0 # Solved bonus is implicit
+        # Minigrid: continuous reward without hard solved gate.
+        # Use WM difficulty + diversity + topology quality signals.
+        reward_loss = float(raw_loss) * 10.0
+        reach_bonus = 3.0 * float(np.clip(minigrid_reach_ratio, 0.0, 1.0))
+        dist_bonus = 1.0 * float(np.clip(minigrid_norm_dist, 0.0, 1.0))
+        return reward_loss + 2.0 * float(div_score) + reach_bonus + dist_bonus - 1.0
 
     def _immutable_mask(self, ids):
         mask = torch.zeros_like(ids, dtype=torch.float32)
@@ -969,6 +1293,9 @@ class GeneratorInterface:
         mask[:, 0, :] = 1.0; mask[:, -1, :] = 1.0; mask[:, :, 0] = 1.0; mask[:, :, -1] = 1.0
         # 2. Protect Agent's Position (Don't erase/move the player once placed)
         mask[ids == self.OBJ_START] = 1.0
+        # 3. For MiniGrid keep goal fixed on base map as well.
+        if (not self.is_crafter) and (not self.is_bipedal):
+            mask[ids == self.OBJ_GOAL] = 1.0
         return mask.unsqueeze(1)
 
     def _map_to_tensor(self, m):

@@ -11,16 +11,22 @@ from domain.minigrid.minigrid_support import (
 )
 from domain.minigrid.minigrid_custom_env import *
 from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper
-from domain.bipedalwalker.bipedalwalker_support import (
-    wrap_env_from_text as wrap_bipedal_env_from_text,
-)
-from domain.bipedalwalker.bipedalwalker_support import read_layout_from_txt
-from domain.bipedalwalker.bipedal_walker_custom import (
-    TERRAIN_GRASS,
-    TERRAIN_LENGTH,
-    TERRAIN_STARTPAD,
-    TERRAIN_STEP,
-)
+try:
+    from domain.bipedalwalker.bipedalwalker_support import (
+        wrap_env_from_text as wrap_bipedal_env_from_text,
+    )
+    from domain.bipedalwalker.bipedalwalker_support import read_layout_from_txt
+    from domain.bipedalwalker.bipedal_walker_custom import (
+        TERRAIN_GRASS,
+        TERRAIN_LENGTH,
+        TERRAIN_STARTPAD,
+        TERRAIN_STEP,
+    )
+except Exception as e:
+    wrap_bipedal_env_from_text = None
+    read_layout_from_txt = None
+    TERRAIN_GRASS = TERRAIN_LENGTH = TERRAIN_STARTPAD = TERRAIN_STEP = None
+    _BIPEDAL_IMPORT_ERROR = e
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import time

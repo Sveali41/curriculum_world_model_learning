@@ -230,6 +230,7 @@ def adversarial_ued_training(cfg: DictConfig):
     file_exists = os.path.exists(summary_csv_path)
     file_non_empty = file_exists and os.path.getsize(summary_csv_path) > 0
     is_bipedal = (env_type == "bipedalwalker")
+    is_minigrid = (env_type == "minigrid")
     if not file_non_empty:
         with open(summary_csv_path, mode='w', newline='') as f:
             writer = csv.writer(f)
@@ -243,20 +244,38 @@ def adversarial_ued_training(cfg: DictConfig):
                 ])
                 print(f"[Logger] Experiment summary initialized with 16 columns at {summary_csv_path}")
             else:
-                writer.writerow([
-                    "Seed", "Iter",
-                    "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
-                    "gen_val_val_inv_loss", "gen_val_val_ce_loss", "gen_val_avg_val_loss_wm",
-                    "target_val_val_inv_loss", "target_val_val_ce_loss", "target_val_avg_val_loss_wm",
-                    "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len"
-                ])
-                print(f"[Logger] Experiment summary initialized with 16 columns at {summary_csv_path}")
+                if is_minigrid:
+                    csv_header = [
+                        "Seed", "Iter",
+                        "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
+                        "gen_val_avg_val_loss_wm", "target_val_avg_val_loss_wm",
+                        "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len"
+                    ]
+                else:
+                    csv_header = [
+                        "Seed", "Iter",
+                        "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
+                        "gen_val_val_inv_loss", "gen_val_val_ce_loss", "gen_val_avg_val_loss_wm",
+                        "target_val_val_inv_loss", "target_val_val_ce_loss", "target_val_avg_val_loss_wm",
+                        "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len"
+                    ]
+                writer.writerow(csv_header)
+                print(f"[Logger] Experiment summary initialized at {summary_csv_path}")
     else:
         print(f"[Logger] Reusing existing summary CSV: {summary_csv_path}")
     print(f"[Logger] Experiment summary will be saved to {summary_csv_path}")
     
     # === Domain-aware single-rollout transition cap for MAC/DR ===
     _apply_domain_collection_budget(cfg, env_type)
+
+    # [NEW] Force Fresh Start (Delete existing checkpoint if requested)
+    ckpt_path = cfg.attention_model.model_save_path
+    if getattr(cfg, "force_fresh_start", False):
+        if os.path.exists(ckpt_path):
+            os.remove(ckpt_path)
+            print(f"[Fresh Start] Deleted existing checkpoint: {ckpt_path}")
+        else:
+            print(f"[Fresh Start] No checkpoint found to delete at: {ckpt_path}")
 
     # === A. 初始化 World Model ===
     wm_instance = AttentionWorldModel(cfg.attention_model).to(device)
@@ -277,7 +296,23 @@ def adversarial_ued_training(cfg: DictConfig):
 
     # === D. 训练状态变量 ===
     old_params, fisher = None, None
-    old_params, fisher = None, None
+    
+    if os.path.exists(ckpt_path):
+        print(f"[System] Found existing checkpoint at {ckpt_path}. Loading for resume...")
+        try:
+            # Fix for PyTorch 2.6 security change compatibility
+            ckpt = torch.load(ckpt_path, weights_only=False)
+            if 'state_dict' in ckpt:
+                wm_instance.load_state_dict(ckpt['state_dict'])
+            else:
+                wm_instance.load_state_dict(ckpt)
+            old_params = wm_instance.save_old_params()
+            print("[System] Model weights resumed successfully.")
+        except Exception as e:
+            print(f"[Warning] Failed to resume from checkpoint: {e}. Starting fresh.")
+    else:
+        print(f"[System] No existing checkpoint found at {ckpt_path}. Starting from scratch.")
+
     total_iterations = cfg.generator_agent.total_iterations
     warmup_iterations = _safe_int_cfg(
         getattr(cfg.generator_agent, "warmup_iterations", 0),
@@ -610,9 +645,9 @@ def adversarial_ued_training(cfg: DictConfig):
                     if is_bipedal:
                         target_contact_accs.append(res_dict.get('contact_acc', 0.0))
                         target_contact_bces.append(res_dict.get('contact_bce', 0.0))
-                    else:
-                        target_ce_losses.append(res_dict['terrain_loss'])
-                        target_inv_losses.append(res_dict['inventory_loss'])
+                    elif not is_minigrid:
+                        target_ce_losses.append(res_dict.get('terrain_loss', 0.0))
+                        target_inv_losses.append(res_dict.get('inventory_loss', 0.0))
             
             # Restore configs
             cfg.attention_model.freeze_weight = old_freeze
@@ -625,16 +660,18 @@ def adversarial_ued_training(cfg: DictConfig):
                     target_val_contact_acc = float(np.mean(target_contact_accs)) if target_contact_accs else 0.0
                     target_val_contact_bce = float(np.mean(target_contact_bces)) if target_contact_bces else 0.0
                     print(f"[Metrics] Combined Target Loss -> Total: {target_val_avg_val_loss_wm:.4f} | Contact Acc: {target_val_contact_acc:.4f} | Contact BCE: {target_val_contact_bce:.4f}")
-                else:
+                elif not is_minigrid:
                     target_val_val_ce_loss = float(np.mean(target_ce_losses))
                     target_val_val_inv_loss = float(np.mean(target_inv_losses))
                     print(f"[Metrics] Combined Target Loss -> Total: {target_val_avg_val_loss_wm:.4f} | Terrain: {target_val_val_ce_loss:.4f}")
+                else:
+                    print(f"[Metrics] Combined Target Loss -> Total: {target_val_avg_val_loss_wm:.4f}")
             else:
                 target_val_avg_val_loss_wm = 0.0
                 if is_bipedal:
                     target_val_contact_acc = 0.0
                     target_val_contact_bce = 0.0
-                else:
+                elif not is_minigrid:
                     target_val_val_ce_loss = 0.0
                     target_val_val_inv_loss = 0.0
         else:
@@ -642,7 +679,7 @@ def adversarial_ued_training(cfg: DictConfig):
             if is_bipedal:
                 target_val_contact_acc = 0.0
                 target_val_contact_bce = 0.0
-            else:
+            elif not is_minigrid:
                 target_val_val_ce_loss = 0.0
                 target_val_val_inv_loss = 0.0
 
@@ -677,24 +714,40 @@ def adversarial_ued_training(cfg: DictConfig):
                             "Avg_Path_Len": f"{gen_avg_ep_len:.2f}"
                         }
                     else:
-                        row_data = {
-                            "Seed": seed,
-                            "Iter": iteration + 1,
-                            "Gen_Mean_Reward": f"{gen_mean_reward:.4f}",
-                            "Gen_Loss": f"{gen_loss:.4f}",
-                            "Gen_Entropy": f"{gen_entropy:.4f}",
-                            "Gen_Div_Reward": f"{gen_div_reward_val:.4f}",
-                            "gen_val_val_inv_loss": f"{gen_val_val_inv_loss:.6f}",
-                            "gen_val_val_ce_loss": f"{gen_val_aux_metric:.6f}",
-                            "gen_val_avg_val_loss_wm": f"{gen_val_avg_val_loss_wm:.6f}",
-                            "target_val_val_inv_loss": f"{target_val_val_inv_loss:.6f}",
-                            "target_val_val_ce_loss": f"{target_val_val_ce_loss:.6f}",
-                            "target_val_avg_val_loss_wm": f"{target_val_avg_val_loss_wm:.6f}",
-                            "New_Data_Size": new_data_size,
-                            "Buffer_Size": len(fisher_buffer),
-                            "Solvable_Count": f"{gen_solvable_count}",
-                            "Avg_Path_Len": f"{gen_avg_ep_len:.2f}"
-                        }
+                        if is_minigrid:
+                            row_data = {
+                                "Seed": seed,
+                                "Iter": iteration + 1,
+                                "Gen_Mean_Reward": f"{gen_mean_reward:.4f}",
+                                "Gen_Loss": f"{gen_loss:.4f}",
+                                "Gen_Entropy": f"{gen_entropy:.4f}",
+                                "Gen_Div_Reward": f"{gen_div_reward_val:.4f}",
+                                "gen_val_avg_val_loss_wm": f"{gen_val_avg_val_loss_wm:.6f}",
+                                "target_val_avg_val_loss_wm": f"{target_val_avg_val_loss_wm:.6f}",
+                                "New_Data_Size": new_data_size,
+                                "Buffer_Size": len(fisher_buffer),
+                                "Solvable_Count": f"{gen_solvable_count}",
+                                "Avg_Path_Len": f"{gen_avg_bfs:.2f}"
+                            }
+                        else:
+                            row_data = {
+                                "Seed": seed,
+                                "Iter": iteration + 1,
+                                "Gen_Mean_Reward": f"{gen_mean_reward:.4f}",
+                                "Gen_Loss": f"{gen_loss:.4f}",
+                                "Gen_Entropy": f"{gen_entropy:.4f}",
+                                "Gen_Div_Reward": f"{gen_div_reward_val:.4f}",
+                                "gen_val_val_inv_loss": f"{gen_val_val_inv_loss:.6f}",
+                                "gen_val_val_ce_loss": f"{gen_val_aux_metric:.6f}",
+                                "gen_val_avg_val_loss_wm": f"{gen_val_avg_val_loss_wm:.6f}",
+                                "target_val_val_inv_loss": f"{target_val_val_inv_loss:.6f}",
+                                "target_val_val_ce_loss": f"{target_val_val_ce_loss:.6f}",
+                                "target_val_avg_val_loss_wm": f"{target_val_avg_val_loss_wm:.6f}",
+                                "New_Data_Size": new_data_size,
+                                "Buffer_Size": len(fisher_buffer),
+                                "Solvable_Count": f"{gen_solvable_count}",
+                                "Avg_Path_Len": f"{gen_avg_ep_len:.2f}"
+                            }
 
                     writer = csv.writer(f)
                     writer.writerow(list(row_data.values()))

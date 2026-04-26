@@ -630,7 +630,7 @@ def p2e_baseline_experiment(cfg: DictConfig):
 
             fisher_buffer.add_from_batch(
                 new_batch,
-                current_sample_ratio=cfg.attention_model.ewc_ratio,
+                current_sample_ratio=cfg.attention_model.current_sample_ratio,
                 target_shape=fisher_target_shape if domain == "minigrid" else None,
             )
 

@@ -19,8 +19,8 @@ p2e:
   # total_budget = transitions_per_collection * updates_per_target * num_targets
   per_domain:
     minigrid:
-      transitions_per_collection: 1400  # 1400 * 5 * 20 = 140000
-      updates_per_target: 5
+      transitions_per_collection: 7000  # 1400 * 5 * 20 = 140000
+      updates_per_target: 1
     crafter:
       transitions_per_collection: 2000
       updates_per_target: 5

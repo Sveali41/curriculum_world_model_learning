@@ -20,8 +20,10 @@ def char_to_color(char: str) -> Optional[str]:
     Returns:
         Optional[str]: The name of the color, or None if the character is not recognized.
     """
-    color_map = {'R': 'red', 'G': 'green', 'B': 'blue',
-                'Y': 'yellow', 'M': 'magenta', 'C': 'cyan'}
+    color_map = {
+        'R': 'red', 'G': 'green', 'B': 'blue', 'Y': 'yellow', 
+        'M': 'purple', 'W': 'grey', 'L': 'red', 'E': 'grey', 'S': 'grey'
+    }
     return color_map.get(char.upper(), None)
 
 

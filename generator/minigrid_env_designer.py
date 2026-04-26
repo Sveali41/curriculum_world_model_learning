@@ -30,6 +30,7 @@ LAVA  = OBJECT_TO_IDX['lava']
 RED    = COLOR_TO_IDX['red']
 YELLOW = COLOR_TO_IDX['yellow']
 BLUE   = COLOR_TO_IDX['blue']
+GREEN  = COLOR_TO_IDX['green']
 GREY   = COLOR_TO_IDX['grey']
 
 # --- 核心映射表 ---
@@ -37,17 +38,19 @@ GREY   = COLOR_TO_IDX['grey']
 # 格式: Action_ID: (Type, Color)
 ACTION_MAP = {
     # 0: Keep (特殊处理)
-    1: (WALL, GREY),
-    2: (EMPTY, 0),
-    3: (LAVA, RED),
+    1: (KEY, YELLOW),
+    2: (KEY, RED),
+    3: (KEY, BLUE),
+    4: (KEY, GREEN),
     
-    4: (DOOR, RED),
     5: (DOOR, YELLOW),
-    6: (DOOR, BLUE),
+    6: (DOOR, RED),
+    7: (DOOR, BLUE),
+    8: (DOOR, GREEN),
     
-    7: (KEY, RED),
-    8: (KEY, YELLOW),
-    9: (KEY, BLUE)
+    9: (WALL, 0),
+    10: (LAVA, RED),
+    11: (EMPTY, 0),
 }
 
 
