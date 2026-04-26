@@ -22,5 +22,5 @@ lightning_logs
 
 # ignore trainer files
 trainer/logs
-trainer/data
+# trainer/data
 my_research_project.egg-info/

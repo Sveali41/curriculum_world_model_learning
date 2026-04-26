@@ -4,7 +4,6 @@
 
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
-
 for SEED in 0 1 2 3 4; do
     echo "=========================================================="
     echo "PHASE: Running Seed $SEED"
