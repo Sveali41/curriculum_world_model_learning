@@ -23,8 +23,8 @@ for SEED in 0 1 2 3 4; do
     # python trainer/dr_baseline_experiment.py seed=$SEED
 
     # 4. run mac baseline experiment
-    echo "[MAC] Starting random baseline collection and training..."
-    python trainer/mac_wm_learning.py seed=$SEED
+    # echo "[MAC] Starting random baseline collection and training..."
+    # python trainer/mac_wm_learning.py seed=$SEED
     
     echo "----------------------------------------------------------"
     echo "[Done] Seed $SEED experiments completed."
