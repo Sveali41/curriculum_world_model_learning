@@ -35,7 +35,7 @@ domains:
     max_edits_layout: 0.6
     max_edits_inventory: 0.5
     replay_frac: 0.8
-    lambda_ewc: 30000 #20000.0
+    lambda_ewc: 10000 #20000.0
     validation_metric: "mse"
     reward:
       ce: 7.0
@@ -183,7 +183,7 @@ attention_model:
   n_cpu: 0
   embed_dim: 128
   num_heads: 1
-  n_epochs: 30
+  n_epochs: 10
   lr: 3e-4
   wd: 1e-5                     # weight decay - required by AttentionWorldModel
   obs_norm_values: ${domains.${domain}.obs_norm}
@@ -210,6 +210,8 @@ attention_model:
 
   # Validation metric
   validation_metric: ${domains.${domain}.validation_metric}
+  # Use same weighted loss during training (align with mse_weighted validation)
+  use_weighted_loss: true
   # Continual Learning / EWC Shielding
   continue_learning: true
   fisher_buffer_size: 500000
@@ -259,7 +261,7 @@ generator_agent:
 ablation:
   type: "none"
 
-seed: 0
+seed: 4
 force_fresh_start: true         # Set to true to delete old model and start from scratch
 
 # Temporary NPZ path used during MAC WM retraining

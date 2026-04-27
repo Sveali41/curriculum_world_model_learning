@@ -18,5 +18,5 @@ generator_agent:
 # Logger settings
 dr_log_dir: ${oc.env:TRAINER_PATH}/logs/results_dr/
 dr_temp_data_dir: ${domains.${domain}.mini_tasks_temp_root}dr/
-seed: 0
+seed: 4
 force_fresh_start: true         # Set to true to delete old model and start from scratch
