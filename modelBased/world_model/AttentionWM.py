@@ -636,12 +636,12 @@ class AttentionWorldModel(pl.LightningModule):
                  C_prev = obs_prev.size(1)
                  obs_prev_latest = obs_prev[:, -C_target:] if C_prev > C_target else obs_prev
                  
-                 diff = torch.abs(next_observations_true - obs_prev_latest).sum(dim=1, keepdim=True)
+                 # For MiniGrid, next_observations_true is already the DELTA, so diff is just its absolute value.
+                 diff = torch.abs(next_observations_true).sum(dim=1, keepdim=True)
                  change_mask = (diff > 1e-5).float()
                  
                  if C_target > 2:
-                      state_diff = torch.abs(next_observations_true[:, 2:3, :, :] - obs_prev_latest[:, 2:3, :, :])
-                      state_change_mask = (state_diff > 1e-5).float()
+                      state_change_mask = (torch.abs(next_observations_true[:, 2:3, :, :]) > 1e-5).float()
                  else:
                       state_change_mask = torch.zeros_like(change_mask)
             else:

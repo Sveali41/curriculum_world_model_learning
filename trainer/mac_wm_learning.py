@@ -197,8 +197,9 @@ def adversarial_ued_training(cfg: DictConfig):
         
     # Always construct path (handles empty suffixes naturally for default case)
     env_type = getattr(cfg.attention_model, "env_type", "minigrid")
+    mask_suffix = f"_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
 
-    summary_csv_path = log_dir / f"{env_type}_ued_results{ablation_suffix}{metric_suffix}.csv"
+    summary_csv_path = log_dir / f"{env_type}_ued_results{mask_suffix}{ablation_suffix}{metric_suffix}.csv"
     if ablation_suffix or metric_suffix or env_type != "crafter":
         print(f"[Log] CSV Path Adjusted: {summary_csv_path}")
 

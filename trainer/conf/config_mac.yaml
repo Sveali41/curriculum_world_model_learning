@@ -229,7 +229,7 @@ attention_model:
   n_phases_to_collect: 1
 
 generator_agent:
-  total_iterations: 60
+  total_iterations: 50
   # Per-domain override comes from domains.${domain}.generator_batch_size.
   batch_size: ${domains.${domain}.generator_batch_size}
   context_dim: 64

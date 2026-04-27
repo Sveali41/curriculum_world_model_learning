@@ -192,14 +192,17 @@ def run_target_baseline_experiment(cfg: DictConfig):
             "target_val_contact_acc", "target_val_contact_bce", "target_val_avg_val_loss_wm",
             "Avg_Val_Total",
         ]
-        csv_out_path = log_dir / "target_baseline_bipedalwalker.csv"
+        csv_domain_name = "bipedalwalker"
     else:
         csv_columns = [
             "Seed", "Iter", "Phase", "Trained_On", "data_size", "cumulative_data_size",
             "target_val_val_ce_loss", "target_val_val_inv_loss", "target_val_avg_val_loss_wm",
             "Avg_Val_CE", "Avg_Val_INV", "Avg_Val_Total",
         ]
-        csv_out_path = log_dir / ("target_baseline_crafter.csv" if is_crafter else "target_baseline_minigrid.csv")
+        csv_domain_name = "crafter" if is_crafter else "minigrid"
+
+    mask_suffix = f"_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
+    csv_out_path = log_dir / f"target_baseline_{csv_domain_name}{mask_suffix}.csv"
 
     file_exists = _ensure_baseline_csv(csv_out_path, csv_columns)
 

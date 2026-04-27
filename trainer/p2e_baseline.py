@@ -339,10 +339,11 @@ def p2e_baseline_experiment(cfg: DictConfig):
         if domain_cfg is not None else default_m
     )
     target_order = str(getattr(cfg.p2e, "target_order", "sequential")).lower()
+    mask_suffix = f"_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
     
     # Paths & Logger
     summary_csv_path = (
-        f"trainer/logs/p2e_baseline_{domain}_n{transitions_per_collection}_m{updates_per_target}_summary.csv"
+        f"trainer/logs/p2e_baseline_{domain}{mask_suffix}_n{transitions_per_collection}_m{updates_per_target}_summary.csv"
     )
     os.makedirs("trainer/logs", exist_ok=True)
     if domain == "minigrid":

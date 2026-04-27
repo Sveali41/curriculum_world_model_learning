@@ -341,7 +341,7 @@ class WMRLDataset(Dataset):
             else:
                 # MiniGrid: predict delta for MSE regression (numerically stable)
                 obs_delta = (obs_next.astype(np.int16) - obs_latest.astype(np.int16)).astype(np.float32)
-                if getattr(self.hparams, "clip_discrete_delta", True):
+                if getattr(self.hparams, "clip_discrete_delta", False):
                     np.clip(obs_delta, -1, 1, out=obs_delta)
 
         else:

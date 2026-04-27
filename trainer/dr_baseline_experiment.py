@@ -173,7 +173,8 @@ def run_dr_baseline_experiment(cfg: DictConfig):
     os.makedirs(log_dir, exist_ok=True)
     temp_data_dir = Path(cfg.dr_temp_data_dir)
     os.makedirs(temp_data_dir, exist_ok=True)
-    summary_csv_path = log_dir / f"dr_summary_{domain_name}.csv"
+    mask_suffix = f"_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
+    summary_csv_path = log_dir / f"dr_summary_{domain_name}{mask_suffix}.csv"
     file_exists = False
 
     old_params, fisher = None, None
