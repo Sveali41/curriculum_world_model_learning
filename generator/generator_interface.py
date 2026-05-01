@@ -65,7 +65,8 @@ class GeneratorInterface:
                 7: CRAFTER_OBJ_MAP['water'], 
                 8: CRAFTER_OBJ_MAP['table'], 
                 9: CRAFTER_OBJ_MAP['furnace'],
-                10: CRAFTER_OBJ_MAP['plant']
+                10: CRAFTER_OBJ_MAP['plant'],
+                11: CRAFTER_OBJ_MAP['cow'],
             }
         elif self.is_bipedal:
             self.map_height = 1
@@ -127,6 +128,7 @@ class GeneratorInterface:
         self.prev_data = None
         self.crafter_reward_cfg = self._get_crafter_reward_cfg()
         self.bipedal_reward_cfg = self._get_bipedal_reward_cfg()
+        self.minigrid_reward_cfg = self._get_minigrid_reward_cfg()
         self.bipedal_history_len = int(self._get_bipedal_history_len())
         self.bipedal_history = deque(maxlen=self.bipedal_history_len)
         self._last_bipedal_memory = (
@@ -155,6 +157,18 @@ class GeneratorInterface:
         if bipedal_cfg is None:
             return {}
         reward_cfg = getattr(bipedal_cfg, "reward", None)
+        return reward_cfg if reward_cfg is not None else {}
+
+    def _get_minigrid_reward_cfg(self):
+        if self.is_crafter or self.is_bipedal:
+            return {}
+        domains_cfg = getattr(self.cfg, "domains", None)
+        if domains_cfg is None:
+            return {}
+        minigrid_cfg = getattr(domains_cfg, "minigrid", None)
+        if minigrid_cfg is None:
+            return {}
+        reward_cfg = getattr(minigrid_cfg, "reward", None)
         return reward_cfg if reward_cfg is not None else {}
 
     def _get_bipedal_history_len(self):
@@ -548,27 +562,16 @@ class GeneratorInterface:
 
         warmup_iters = self._get_warmup_iterations()
         is_warmup = (iteration < warmup_iters)
-        num_elites = 0
-        if self.use_elites and (not is_warmup) and len(self.elite_buffer) > 0:
-            num_elites = min(len(self.elite_buffer), self.max_elites)
-        num_random = self.batch_size - num_elites
+        num_random = self.batch_size
 
-        for i in range(num_elites):
-            obj_map_np, h_dict, stats_np = self.elite_buffer[i]
-            obj_map_np = self._normalize_base_map(obj_map_np)
-            obj_map_np = self._anchor_minigrid_terminals(obj_map_np)
-            base_maps.append(obj_map_np)
-            base_stats.append(stats_np)
-
-            zm, zh, _ = self._zero_context(1, self.map_height, self.map_width)
-            m_3ch = zm.clone()
-            m_3ch[0, 0] = torch.tensor(obj_map_np, device=self.device)
-            context_maps.append(m_3ch)
-            context_heats_terrain.append(torch.tensor(h_dict['terrain'], dtype=torch.float32, device=self.device).view(1, 1, self.map_height, self.map_width))
-            if self.is_bipedal:
-                context_heats_stats.append(torch.tensor(shared_bipedal_memory, dtype=torch.float32, device=self.device).reshape(1, 26))
+        # [NEW] Robust prev_data unpacking for all envs (MiniGrid: 2 elements, others: 3)
+        p_maps, p_terrain, p_stats = None, None, None
+        if self.prev_data is not None:
+            if len(self.prev_data) == 3:
+                p_maps, p_terrain, p_stats = self.prev_data
             else:
-                context_heats_stats.append(torch.tensor(h_dict['inventory']).to(self.device).reshape(1, 16))
+                p_maps, p_terrain = self.prev_data
+                p_stats = None
 
         for r_idx in range(num_random):
             if self.is_bipedal:
@@ -583,36 +586,36 @@ class GeneratorInterface:
             base_stats.append(self._default_stats())
 
             zm, zh, _ = self._zero_context(1, self.map_height, self.map_width)
-            if self.is_bipedal and self.prev_data is not None:
-                # [Fix] Forward ALL previous data (Map, Heatmap, Stats) to the generator context
-                p_maps, p_terrain, p_stats = self.prev_data
+            
+            # [MODIFIED] Universal adaptive context forwarding for all environments
+            if p_maps is not None:
                 idx = r_idx % p_maps.shape[0] if p_maps.shape[0] > 0 else 0
                 context_maps.append(p_maps[idx:idx+1])
                 context_heats_terrain.append(p_terrain[idx:idx+1])
-                # BUGFIX(bipedal-history): prev_data stats were overwriting long-term history stats.
-                # Merge online per-sample error stats (first 20 dims) with deque-based action history
-                # (last 6 dims), so history signal stays alive across iterations.
-                prev_stats = p_stats[idx:idx+1]
-                if prev_stats.shape[-1] < 26:
-                    prev_stats = F.pad(prev_stats, (0, 26 - prev_stats.shape[-1]))
-                elif prev_stats.shape[-1] > 26:
-                    prev_stats = prev_stats[:, :26]
-
-                merged_stats = prev_stats.clone()
-                if shared_bipedal_memory is not None:
-                    merged_stats[:, 20:26] = torch.tensor(
-                        shared_bipedal_memory[20:26],
-                        dtype=torch.float32,
-                        device=self.device,
-                    ).reshape(1, 6)
-                context_heats_stats.append(merged_stats)
+                
+                # Handle Stats/Inventory Heatmap
+                if p_stats is not None:
+                    curr_p_stats = p_stats[idx:idx+1]
+                    if self.is_bipedal:
+                        # BUGFIX(bipedal-history): Merge online errors with long-term action history
+                        merged_stats = curr_p_stats.clone()
+                        if shared_bipedal_memory is not None:
+                            merged_stats[:, 20:26] = torch.tensor(
+                                shared_bipedal_memory[20:26],
+                                dtype=torch.float32,
+                                device=self.device,
+                            ).reshape(1, 6)
+                        context_heats_stats.append(merged_stats)
+                    else:
+                        context_heats_stats.append(curr_p_stats)
+                else:
+                    # Fallback for envs without stats (MiniGrid)
+                    context_heats_stats.append(torch.zeros((1, 16), device=self.device))
             else:
+                # First iteration: fall back to zero context
                 context_maps.append(zm)
                 context_heats_terrain.append(zh)
-                if self.is_bipedal:
-                    context_heats_stats.append(torch.tensor(shared_bipedal_memory, dtype=torch.float32, device=self.device).reshape(1, 26))
-                else:
-                    context_heats_stats.append(torch.tensor([0.0]*16, dtype=torch.float32, device=self.device).reshape(1, 16))
+                context_heats_stats.append(torch.zeros((1, 26 if self.is_bipedal else 16), device=self.device))
 
         base_ids = torch.from_numpy(np.stack(base_maps)).to(self.device).long()
         B, H, W = base_ids.shape
@@ -622,8 +625,9 @@ class GeneratorInterface:
             torch.cat(context_heats_terrain),
             torch.cat(context_heats_stats) if (self.is_crafter or self.is_bipedal) else None,
         )
-        heat_terrain_spatial = ppo_input_context[1].squeeze(1).float()
-        curr_map = torch.stack([base_ids.float(), heat_terrain_spatial, zeros], dim=1)
+        # Keep discrete map channels discrete. Terrain heat belongs in the
+        # history/context stream, not in the color embedding index channel.
+        curr_map = torch.stack([base_ids.float(), zeros, zeros], dim=1)
         mask = self._immutable_mask(base_ids)
 
         actions, stats_actions, logp, values, topk_action_mask, topk_stats_action_mask, _ = self.ppo.select_action(
@@ -744,6 +748,19 @@ class GeneratorInterface:
                 valid_trajs.append(traj)
                 next_maps.append(self._map_to_tensor(final_map_3ch))
                 next_heats_terrain.append(torch.tensor(errors['terrain'], dtype=torch.float32, device=self.device).view(1, 1, self.map_height, self.map_width))
+                if not self.is_bipedal:
+                    h_map = errors['terrain']
+                    if h_map.max() > 1e-6:
+                        y, x = np.unravel_index(np.argmax(h_map), h_map.shape)
+                        # MiniGrid final_map_obj is [H, W]
+                        obj_id = int(final_map_obj[y, x])
+                        # Look up object name
+                        obj_name = [k for k, v in self.support.cfg.training_generator.map_element.items() if v == obj_id]
+                        obj_name = obj_name[0] if obj_name else f"ID({obj_id})"
+                        print(f"[Feedback-Debug] Iter {iteration} Env {i}: Max Error {h_map.max():.4f} at ({y},{x}) which is {obj_name}")
+                    else:
+                        print(f"[Feedback-Debug] Iter {iteration} Env {i}: Heatmap is zero.")
+
                 if self.is_bipedal:
                     # [MODIFIED] Semantic + Physical Error Attribution
                     # Now we combine which obstacle types were present AND the physical failures
@@ -1255,10 +1272,22 @@ class GeneratorInterface:
             
         # Minigrid: continuous reward without hard solved gate.
         # Use WM difficulty + diversity + topology quality signals.
-        reward_loss = float(raw_loss) * 10.0
-        reach_bonus = 3.0 * float(np.clip(minigrid_reach_ratio, 0.0, 1.0))
-        dist_bonus = 1.0 * float(np.clip(minigrid_norm_dist, 0.0, 1.0))
-        return reward_loss + 2.0 * float(div_score) + reach_bonus + dist_bonus - 1.0
+        reward_cfg = self.minigrid_reward_cfg
+        w_loss = float(getattr(reward_cfg, "loss", 10.0))
+        w_div = float(getattr(reward_cfg, "div", 2.0))
+        w_reach = float(getattr(reward_cfg, "reach", 3.0))
+        w_dist = float(getattr(reward_cfg, "dist", 1.0))
+        bias = float(getattr(reward_cfg, "bias", -1.0))
+        reward_clip = float(getattr(reward_cfg, "clip", 50.0))
+
+        reward = (
+            w_loss * float(raw_loss)
+            + w_div * float(div_score)
+            + w_reach * float(np.clip(minigrid_reach_ratio, 0.0, 1.0))
+            + w_dist * float(np.clip(minigrid_norm_dist, 0.0, 1.0))
+            + bias
+        )
+        return float(np.clip(reward, -reward_clip, reward_clip))
 
     def _immutable_mask(self, ids):
         mask = torch.zeros_like(ids, dtype=torch.float32)

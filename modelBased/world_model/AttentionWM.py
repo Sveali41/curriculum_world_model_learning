@@ -648,7 +648,7 @@ class AttentionWorldModel(pl.LightningModule):
                  change_mask = (next_observations_true.abs() > 1e-6).any(dim=1, keepdim=True).float()
                  state_change_mask = torch.zeros_like(change_mask)
 
-            weights = 1.0 + (change_mask * 10.0) + (state_change_mask * 50.0)
+            weights = 1.0 + (change_mask * 3.0) + (state_change_mask * 10.0)
             
             if obs_masked is not None:
                  if obs_masked.ndim == 3:
@@ -656,13 +656,20 @@ class AttentionWorldModel(pl.LightningModule):
                  else:
                      static_mask = obs_masked.float()
                  interaction_mask = change_mask * static_mask
-                 weights = weights + (interaction_mask * 100.0)
+                 weights = weights + (interaction_mask * 20.0)
 
-        # 5. Weighted Mean
+        # 5. Weighted reduction
         if torch.is_tensor(weights) and weights.ndim > raw_error_map.ndim:
              weights = weights.squeeze(1) # [B, 1, H, W] -> [B, H, W]
-        
-        loss = (raw_error_map * weights).mean()
+
+        if torch.is_tensor(weights):
+            if bool(getattr(self.hparams, "normalize_weighted_loss", True)):
+                weighted_error = raw_error_map * weights
+                loss = weighted_error.sum() / weights.sum().clamp_min(1.0)
+            else:
+                loss = (raw_error_map * weights).mean()
+        else:
+            loss = (raw_error_map * weights).mean()
         
         return {"loss_obs": loss}
 
@@ -678,7 +685,7 @@ class AttentionWorldModel(pl.LightningModule):
             if not param.requires_grad:
                 continue
             # 'fc' 是负责地图 Tile 分类的输出层
-            if 'fc' in name:
+            if 'model.fc.' in name:
                 head_params.append(param)
             else:
                 base_params.append(param)
@@ -951,6 +958,11 @@ class AttentionWorldModel(pl.LightningModule):
         if getattr(self.hparams, "keep_cell_loss", False) and not getattr(self, 'is_bipedal', False):
             loss_map = self.compute_cell_loss(obs_pred, obs_next)
             batch_size = loss_map.shape[0]
+            
+            # [DEBUG] Check if we are actually getting coordinates and values
+            if batch_idx == 0 and self.env_type == 'minigrid':
+                print(f"[WM-Debug] LossMap Mean: {loss_map.mean():.6f}, AgentPos[0]: {agent_position[0]}")
+                
             for i in range(batch_size):
                 agent_pos = agent_position[i].tolist()  # (y, x)
                 self.accumulate_loss(loss_map[i], agent_pos)
@@ -1077,6 +1089,11 @@ class AttentionWorldModel(pl.LightningModule):
                     avg_loss_map[y, x] = sum(vals) / len(vals) if vals else 0
 
             self.loss_map_result = avg_loss_map.cpu().numpy()
+            if self.env_type == 'minigrid':
+                if self.loss_map_result.size > 0:
+                    print(f"[WM-Debug] Final Heatmap Stats - Max: {self.loss_map_result.max():.6f}, Non-zero cells: {np.count_nonzero(self.loss_map_result)}")
+                else:
+                    print(f"[WM-Debug] Warning: Final Heatmap is empty (size 0)!")
         elif getattr(self.hparams, "keep_cell_loss", False) and getattr(self, 'is_bipedal', False):
             if hasattr(self, "bipedal_semantic_acc") and len(self.bipedal_semantic_acc) > 0:
                 stacked_sem = torch.cat(self.bipedal_semantic_acc, dim=0) # [Total_Samples, 5]

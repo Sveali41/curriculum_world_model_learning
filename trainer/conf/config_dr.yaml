@@ -6,17 +6,17 @@ defaults:
   - _self_
 
 # --- Control Switch ---
-domain: 'minigrid'             # Options: 'crafter' or 'minigrid' or 'bipedal'
+domain: 'crafter'             # Options: 'crafter' or 'minigrid' or 'bipedal'
 
 # --- Force Random Exploration (DR core) ---
 generator_agent:
   agent_type: 'random'         # No adversarial, just random maps
-  total_iterations: 40 # 30 minigrid 50 bipedal 
+  total_iterations: 50 # 30 minigrid 50 bipedal 
   wm_train_frequency: 1
   warmup_iterations: 0         # No need to warm up random
 
 # Logger settings
 dr_log_dir: ${oc.env:TRAINER_PATH}/logs/results_dr/
 dr_temp_data_dir: ${domains.${domain}.mini_tasks_temp_root}dr/
-seed: 4
+seed: 1
 force_fresh_start: true         # Set to true to delete old model and start from scratch

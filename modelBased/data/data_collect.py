@@ -1790,7 +1790,10 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
     if obs_np.shape[1] not in [2, 3, 4, 5]:  # 通道数异常 -> 应该是放在最后
         obs_np = np.moveaxis(obs_np, -1, 1)
         
-    # Crafter stores object IDs where player is exactly ID=10.
+    is_crafter_symbolic = (obs_np.shape[1] == 2)
+
+    # Crafter symbolic observations use their own object-id mapping and must
+    # not fall back to the MiniGrid agent-position helper.
     if obs_np.shape[1] == 2:
         from domain.crafter.crafter_support import extract_player_positions
         positions = extract_player_positions(obs_np)  # (N, 2)
@@ -1805,7 +1808,8 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
         obs_np = ColRowCanl_to_CanlRowCol(obs_np)
         
     Height, Width = obs_np.shape[2], obs_np.shape[3]
-    positions = get_agent_position(obs_np)  # Returns (y, x) for NCHW
+    if not is_crafter_symbolic:
+        positions = get_agent_position(obs_np)  # Returns (y, x) for NCHW
 
     # -------------------------------
     # Step 2: 统计访问次数
@@ -1848,7 +1852,7 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
         # 1. Heatmap
         ax1 = plt.subplot(1, 2, 1)
         im = ax1.imshow(heatmap, cmap="viridis", origin="upper")
-        ax1.set_title(title, fontsize=12, fontweight='bold')
+        # ax1.set_title(title, fontsize=12, fontweight='bold')
         ax1.set_xlabel("X axis")
         ax1.set_ylabel("Y axis")
         plt.colorbar(im, ax=ax1, label="Occurrences", fraction=0.046, pad=0.04)
@@ -1882,12 +1886,12 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
         
         plt.tight_layout()
     else:
-        plt.figure(figsize=(6,6))
-        plt.imshow(heatmap, cmap="viridis", origin="upper")
-        plt.title(title)
-        plt.xlabel("X axis")
-        plt.ylabel("Y axis")
-        plt.colorbar(label="Occurrences")
+        fig, ax = plt.subplots(figsize=(6,6))
+        im = ax.imshow(heatmap, cmap="viridis", origin="upper")
+        # ax.set_title(title)
+        ax.set_xlabel("X axis")
+        ax.set_ylabel("Y axis")
+        plt.colorbar(im, ax=ax, label="Occurrences", fraction=0.046, pad=0.04)
         plt.tight_layout()
 
     if save_path:

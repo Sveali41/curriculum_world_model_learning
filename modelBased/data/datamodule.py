@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 import pytorch_lightning as pl
@@ -149,7 +150,11 @@ class WMRLDataset(Dataset):
             replay_data (dict, optional): 来自 Replay Buffer 的历史数据字典。
         """
         import numpy as np
-        rng = np.random.default_rng()  # 统一随机源
+        seed = getattr(self.hparams, "seed", None)
+        if seed is None:
+            env_seed = os.environ.get("PYTHONHASHSEED")
+            seed = int(env_seed) if env_seed is not None else 0
+        rng = np.random.default_rng(int(seed))  # 统一随机源，并与全局 seed 对齐
 
         # ===== 基础取数 =====
         mask_size = self.hparams.attention_mask_size

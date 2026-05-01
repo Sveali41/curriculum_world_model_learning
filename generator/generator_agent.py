@@ -39,6 +39,8 @@ class GeneratorPPO:
         self.env_type = env_type
         # self.ratio = ratio # removed
         self.top_k_features = top_k_features
+        self.is_bipedal = (env_type == "bipedalwalker")
+        self.policy_context_dim = context_dim if self.is_bipedal else context_dim * 2
 
         # history encoder
         
@@ -55,14 +57,14 @@ class GeneratorPPO:
 
         self.policy = MapEditorActorCritic(
             num_actions=num_actions,
-            context_dim=context_dim,
+            context_dim=self.policy_context_dim,
             ablation_type=ablation_type,
             env_type=env_type,
         ).to(device)
 
         self.policy_old = MapEditorActorCritic(
             num_actions=num_actions,
-            context_dim=context_dim,
+            context_dim=self.policy_context_dim,
             ablation_type=ablation_type,
             env_type=env_type,
         ).to(device)
@@ -116,13 +118,18 @@ class GeneratorPPO:
     def _compute_global_context_dual(self, prev_map, terrain_heat, stats_heat, top_k_features=16):
         """
         聚合物理布局失败特征 (Spatial) 和 物资数值失败特征 (Inventory).
+        For Crafter/MiniGrid we keep both:
+        - local per-sample history context
+        - global batch summary context
         """
         # 使用更新后的 HistoryEncoder 提取每个样本的综合失败特征
         ctx = self.encoder(prev_map, terrain_heat, stats_heat) # [B, context_dim]
 
-        if self.env_type == "bipedalwalker":
+        if self.is_bipedal:
             return F.normalize(ctx, p=2, dim=1)
         
+        local_ctx = F.normalize(ctx, p=2, dim=1)
+
         # 跨 Batch 取并集 (Max-Pooling)
         v_ctx, _ = torch.max(ctx, dim=0, keepdim=True) # [1, context_dim]
 
@@ -134,8 +141,9 @@ class GeneratorPPO:
             v_ctx = v_ctx * mask
 
         # 数值归一化
-        v_ctx = F.normalize(v_ctx, p=2, dim=1) 
-        return v_ctx
+        global_ctx = F.normalize(v_ctx, p=2, dim=1)
+        global_ctx = global_ctx.expand(local_ctx.size(0), -1)
+        return torch.cat([local_ctx, global_ctx], dim=1)
 
     # ------------------------------------------------------------------
     # Rollout
@@ -151,6 +159,7 @@ class GeneratorPPO:
             if prev_data is None:
                 # 初始状态：空地图、空热图、空背包热图
                 H, W = base_map.size(2), base_map.size(3)
+                # pm: prev_map, pht: prev_heat_terrain, phs: prev_heat_stats
                 pm = torch.zeros((1, 3, H, W), device=device)
                 pht = torch.zeros((1, 1, H, W), device=device)
                 phs = None if self.env_type == "minigrid" else torch.zeros(

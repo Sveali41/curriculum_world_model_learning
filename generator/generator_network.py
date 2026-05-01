@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 import numpy as np
 
+from generator.crafter_env_designer import CRAFTER_OBJ_MAP
+
 
 class ResBlock(nn.Module):
     """标准残差块"""
@@ -35,6 +37,13 @@ class MapEditorActorCritic(nn.Module):
         self.env_type = str(env_type).lower()
         self.is_bipedal = ("bipedal" in self.env_type)
         self.is_crafter = ("crafter" in self.env_type)
+
+        if self.is_crafter:
+            max_obj_id = max(CRAFTER_OBJ_MAP.values())
+            # Crafter generator currently uses object ids plus placeholder zero
+            # channels for color/state.
+            max_color_id = 0
+            max_state_id = 0
 
         # === 1. Embedding Layers ===
         self.emb_dim_obj = 16

@@ -87,22 +87,47 @@ class FisherReplayBuffer:
         scores = []
 
         with torch.no_grad():
-            obs = torch.tensor(samples['obs']).to(device).float()
-            act = torch.tensor(samples['act']).to(device)
-            obs_next = torch.tensor(samples['obs_next']).to(device).float()
-            if 'info' in samples:
-                info = torch.tensor(samples['info']).to(device).float()
+            batch = {
+                "obs": torch.tensor(samples["obs"]).to(device),
+                "act": torch.tensor(samples["act"]).to(device),
+                "obs_next": torch.tensor(samples["obs_next"]).to(device),
+            }
+            if "info" in samples and samples["info"] is not None:
+                batch["info"] = torch.tensor(samples["info"]).to(device)
+            if "inv" in samples and samples["inv"] is not None:
+                batch["inv"] = torch.tensor(samples["inv"]).to(device)
+            if "inv_next" in samples and samples["inv_next"] is not None:
+                batch["inv_next"] = torch.tensor(samples["inv_next"]).to(device)
+
+            if hasattr(model, "preprocess_batch"):
+                obs_masked, act, obs_next_masked, info, _, _, inv, _ = model.preprocess_batch(
+                    batch, training=False
+                )
+                pred, _, aux_pred = model(obs_masked, act, info, inv=inv)
+                pred_for_loss = aux_pred if (getattr(model, "env_type", "") == "crafter" and aux_pred is not None) else pred
             else:
-                info = None
-            agent_postion_yx_batch = minigrid_utils.get_agent_position(obs)
-            agent_postion_yx_batch_next = minigrid_utils.get_agent_position(obs_next)
-            obs_masked = minigrid_utils.extract_masked_state(obs, self.mask_size, agent_postion_yx_batch)
-            obs_next_masked = minigrid_utils.extract_masked_state(obs_next, self.mask_size, agent_postion_yx_batch_next)
-            pred, _ = model(obs_masked, act, info)
-            loss = [F.mse_loss(pred[i], obs_next_masked[i]).item() for i in range(len(pred))]
+                obs = batch["obs"].float()
+                act = batch["act"]
+                obs_next = batch["obs_next"].float()
+                info = batch.get("info", None)
+                agent_postion_yx_batch = minigrid_utils.get_agent_position(obs)
+                obs_masked = minigrid_utils.extract_masked_state(obs, self.mask_size, agent_postion_yx_batch)
+                obs_next_masked = minigrid_utils.extract_masked_state(obs_next, self.mask_size, agent_postion_yx_batch)
+                pred_for_loss, _ = model(obs_masked, act, info)
+
+            if getattr(model, "env_type", "") == "crafter":
+                from domain.crafter.crafter_support import crafter_classification_loss
+                per_cell = crafter_classification_loss(
+                    pred_for_loss, obs_next_masked, reduction="none", weighted=False
+                )
+                loss = per_cell.mean(dim=(1, 2)).detach().cpu().tolist()
+            else:
+                loss = [F.mse_loss(pred_for_loss[i], obs_next_masked[i]).item() for i in range(len(pred_for_loss))]
 
             # 可选加权项，例如状态变化量
-            delta = [(obs_next[i] - obs[i]).abs().mean().item() for i in range(len(obs_next))]
+            obs_full = batch["obs"].float()
+            obs_next_full = batch["obs_next"].float()
+            delta = [(obs_next_full[i] - obs_full[i]).abs().mean().item() for i in range(len(obs_next_full))]
             score = [l + 0.1 * d for l, d in zip(loss, delta)]  # 组合得分
         
             scored_samples = list(zip(score, [dict(obs=samples['obs'][i],

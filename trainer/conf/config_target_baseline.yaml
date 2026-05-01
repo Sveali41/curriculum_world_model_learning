@@ -6,7 +6,7 @@ defaults:
   - _self_
 
 # --- Control Switch (Unified across all baselines) ---
-domain: 'minigrid'              # 'crafter' or 'minigrid' or 'bipedalwalker'
+domain: 'crafter'              # 'crafter' or 'minigrid' or 'bipedalwalker'
 
 # --- Domain-Specific Specifications for Sequential Phase Training ---
 domains:

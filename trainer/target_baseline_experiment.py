@@ -190,14 +190,14 @@ def run_target_baseline_experiment(cfg: DictConfig):
         csv_columns = [
             "Seed", "Iter", "Phase", "Trained_On", "data_size", "cumulative_data_size",
             "target_val_contact_acc", "target_val_contact_bce", "target_val_avg_val_loss_wm",
-            "Avg_Val_Total",
+            "Avg_Val_Total", "Buffer_Size",
         ]
         csv_domain_name = "bipedalwalker"
     else:
         csv_columns = [
             "Seed", "Iter", "Phase", "Trained_On", "data_size", "cumulative_data_size",
             "target_val_val_ce_loss", "target_val_val_inv_loss", "target_val_avg_val_loss_wm",
-            "Avg_Val_CE", "Avg_Val_INV", "Avg_Val_Total",
+            "Avg_Val_CE", "Avg_Val_INV", "Avg_Val_Total", "Buffer_Size",
         ]
         csv_domain_name = "crafter" if is_crafter else "minigrid"
 
@@ -326,9 +326,13 @@ def run_target_baseline_experiment(cfg: DictConfig):
 
             # --- A. Training Step ---
             replay_data = None
+            replay_size = 0
             if len(fisher_buffer) > 0:
+                print(f"  [Buffer] Fisher buffer size: {len(fisher_buffer)} samples")
                 try:
                     replay_data = fisher_buffer.export_dict()
+                    replay_size = len(replay_data['obs']) if replay_data and 'obs' in replay_data else 0
+                    print(f"  [Buffer] Exported replay data: {replay_size} samples (replay_frac={cfg.attention_model.replay_frac})")
                 except ValueError as e:
                     print(f"  [Warn] Replay export failed: {e}")
                     if domain_name == "minigrid" and fisher_target_shape is not None:
@@ -357,6 +361,7 @@ def run_target_baseline_experiment(cfg: DictConfig):
                     "Trained_On": current_task,
                     "data_size": current_data_size,
                     "cumulative_data_size": cumulative_data_size,
+                    "Buffer_Size": len(fisher_buffer),
                 }
                 
                 val_summary = validate_on_all_targets(
@@ -400,6 +405,7 @@ def run_target_baseline_experiment(cfg: DictConfig):
             current_sample_ratio=cfg.attention_model.current_sample_ratio,
             target_shape=fisher_target_shape if domain_name == "minigrid" else None,
         )
+        print(f"  [Buffer] After archiving: buffer size = {len(fisher_buffer)} samples")
         torch.cuda.empty_cache()
 
     print(f"\n[SUCCESS] Experiment Complete. CSV saved to: {csv_out_path}")

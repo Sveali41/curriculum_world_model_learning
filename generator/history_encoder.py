@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from minigrid.core.constants import OBJECT_TO_IDX, COLOR_TO_IDX, STATE_TO_IDX
 
+from generator.crafter_env_designer import CRAFTER_OBJ_MAP
+
 class HistoryEncoder(nn.Module):
     '''
     历史状态编码器：将历史状态网格及其对应的错误热图和注意力图编码为全局上下文向量
@@ -55,9 +57,14 @@ class HistoryEncoder(nn.Module):
             return
 
         # 1. Embedding 层
-        max_object_id = max(OBJECT_TO_IDX.values())
-        max_color_id = max(COLOR_TO_IDX.values())
-        max_cell_state_id = max(STATE_TO_IDX.values())
+        if self.env_type == "crafter":
+            max_object_id = max(CRAFTER_OBJ_MAP.values())
+            max_color_id = 0
+            max_cell_state_id = 0
+        else:
+            max_object_id = max(OBJECT_TO_IDX.values())
+            max_color_id = max(COLOR_TO_IDX.values())
+            max_cell_state_id = max(STATE_TO_IDX.values())
         
         self.emb_object = nn.Embedding(max_object_id + 1, emb_dim)
         self.emb_color = nn.Embedding(max_color_id + 1, emb_dim)

@@ -4,7 +4,7 @@
 
 # 1. Domain-Specific Overrides (Categorized for ease of management)
 # ----------------------------------------------------------------------
-domain: 'minigrid' # 'crafter' OR 'minigrid' OR 'bipedalwalker'
+domain: 'crafter' # 'crafter' OR 'minigrid' OR 'bipedalwalker'
 
 # [Internal Taxonomy] Do not edit these directly unless adding a new domain
 domains:
@@ -30,7 +30,7 @@ domains:
     use_bipedal_attention: false
     # Data collection budget for MAC/DR (per training iteration).
     # Runtime will split this by generator_batch_size to get per-rollout max transitions.
-    iter_transition_budget: 2000
+    iter_transition_budget: 8000
     generator_batch_size: 8
     max_edits_layout: 0.6
     max_edits_inventory: 0.5
@@ -38,9 +38,9 @@ domains:
     lambda_ewc: 10000 #20000.0
     validation_metric: "mse"
     reward:
-      ce: 7.0
+      ce: 10.0
       inv: 3.5
-      div: 1.8
+      div: 3.0
       inv_change: 4.0
       inv_change_norm_slots: 8.0
       bias: 1.0
@@ -49,7 +49,7 @@ domains:
   minigrid:
     h: 8
     w: 8
-    grid_shape: [3, 0, 0]
+    grid_shape: [3, 8, 8]
     obs_norm: [11, 6, 3]
     action_norm: 7
     attention_mask: 3
@@ -70,12 +70,19 @@ domains:
     # Example: 1400 with batch=8 -> each rollout collects 175 transitions.
     iter_transition_budget: 3500 # 3500*40 = 140000
     generator_batch_size: 8
-    max_edits_layout: 0.4
+    max_edits_layout: 0.3
     # MiniGrid does not use inventory edits; keep this as 0.0 to disable.
     max_edits_inventory: 0.0
-    replay_frac: 0.7
-    lambda_ewc: 2000.0 # larger-> protect old memory and smaller-> new knowledge
+    replay_frac: 3
+    lambda_ewc: 10000.0 # larger-> protect old memory and smaller-> new knowledge
     validation_metric: "mse_weighted"
+    reward:
+      loss: 25.0          # WM prediction difficulty weight
+      div: 5.0            # diversity score weight
+      reach: 2.0          # reachable area ratio weight
+      dist: 2.0           # shortest path distance weight
+      bias: 0.0          # constant offset
+      clip: 60.0          # reward clipping bound
 
   bipedalwalker:
     h: 1
@@ -108,7 +115,7 @@ domains:
     validation_metric: "mse"
     reward:
       contact_bce: 1
-      total_loss: 20.0
+      total_loss: 1.0
       div: 2.0
       survival: 0.01
       bias: 0.0
@@ -163,10 +170,10 @@ env:
     env_visualize_save_path: ${domains.${domain}.env_visualize_folder}
     env_visualize_filename: ued_env.png
     # visualize the env and layout of the env
-    save_env_visualize: false # visualize env layout
+    save_env_visualize: true # visualize env layout
     visualize_save_path: ${domains.${domain}.dataset_visualize_folder}
     visualize_filename: ued_dataset.png
-    save_coverage_visualize: false # visualize the exploration coverage
+    save_coverage_visualize: true # visualize the exploration coverage
     current_layout_str: null      # bipedal-only: runtime layout string for UED coverage visualization
     maximum_dataset_size: 500
     max_steps: 80000              # max steps per data collection episode
@@ -183,8 +190,8 @@ attention_model:
   n_cpu: 0
   embed_dim: 128
   num_heads: 1
-  n_epochs: 10
-  lr: 3e-4
+  n_epochs: 15
+  lr: 5e-4
   wd: 1e-5                     # weight decay - required by AttentionWorldModel
   obs_norm_values: ${domains.${domain}.obs_norm}
   action_norm_values: ${domains.${domain}.action_norm}
@@ -206,7 +213,7 @@ attention_model:
   visualize_every: 1000
   save_path: ${oc.env:TRAINER_PATH}/visulization
   direction_map: {0: 'right', 1: 'down', 2: 'left', 3: 'up'}
-  action_map: {0: 'left', 1: 'right', 2: 'forward', 3: 'pickup', 4: 'drop', 5: 'toggle', 6: 'done'}
+  action_map: {0: 'left', 1: 'right', 2: 'forward', 3: 'pickup', 4: 'toggle'}
 
   # Validation metric
   validation_metric: ${domains.${domain}.validation_metric}
@@ -215,7 +222,7 @@ attention_model:
   # Continual Learning / EWC Shielding
   continue_learning: true
   fisher_buffer_size: 500000
-  current_sample_ratio: 0.6
+  current_sample_ratio: 0.7
   fisher_buffer_elements_ratio: 0.8
   replay_frac: ${domains.${domain}.replay_frac} # replay amount = new_data_size * replay_frac
   fisher_beta: 0.3
@@ -236,7 +243,7 @@ generator_agent:
   batch_size: ${domains.${domain}.generator_batch_size}
   context_dim: 64
   his_emb_dim: 16
-  ctx_top_k_features: 16
+  ctx_top_k_features: 64
   max_edits_layout: ${domains.${domain}.max_edits_layout}
   max_edits_inventory: ${domains.${domain}.max_edits_inventory}
   reward_w_ce: 7.0
@@ -261,7 +268,7 @@ generator_agent:
 ablation:
   type: "none"
 
-seed: 4
+seed: 1
 force_fresh_start: true         # Set to true to delete old model and start from scratch
 
 # Temporary NPZ path used during MAC WM retraining
@@ -273,4 +280,4 @@ PPO:
   gamma: 0.99
   eps_clip: 0.2
   K_epochs: 2
-  entropy_coef: 0.01
+  entropy_coef: 0.02

@@ -230,23 +230,24 @@ def crafter_classification_loss(
     obj_true, dir_true = crafter_clamp_targets(obj_true, dir_true)
 
     # --- 增加分层加权逻辑 ---
-    obj_weights = None
-    if weighted:
-        # Tiered Weights Map:
-        # Grass=0.5, Standard=1.0, Tools/Animals=10.0, Progress=25.0, HolyGrail=50.0
-        w = torch.ones(CRAFTER_OBJ_CLASSES, device=next_pred.device)
-        w[2] = 0.5   # Grass (Suppress common background)
-        w[8] = 10.0  # Coal
-        w[11] = 10.0 # Table
-        w[12] = 10.0 # Furnace
-        w[14:20] = 10.0 # Mobs (Cow, Zombie, Skeleton, etc)
-        w[9] = 25.0  # Iron
-        w[13] = 25.0 # Player
-        w[10] = 50.0 # Diamond (Highest priority)
-        obj_weights = w.to(obj_logits.device, non_blocking=True)
+    # obj_weights = None
+    # if weighted:
+    #     # Tiered Weights Map:
+    #     # Grass=0.5, Standard=1.0, Tools/Animals=10.0, Progress=25.0, HolyGrail=50.0
+    #     w = torch.ones(CRAFTER_OBJ_CLASSES, device=next_pred.device)
+    #     w[2] = 0.5   # Grass (Suppress common background)
+    #     w[8] = 2.0  # Coal
+    #     w[11] = 2.0 # Table
+    #     w[12] = 2.0 # Furnace
+    #     w[14:20] = 3.0 # Mobs (Cow, Zombie, Skeleton, etc)
+    #     w[9] = 3.0  # Iron
+    #     w[13] = 4.0 # Player
+    #     w[10] = 5.0 # Diamond (Highest priority)
+    #     obj_weights = w.to(obj_logits.device, non_blocking=True)
 
-    # Add label_smoothing=0.1 to prevent model from being overconfident
-    loss_obj = F.cross_entropy(obj_logits, obj_true, weight=obj_weights, reduction=reduction, label_smoothing=0.1)
+    # # Add label_smoothing=0.1 to prevent model from being overconfident
+    # loss_obj = F.cross_entropy(obj_logits, obj_true, weight=obj_weights, reduction=reduction, label_smoothing=0.1)
+    loss_obj = F.cross_entropy(obj_logits, obj_true, reduction=reduction, label_smoothing=0.1)
     loss_dir = F.cross_entropy(dir_logits, dir_true, reduction=reduction, label_smoothing=0.1)
 
     total = loss_obj + loss_dir  # (B, H, W) or scalar
