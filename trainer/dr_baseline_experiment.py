@@ -155,7 +155,8 @@ def run_dr_baseline_experiment(cfg: DictConfig):
 
     # [NEW] Force Fresh Start (Delete existing checkpoint if requested)
     ckpt_path = cfg.attention_model.model_save_path
-    if getattr(cfg, "force_fresh_start", False):
+    force_fresh_start = bool(getattr(cfg, "force_fresh_start", False))
+    if force_fresh_start:
         if os.path.exists(ckpt_path):
             os.remove(ckpt_path)
             print(f"[Fresh Start] Deleted existing checkpoint: {ckpt_path}")
@@ -167,12 +168,17 @@ def run_dr_baseline_experiment(cfg: DictConfig):
 
     # DR usually generates random maps via GeneratorInterface (agent_type='random')
     generator = GeneratorInterface(wm, device, cfg, agent_type='random')
-    fisher_buffer = FisherReplayBuffer(max_size=cfg.attention_model.fisher_buffer_size)
+    fisher_buffer = FisherReplayBuffer(max_size=cfg.attention_model.fisher_buffer_size, contact_positive_ratio=float(getattr(cfg.domains[cfg.domain], "contact_positive_ratio", 0.5))
+)
     
     log_dir = Path(cfg.dr_log_dir)
     os.makedirs(log_dir, exist_ok=True)
     temp_data_dir = Path(cfg.dr_temp_data_dir)
     os.makedirs(temp_data_dir, exist_ok=True)
+    
+    # 强制将所有 UED 收集到的数据存在 dr temp 文件夹中
+    cfg.env.collect.data_folder = str(temp_data_dir) + "/"
+
     mask_suffix = f"_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
     summary_csv_path = log_dir / f"dr_summary_{domain_name}{mask_suffix}.csv"
     file_exists = False
@@ -202,20 +208,23 @@ def run_dr_baseline_experiment(cfg: DictConfig):
 
     # 1.5 Load existing model if available (Resume logic)
     ckpt_path = cfg.attention_model.model_save_path
-    if os.path.exists(ckpt_path):
-        print(f"[System] Found existing checkpoint at {ckpt_path}. Loading weights for resume...")
-        try:
-            ckpt = torch.load(ckpt_path, weights_only=False)
-            if 'state_dict' in ckpt:
-                wm.load_state_dict(ckpt['state_dict'])
-            else:
-                wm.load_state_dict(ckpt)
-            old_params = wm.save_old_params()
-            print("[System] Model weights loaded successfully.")
-        except Exception as e:
-            print(f"[Warning] Failed to load existing model: {e}. Starting from scratch.")
+    if force_fresh_start:
+        print("[System] Fresh-start mode enabled. Skipping checkpoint resume.")
     else:
-        print(f"[System] No existing checkpoint found at {ckpt_path}. Starting from scratch.")
+        if os.path.exists(ckpt_path):
+            print(f"[System] Found existing checkpoint at {ckpt_path}. Loading weights for resume...")
+            try:
+                ckpt = torch.load(ckpt_path, weights_only=False)
+                if 'state_dict' in ckpt:
+                    wm.load_state_dict(ckpt['state_dict'])
+                else:
+                    wm.load_state_dict(ckpt)
+                old_params = wm.save_old_params()
+                print("[System] Model weights loaded successfully.")
+            except Exception as e:
+                print(f"[Warning] Failed to load existing model: {e}. Starting from scratch.")
+        else:
+            print(f"[System] No existing checkpoint found at {ckpt_path}. Starting from scratch.")
 
     # 2. Main Loop
     for iteration in range(cfg.generator_agent.total_iterations):

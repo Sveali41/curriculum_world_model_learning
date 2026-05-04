@@ -91,7 +91,8 @@ jupyterlab_pygments==0.3.0
 jupyterlab_server==2.27.3
 jupyterlab_widgets==3.0.16
 kiwisolver==1.4.9
-KNN-CUDA @ file:///home/siyao/project/RoboCup/robocup_svea/src/Base/common/manipulation/lasr_manipulation_3d_completion/KNN_CUDA
+# Optional local dependency; install separately if your workflow requires it.
+KNN-CUDA
 lightning-utilities==0.11.6
 llvmlite==0.44.0
 lmdb==1.6.2
@@ -107,7 +108,6 @@ msgpack==1.1.0
 msgpack-numpy==0.4.8
 mujoco==3.4.0
 multidict==6.0.5
--e git+https://github.com/Sveali41/curriculum_world_model_learning.git@34feed7eeb6643d29ee27929c03e5cf097d14712#egg=my_research_project
 narwhals==1.26.0
 nbclient==0.10.2
 nbconvert==7.16.6

@@ -292,7 +292,7 @@ class AttentionWorldModel(pl.LightningModule):
                 s_inv_next = inv_next[b:b+1].to(device) if inv_next is not None else None
 
                 # Forward & Backward (fp32)
-                with torch.cuda.amp.autocast(enabled=False):
+                with torch.amp.autocast("cuda", enabled=False):
                     pred, _, s_inv_pred = self(s_obs, s_act, s_info, inv=s_inv)
                     loss_dict = self.loss_function_weight(pred, s_obs_next, s_obs_masked, obs_prev=s_obs)
                     loss_sample = loss_dict['loss_obs']
@@ -446,8 +446,7 @@ class AttentionWorldModel(pl.LightningModule):
         count = 0
 
         # 关闭 autocast，确保 fp32
-        import torch.cuda.amp as amp
-        with amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             for n, p in self.named_parameters():
                 if not p.requires_grad:
                     continue

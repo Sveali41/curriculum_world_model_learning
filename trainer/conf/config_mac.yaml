@@ -11,7 +11,7 @@ domains:
   crafter:
     h: 8
     w: 8
-    grid_shape: [2, 31, 31]
+    grid_shape: [2, 8, 8]
     obs_norm: [20, 5, 0]
     action_norm: 17
     attention_mask: 5
@@ -32,19 +32,20 @@ domains:
     # Runtime will split this by generator_batch_size to get per-rollout max transitions.
     iter_transition_budget: 8000
     generator_batch_size: 8
-    max_edits_layout: 0.6
-    max_edits_inventory: 0.5
+    max_edits_layout: 0.3
+    max_edits_inventory: 0.8
     replay_frac: 0.8
-    lambda_ewc: 10000 #20000.0
+    lambda_ewc: 20 #20000.0
     validation_metric: "mse"
     reward:
-      ce: 10.0
-      inv: 3.5
-      div: 3.0
-      inv_change: 4.0
-      inv_change_norm_slots: 8.0
-      bias: 1.0
-      clip: 50.0
+      ce: 6.0
+      inv: 3.0
+      div: 1
+      inv_change: 2
+      layout_change: 0         # [NEW] 鼓励地形发生动态交互的辅助奖励 (上限 2.0)
+      inv_change_norm_slots: 3.0
+      bias: 0.5
+      clip: 20.0
   
   minigrid:
     h: 8
@@ -150,7 +151,7 @@ domains:
 training_generator:
   map_width: ${domains.${domain}.w}
   map_height: ${domains.${domain}.h}
-  batch_size: 1
+  batch_size: ${domains.${domain}.generator_batch_size}
   lr: 8e-4
   map_element: ${domains.${domain}.map_elements}
   color_element: ${domains.${domain}.color_elements}
@@ -199,6 +200,8 @@ attention_model:
   valid_values_color: [0, 1, 2, 4, 5]
   valid_values_state: [0, 1, 2, 3]
   use_wandb: False
+  # Unified debug switch: turns on WM progress bar and extra WM metric prints.
+  debug_mode: False
   keep_cell_loss: false
   target_validation_keep_cell_loss: false
   frame_stack: 1
@@ -238,7 +241,7 @@ attention_model:
   n_phases_to_collect: 1
 
 generator_agent:
-  total_iterations: 50
+  total_iterations: 60
   # Per-domain override comes from domains.${domain}.generator_batch_size.
   batch_size: ${domains.${domain}.generator_batch_size}
   context_dim: 64
@@ -266,9 +269,9 @@ generator_agent:
   div_reset_interval: 20
 
 ablation:
-  type: "none"
+  type: "no_history" # "none"|"no_diversity"|"no_history"
 
-seed: 1
+seed: 20
 force_fresh_start: true         # Set to true to delete old model and start from scratch
 
 # Temporary NPZ path used during MAC WM retraining
@@ -280,4 +283,5 @@ PPO:
   gamma: 0.99
   eps_clip: 0.2
   K_epochs: 2
-  entropy_coef: 0.02
+  entropy_coef: 0.03
+  buffer_window_rounds: 5

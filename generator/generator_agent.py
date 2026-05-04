@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from collections import deque
 
 from generator.generator_network import MapEditorActorCritic
 from generator.history_encoder import HistoryEncoder
@@ -24,6 +25,10 @@ class GeneratorPPO:
         K_epochs=10,   # Keep K_epochs=10 high to learn efficiently from safe steps
         eps_clip=0.2,
         entropy_coef=0.02,
+        entropy_coef_start=None,
+        entropy_coef_end=None,
+        entropy_anneal_iters=0,
+        buffer_window_rounds=1,
         num_actions=11,
         # ratio=0.25, # removed
         top_k_features=16,
@@ -35,6 +40,10 @@ class GeneratorPPO:
         self.eps_clip = eps_clip
         self.K_epochs = int(K_epochs)
         self.entropy_coef = entropy_coef
+        self.entropy_coef_start = float(entropy_coef if entropy_coef_start is None else entropy_coef_start)
+        self.entropy_coef_end = float(entropy_coef if entropy_coef_end is None else entropy_coef_end)
+        self.entropy_anneal_iters = max(0, int(entropy_anneal_iters))
+        self.buffer_window_rounds = max(1, int(buffer_window_rounds))
         self.context_dim = context_dim
         self.env_type = env_type
         # self.ratio = ratio # removed
@@ -111,6 +120,21 @@ class GeneratorPPO:
             "stats_heat": [],     # Inventory error history [1, 16]
         }
         self.last_mean_reward = 0.0
+        self.last_entropy_coef = float(self.entropy_coef_start)
+        self.round_lengths = deque()
+        self.current_round_count = 0
+
+    def _get_entropy_coef(self, iteration=None):
+        if iteration is None or self.entropy_anneal_iters <= 0:
+            return float(self.entropy_coef)
+        if iteration >= self.entropy_anneal_iters:
+            return float(self.entropy_coef_end)
+
+        progress = float(iteration) / float(max(self.entropy_anneal_iters, 1))
+        return float(
+            self.entropy_coef_start
+            + (self.entropy_coef_end - self.entropy_coef_start) * progress
+        )
 
     # ------------------------------------------------------------------
     # Context
@@ -223,15 +247,29 @@ class GeneratorPPO:
                 self.buffer["stats_heat"].append(torch.zeros((B, stats_dim)))
             else:
                 self.buffer["stats_heat"].append(phs.cpu())
+        self.current_round_count += 1
 
     def clear_buffer(self):
         for k in self.buffer:
             self.buffer[k].clear()
+        self.round_lengths.clear()
+        self.current_round_count = 0
+
+    def _trim_buffer_to_recent_rounds(self):
+        while len(self.round_lengths) > self.buffer_window_rounds:
+            remove_n = int(self.round_lengths.popleft())
+            if remove_n <= 0:
+                continue
+            for k in self.buffer:
+                if remove_n >= len(self.buffer[k]):
+                    self.buffer[k].clear()
+                else:
+                    del self.buffer[k][:remove_n]
 
     # ------------------------------------------------------------------
     # PPO Update
     # ------------------------------------------------------------------
-    def update(self):
+    def update(self, iteration=None):
             """
             PPO 更新逻辑：
             1. 从 Buffer 中提取并处理本轮收集到的所有经验。
@@ -243,6 +281,9 @@ class GeneratorPPO:
             if len(self.buffer["curr_map"]) == 0:
                 print("[GeneratorPPO] Warning: Buffer is empty, skipping update.")
                 return 0.0, 0.0
+            if self.current_round_count > 0:
+                self.round_lengths.append(self.current_round_count)
+                self.current_round_count = 0
 
             # --- Step 1: 基础数据准备与归一化 ---
             rewards = torch.tensor(self.buffer["reward"], device=device)
@@ -251,6 +292,13 @@ class GeneratorPPO:
             mean_reward = rewards.mean().item()
             self.last_mean_reward = mean_reward
             print(f"[GeneratorPPO] Mean Reward: {mean_reward:.4f}")
+            current_entropy_coef = self._get_entropy_coef(iteration)
+            self.last_entropy_coef = current_entropy_coef
+            print(f"[GeneratorPPO] Entropy Coef: {current_entropy_coef:.4f}")
+            print(
+                f"[GeneratorPPO] Buffer Window: {len(self.round_lengths)} round(s), "
+                f"{len(self.buffer['reward'])} samples"
+            )
             
             # 奖励归一化：保证奖励量级稳定
             # FIX: Only normalize if there is variance. If all rewards are -5.0 (failure),
@@ -327,7 +375,7 @@ class GeneratorPPO:
                 # - Entropy Loss: 不要太大，否则会强迫生成器永远随机乱下棋 (Reduced from 0.05 to 0.01 for stability)
                 loss_policy = -torch.min(surr1, surr2).mean()
                 loss_value = 0.5 * self.mse(value, rewards)
-                loss_entropy = -self.entropy_coef * entropy.mean()
+                loss_entropy = -current_entropy_coef * entropy.mean()
 
                 total_loss = loss_policy + loss_value + loss_entropy
                 
@@ -354,7 +402,7 @@ class GeneratorPPO:
             # --- Step 5: 状态同步与清理 ---
             # 更新完成后，将旧策略同步到最新状态，并清空 Buffer 迎接下一轮采样
             self.policy_old.load_state_dict(self.policy.state_dict())
-            self.clear_buffer()
+            self._trim_buffer_to_recent_rounds()
             
             # [MODIFIED] Return entropy for monitoring
             return last_loss, entropy.mean().item()
@@ -363,16 +411,14 @@ class GeneratorPPO:
     # Save / Load
     # ------------------------------------------------------------------
     def save(self, path):
-        torch.save(
-            {
-                "policy": self.policy.state_dict(),
-                "encoder": self.encoder.state_dict(),
-            },
-            path,
-        )
+        save_dict = {"policy": self.policy.state_dict()}
+        if self.encoder is not None:
+            save_dict["encoder"] = self.encoder.state_dict()
+        torch.save(save_dict, path)
 
     def load(self, path):
         ckpt = torch.load(path, map_location=device)
         self.policy.load_state_dict(ckpt["policy"])
         self.policy_old.load_state_dict(ckpt["policy"])
-        self.encoder.load_state_dict(ckpt["encoder"])
+        if self.encoder is not None and "encoder" in ckpt:
+            self.encoder.load_state_dict(ckpt["encoder"])

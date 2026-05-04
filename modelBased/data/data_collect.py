@@ -538,6 +538,7 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     domain_cfg = getattr(getattr(cfg, "domains", None), "bipedalwalker", None) if is_bipedal else None
 
     # --- 1. Exhaustive Shuffled Queue for 100% Coverage ---
+
     ground_tiles_queue = []
     if randomize_inventory and is_crafter:
         cg = env.unwrapped.char_grid

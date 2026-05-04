@@ -1,4 +1,5 @@
 import os
+import warnings
 
 import torch
 ROOTPATH = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -18,6 +19,18 @@ import wandb
 import numpy as np
 from modelBased.common.utils import TRAINER_PATH
 from omegaconf import open_dict
+
+
+warnings.filterwarnings(
+    "ignore",
+    message=r".*val_dataloader.*sampler has shuffling enabled.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*does not have many workers which may be a bottleneck.*",
+    category=UserWarning,
+)
 
 
 # === Define Custom Datamodule for Validation ===
@@ -167,6 +180,9 @@ def run(
     )
 
     # trainer
+    debug_mode = bool(getattr(cfg.attention_model, "debug_mode", False))
+    show_progress_bar = bool(getattr(cfg.attention_model, "enable_progress_bar", debug_mode))
+
     trainer = pl.Trainer(
         precision=32,
         logger=wandb_logger if use_wandb else None,
@@ -176,7 +192,7 @@ def run(
         gradient_clip_val=1.0,
         callbacks=[early_stop_callback, checkpoint_callback],
         deterministic=False,
-        enable_progress_bar=True,
+        enable_progress_bar=show_progress_bar,
     )
 
 

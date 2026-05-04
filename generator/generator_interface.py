@@ -36,10 +36,12 @@ class GeneratorInterface:
         self.device = device
         self.cfg = cfg
         self.agent_type = agent_type
+        self.ablation_type = getattr(getattr(cfg, "ablation", None), "type", "none")
         hparams = cfg.generator_agent
         self.batch_size = hparams.batch_size
         self.support = Support(cfg)
         self.wm = world_model
+        self.debug_mode = bool(getattr(cfg.attention_model, "debug_mode", False))
         self.use_elites = getattr(hparams, "use_elites", True)
         
         self.use_elites = getattr(hparams, "use_elites", True)
@@ -104,6 +106,10 @@ class GeneratorInterface:
                 K_epochs=int(getattr(ppo_cfg, "K_epochs", 10)) if ppo_cfg is not None else 10,
                 eps_clip=float(getattr(ppo_cfg, "eps_clip", 0.2)) if ppo_cfg is not None else 0.2,
                 entropy_coef=float(getattr(ppo_cfg, "entropy_coef", 0.05)) if ppo_cfg is not None else 0.05,
+                entropy_coef_start=float(getattr(ppo_cfg, "entropy_coef_start", getattr(ppo_cfg, "entropy_coef", 0.05))) if ppo_cfg is not None else 0.05,
+                entropy_coef_end=float(getattr(ppo_cfg, "entropy_coef_end", getattr(ppo_cfg, "entropy_coef", 0.05))) if ppo_cfg is not None else 0.05,
+                entropy_anneal_iters=int(getattr(ppo_cfg, "entropy_anneal_iters", 0)) if ppo_cfg is not None else 0,
+                buffer_window_rounds=int(getattr(ppo_cfg, "buffer_window_rounds", 1)) if ppo_cfg is not None else 1,
             )
         
         self.div_k = hparams.div_k
@@ -748,7 +754,7 @@ class GeneratorInterface:
                 valid_trajs.append(traj)
                 next_maps.append(self._map_to_tensor(final_map_3ch))
                 next_heats_terrain.append(torch.tensor(errors['terrain'], dtype=torch.float32, device=self.device).view(1, 1, self.map_height, self.map_width))
-                if not self.is_bipedal:
+                if self.debug_mode and (not self.is_bipedal):
                     h_map = errors['terrain']
                     if h_map.max() > 1e-6:
                         y, x = np.unravel_index(np.argmax(h_map), h_map.shape)
@@ -1205,6 +1211,30 @@ class GeneratorInterface:
         minigrid_norm_dist=0.0,
     ):
         if is_warmup:
+            if self.is_crafter:
+                reward_cfg = self.crafter_reward_cfg
+                w_div = float(getattr(reward_cfg, "div", getattr(self.cfg.generator_agent, "reward_w_div", 3.0)))
+                w_inv_change = float(getattr(reward_cfg, "inv_change", getattr(self.cfg.generator_agent, "reward_w_inv_change", 0.0)))
+                inv_change_norm_slots = float(getattr(reward_cfg, "inv_change_norm_slots", getattr(self.cfg.generator_agent, "inv_change_norm_slots", 8.0)))
+                bias = float(getattr(reward_cfg, "bias", getattr(self.cfg.generator_agent, "reward_bias", 1.0)))
+                reward_clip = float(getattr(reward_cfg, "clip", getattr(self.cfg.generator_agent, "reward_clip", 50.0)))
+
+                inv_changed = max(float(inv_diversity), 0.0)
+                inv_norm = max(inv_change_norm_slots, 1e-6)
+                inv_change_bonus = min(inv_changed / inv_norm, 1.0)
+
+                # [ABLATION] no_diversity: zero out diversity + inv_change rewards
+                if self.ablation_type == "no_diversity":
+                    div_score = 0.0
+                    inv_change_bonus = 0.0
+
+                reward = (
+                    w_div * float(div_score)
+                    + w_inv_change * inv_change_bonus
+                    + bias
+                )
+                return float(np.clip(reward, -reward_clip, reward_clip))
+
             w_survival = float(getattr(self.bipedal_reward_cfg, "survival", 0.08)) if self.is_bipedal else 0.0
             return 1.0 + div_score * 5.0 + w_survival * avg_ep_len
         
@@ -1259,6 +1289,11 @@ class GeneratorInterface:
             inv_changed = max(float(inv_diversity), 0.0)
             inv_norm = max(inv_change_norm_slots, 1e-6)
             inv_change_bonus = min(inv_changed / inv_norm, 1.0)
+
+            # [ABLATION] no_diversity: zero out diversity + inv_change rewards
+            if self.ablation_type == "no_diversity":
+                div_score = 0.0
+                inv_change_bonus = 0.0
             reward = (
                 w_ce * ce_term
                 + w_inv * inv_term
@@ -1308,8 +1343,6 @@ class GeneratorInterface:
     def _map_to_tensor(self, m):
         return torch.tensor(m, device=self.device).float().unsqueeze(0)
 
-    def update(self):
-        loss, ent = self.ppo.update()
-        return loss, ent, self.ppo.last_mean_reward
-        loss, ent = self.ppo.update()
+    def update(self, iteration=None):
+        loss, ent = self.ppo.update(iteration=iteration)
         return loss, ent, self.ppo.last_mean_reward

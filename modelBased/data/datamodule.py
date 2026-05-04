@@ -424,23 +424,25 @@ class WMRLDataModule(pl.LightningDataModule):
             self.data_test = torch.utils.data.Subset(data, range(split_size, len(data)))
 
     def train_dataloader(self):
+        num_workers = int(getattr(self.cfg, "n_cpu", 0))
         return DataLoader(
             self.data_train, 
             batch_size=self.cfg.batch_size, 
             shuffle=True,
             drop_last=True,
-            num_workers=0,
+            num_workers=num_workers,
             pin_memory=True,
-            persistent_workers=False
+            persistent_workers=bool(num_workers > 0)
         )
 
     def val_dataloader(self):
+        num_workers = int(getattr(self.cfg, "n_cpu", 0))
         return DataLoader(
             self.data_test, 
             batch_size=self.cfg.batch_size, 
-            shuffle=True,
+            shuffle=False,
             drop_last=False,
-            num_workers=0,
+            num_workers=num_workers,
             pin_memory=True,
-            persistent_workers=False
+            persistent_workers=bool(num_workers > 0)
         )

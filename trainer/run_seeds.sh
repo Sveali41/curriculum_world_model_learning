@@ -4,7 +4,7 @@
 
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
-for SEED in 0 1 2 3 4; do
+for SEED in 2 3 4; do
     echo "=========================================================="
     echo "PHASE: Running Seed $SEED"
     echo "=========================================================="
@@ -59,6 +59,23 @@ done
 # done
 
 
+
+# ====== Crafter Ablation Experiments ======
+# Ablation 1: MAC without Diversity Reward (no_diversity)
+# for SEED in 0 1 2 3 4; do
+#     echo "=========================================================="
+#     echo "ABLATION: no_diversity | Seed $SEED"
+#     echo "=========================================================="
+#     python trainer/mac_wm_learning.py seed=$SEED ablation.type=no_diversity
+# done
+
+# Ablation 2: MAC without History Encoder (no_history)
+# for SEED in 0 1 2 3 4; do
+#     echo "=========================================================="
+#     echo "ABLATION: no_history | Seed $SEED"
+#     echo "=========================================================="
+#     python trainer/mac_wm_learning.py seed=$SEED ablation.type=no_history
+# done
 
 
 echo "All experiments for seeds 1-5 have been successfully completed!"

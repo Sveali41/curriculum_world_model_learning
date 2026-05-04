@@ -2,6 +2,7 @@
 import numpy as np
 import torch
 
+
 class RandomGeneratorAgent:
     def __init__(self, num_actions, device='cuda'):
         self.num_actions = num_actions
@@ -57,12 +58,11 @@ class RandomGeneratorAgent:
         # Slots 0-15 (Key 16-31): Inc by 5
         num_keys = 32
         
-        # [Fix] Treat max_stats_edit_ratio as an independent probability for each slot
-        # This completely removes the artificial constraint of exactly 'k' items, 
-        # unlocking true power-set permutations just like independent PPO outputs.
-        p = max(0.0, min(1.0, max_stats_edit_ratio))
+        # [Fix] Sample a random probability for this batch to ensure uniform distribution of inventory richness
+        # Instead of using max_stats_edit_ratio as a fixed p, we sample p ~ Uniform(0, max_stats_edit_ratio)
+        current_p = np.random.uniform(0.0, max_stats_edit_ratio)
         rand_tensor = torch.rand((B, num_keys), device=self.device)
-        stats_action = (rand_tensor < p).float()
+        stats_action = (rand_tensor < current_p).float()
             
         # --- 3. Dummies ---
         logprob = torch.zeros(B, device=self.device)

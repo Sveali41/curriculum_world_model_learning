@@ -22,7 +22,7 @@ p2e:
       transitions_per_collection: 7000  # 1400 * 5 * 20 = 140000
       updates_per_target: 1
     crafter:
-      transitions_per_collection: 2000
+      transitions_per_collection: 4000
       updates_per_target: 5
     bipedalwalker:
       transitions_per_collection: 2000

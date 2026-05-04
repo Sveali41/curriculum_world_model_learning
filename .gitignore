@@ -1,6 +1,7 @@
 /modelBased/wandb/
 wandb/
 outputs/
+.env
 
 # Ignore Python bytecode files
 __pycache__/
@@ -18,9 +19,12 @@ generator/visualize
 modelBased/models/
 modelBased/log/
 lightning_logs
+*.ckpt
 
 
 # ignore trainer files
 trainer/logs
-# trainer/data
+trainer/data
+trainer/results
+trainer/*.png
 my_research_project.egg-info/

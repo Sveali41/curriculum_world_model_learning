@@ -215,6 +215,10 @@ def adversarial_ued_training(cfg: DictConfig):
     )
     os.makedirs(temp_data_dir, exist_ok=True)
     
+    # 强制将所有 UED 收集到的数据存在 mac temp 文件夹中
+    cfg.env.collect.data_folder = str(temp_data_dir) + "/"
+
+    
     # [TARGET DATA] Domain-specific fixed target datasets
     target_data_dir = data_save_dir
     domain_cfg = cfg.domains[env_type] if hasattr(cfg, "domains") and env_type in cfg.domains else None
@@ -258,7 +262,8 @@ def adversarial_ued_training(cfg: DictConfig):
                         "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
                         "gen_val_val_inv_loss", "gen_val_val_ce_loss", "gen_val_avg_val_loss_wm",
                         "target_val_val_inv_loss", "target_val_val_ce_loss", "target_val_avg_val_loss_wm",
-                        "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len"
+                        "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
+                        "Inv_Change_Ratio"
                     ]
                 writer.writerow(csv_header)
                 print(f"[Logger] Experiment summary initialized at {summary_csv_path}")
@@ -348,6 +353,7 @@ def adversarial_ued_training(cfg: DictConfig):
         print(
             f"\n=== Iteration {iteration + 1}/{total_iterations} ==="
         )
+        inv_change_ratio = 0.0
 
         # --------------------------------------------------------
         # Step 0: Transition Handling (Warmup -> Adversarial)
@@ -433,6 +439,19 @@ def adversarial_ued_training(cfg: DictConfig):
                 buffer_input["inv"] = new_batch["inv"]
             if new_batch.get('inv_next') is not None:
                 buffer_input["inv_next"] = new_batch["inv_next"]
+                try:
+                    inv_cur = new_batch.get("inv")
+                    inv_nxt = new_batch.get("inv_next")
+                    if inv_cur is not None and inv_nxt is not None:
+                        if torch.is_tensor(inv_cur):
+                            inv_cur = inv_cur.detach().cpu().numpy()
+                        if torch.is_tensor(inv_nxt):
+                            inv_nxt = inv_nxt.detach().cpu().numpy()
+                        delta = np.abs(inv_nxt.astype(np.float32) - inv_cur.astype(np.float32))
+                        inv_change_ratio = float((delta > 1e-6).mean())
+                except Exception as e:
+                    print(f"[Warning] Failed to compute Inv_Change_Ratio: {e}")
+                    inv_change_ratio = 0.0
             # Moved buffer update to AFTER training (Step 4.5) to prevent double counting
 
 
@@ -443,7 +462,7 @@ def adversarial_ued_training(cfg: DictConfig):
         # Generator trains from the start (Iter 0).
         if True:
             # [MODIFIED] Now returns entropy
-            gen_loss, gen_entropy, gen_mean_reward = gen_interface.update()
+            gen_loss, gen_entropy, gen_mean_reward = gen_interface.update(iteration=iteration)
 
             if gen_loss is not None:
                 print(
@@ -537,6 +556,19 @@ def adversarial_ued_training(cfg: DictConfig):
             )
             # Update old_params from the result dict for next iteration
             old_params = train_res.get("old_params")
+
+            # Explicit console metrics for quick EWC diagnosis when wandb is disabled.
+            ewc_term_val = train_res.get("ewc_term", train_res.get("train/ewc_term", None))
+            loss_weighted_val = train_res.get("loss_weighted", train_res.get("train/loss_weighted", None))
+            inv_loss_val = train_res.get("inv_loss", train_res.get("train/inv_loss", None))
+            debug_mode = bool(getattr(cfg.attention_model, "debug_mode", False))
+            if debug_mode and ((ewc_term_val is not None) or (loss_weighted_val is not None) or (inv_loss_val is not None)):
+                print(
+                    "[WM Metrics] "
+                    f"ewc_term={float(ewc_term_val) if ewc_term_val is not None else float('nan'):.6f} | "
+                    f"loss_weighted={float(loss_weighted_val) if loss_weighted_val is not None else float('nan'):.6f} | "
+                    f"inv_loss={float(inv_loss_val) if inv_loss_val is not None else float('nan'):.6f}"
+                )
             
             # Step 4.2: Delete Temp Data After Training (阅后即焚)
             if current_data_path and os.path.exists(current_data_path):
@@ -581,10 +613,10 @@ def adversarial_ued_training(cfg: DictConfig):
         # We do this AFTER training so that 'replay_data' (used in training) 
         # strictly contains PAST data, while 'curr_data' contains CURRENT data.
         if buffer_input is not None and not is_warmup_for_wm:
-             fisher_buffer.update_combined(
+             fisher_buffer.add_from_batch(
                 buffer_input,
-                cfg.attention_model.current_sample_ratio,
-                cfg.attention_model.fisher_buffer_elements_ratio,
+                current_sample_ratio=cfg.attention_model.current_sample_ratio,
+                fisher_buffer_elements_ratio=cfg.attention_model.fisher_buffer_elements_ratio,
             )
              print(
                 f"[Buffer] Archived {new_data_size} transitions. "
@@ -747,7 +779,8 @@ def adversarial_ued_training(cfg: DictConfig):
                                 "New_Data_Size": new_data_size,
                                 "Buffer_Size": len(fisher_buffer),
                                 "Solvable_Count": f"{gen_solvable_count}",
-                                "Avg_Path_Len": f"{gen_avg_ep_len:.2f}"
+                                "Avg_Path_Len": f"{gen_avg_ep_len:.2f}",
+                                "Inv_Change_Ratio": f"{inv_change_ratio:.6f}"
                             }
 
                     writer = csv.writer(f)
@@ -761,7 +794,8 @@ def adversarial_ued_training(cfg: DictConfig):
         # --------------------------------------------------------
         # Delete generated trajectory files for this iteration to save space
         # Pattern matches UED_Dual_iter{iteration}_b{idx}_test_{explore_type}.npz
-        temp_files = glob.glob(str(data_save_dir / f"UED_Dual_iter{iteration}_b*.npz"))
+        # Use the runtime collection folder (temp_data_dir) to avoid path drift.
+        temp_files = glob.glob(str(temp_data_dir / f"UED_Dual_iter{iteration}_b*.npz"))
         if temp_files:
             print(f"[Cleanup] Deleting {len(temp_files)} temporary files for Iteration {iteration}...")
             for f in temp_files:
