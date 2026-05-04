@@ -229,7 +229,7 @@ def crafter_classification_loss(
 
     obj_true, dir_true = crafter_clamp_targets(obj_true, dir_true)
 
-    # --- 增加分层加权逻辑 ---
+    # --- Optional tiered weighting logic ---
     # obj_weights = None
     # if weighted:
     #     # Tiered Weights Map:
@@ -293,24 +293,24 @@ def visualize_crafter_wm(
     if obs_next_masked.ndim == 4: obs_next_masked = obs_next_masked[0]
     if obs_pred_logits.ndim == 4: obs_pred_logits = obs_pred_logits[0]
         
-    # 1. 提取预测 ID 和 不确定性
+    # 1. Extract predicted IDs and uncertainty.
     obj_logits = obs_pred_logits[:CRAFTER_OBJ_CLASSES]  
     obj_probs = F.softmax(obj_logits, dim=0)
     obj_pred = obj_probs.argmax(dim=0).detach().cpu().numpy()
     confidence = obj_probs.max(dim=0)[0].detach().cpu().numpy()
     uncertainty = 1.0 - confidence
     
-    # 2. 获取真实观测
+    # 2. Read the ground-truth observation.
     obj_curr = obs_masked[0].detach().cpu().numpy()
     obj_next = obs_next_masked[0].detach().cpu().numpy()
     
-    # 3. 计算 Error Map (必须在裁剪前，基于完整预测和真实值计算)
+    # 3. Compute the error map before cropping.
     error_map = (obj_pred != obj_next).astype(np.float32)
 
-    # --- 改进：基于地图尺寸和 Agent 位置进行精确裁剪 ---
+    # --- Crop precisely using the map size and agent position ---
     mask_size = obs_masked.shape[-1]
     half = mask_size // 2
-    # 确保坐标是整数
+    # Ensure integer coordinates.
     ay, ax = int(agent_pos[0]), int(agent_pos[1])
     H, W = int(full_map_size[0]), int(full_map_size[1])
     
@@ -319,7 +319,7 @@ def visualize_crafter_wm(
     x_start = half - ax
     x_end = x_start + W
     
-    # 确保切片不越界
+    # Keep slice bounds within the valid region.
     y_start, y_end = max(0, y_start), min(mask_size, y_end)
     x_start, x_end = max(0, x_start), min(mask_size, x_end)
 
@@ -331,19 +331,19 @@ def visualize_crafter_wm(
     
     h_crop, w_crop = obj_curr.shape
         
-    # --- 改进：定义符合直觉的 Crafter 颜色映射 ---
+    # --- Define an intuitive Crafter color palette ---
     # 0=Empty, 1=Water, 2=Grass, 3=Stone, 4=Path, 5=Sand, 6=Tree, 7=Lava, 8=Coal, 9=Iron, 10=Diamond, 11=Table, 12=Furnace
     # 13=Player, 14=Cow, 15=Zombie, 16=Skeleton, 17=Arrow, 18=Plant, 19=Fence
     from matplotlib.colors import ListedColormap
     colors = [
         '#000000', # 0: None (Black)
         '#1E90FF', # 1: Water (Dodger Blue)
-        '#32CD32', # 2: Grass (Lime Green) - 改为绿色
+        '#32CD32', # 2: Grass (Lime Green)
         '#888888', # 3: Stone (Grey)
         '#964B00', # 4: Path (Brown)
         '#FFFFBB', # 5: Sand (Yellowish)
         '#006400', # 6: Tree (Dark Green)
-        '#FFA500', # 7: Lava (Orange-Yellow) - 改为橙黄色，与 Agent 区分
+        '#FFA500', # 7: Lava (Orange-Yellow)
         '#333333', # 8: Coal (Grey/Black)
         '#CCCCCC', # 9: Iron (Light Grey)
         '#00FFFF', # 10: Diamond (Cyan)
@@ -351,17 +351,17 @@ def visualize_crafter_wm(
         '#331100', # 12: Furnace (Darker)
         '#FF0000', # 13: Player (Red)
         '#FFFFFF', # 14: Cow (White)
-        '#9400D3', # 15: Zombie (Dark Violet) - 改为紫色，避开草地绿色
+        '#9400D3', # 15: Zombie (Dark Violet)
         '#EEEEEE', # 16: Skeleton (Bone)
         '#FFFF00', # 17: Arrow (Yellow)
         '#ADFF2F', # 18: Plant (Green Yellow)
         '#442200', # 19: Fence (Wood)
     ]
-    # 如果类别数超过颜色数，补齐
+    # Extend the palette if the class count exceeds the predefined colors.
     while len(colors) < CRAFTER_OBJ_CLASSES: colors.append('#333333')
     cmap = ListedColormap(colors)
     
-    # 创建 2x3 的布局
+    # Create a 2x3 panel layout.
     fig, axes = plt.subplots(2, 3, figsize=(18, 11))
     axes = axes.flatten()
     
@@ -379,7 +379,7 @@ def visualize_crafter_wm(
     axes[2].set_title(f"True Observed (T+1)")
     
     # Panel 3: Error Map (Correctness)
-    # 使用 binary 映射，黄色代表错，紫色代表对
+    # Use a binary map to highlight incorrect vs. correct predictions.
     im3 = axes[3].imshow(error_map, cmap="viridis", vmin=0, vmax=1)
     axes[3].set_title(f"Error Map (Yellow=Wrong)")
     plt.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.04)
@@ -428,12 +428,12 @@ def visualize_crafter_wm(
         axes[5].add_patch(mpatches.Rectangle((x_pos, y_pos), 0.05, 0.08, color=color, transform=axes[5].transAxes))
         axes[5].text(x_pos + 0.07, y_pos + 0.02, label, fontsize=10, transform=axes[5].transAxes)
     
-    # 给所有格子加网格线，清晰展示 layout
+    # Add grid lines for a clearer layout view.
     for i in range(5):
         axes[i].set_xticks(np.arange(-.5, w_crop, 1), minor=True)
         axes[i].set_yticks(np.arange(-.5, h_crop, 1), minor=True)
         axes[i].grid(which='minor', color='w', linestyle='-', linewidth=0.5, alpha=0.3)
-        # 隐藏刻度和标签，不使用 labelsize=0 以免触发警告
+        # Hide ticks and labels without triggering Matplotlib warnings.
         axes[i].set_xticklabels([])
         axes[i].set_yticklabels([])
         axes[i].tick_params(which='both', size=0)

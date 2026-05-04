@@ -20,9 +20,9 @@ except ImportError as e:
         'Box2D is not installed, you can install it by run `pip install swig` followed by `pip install "gymnasium[box2d]"`'
     ) from e
 
-# --- 原生常量 ---
+# --- Core constants ---
 FPS = 50
-SCALE = 30.0  # 物理缩放不能改，否则物理引擎会崩
+SCALE = 30.0  # Keep fixed to preserve stable Box2D dynamics.
 MOTORS_TORQUE = 80
 SPEED_HIP = 4
 SPEED_KNEE = 6
@@ -32,10 +32,10 @@ HULL_POLY = [(-30, +9), (+6, +9), (+34, +1), (+34, -8), (-30, -8)]
 LEG_DOWN = -8 / SCALE
 LEG_W, LEG_H = 8 / SCALE, 34 / SCALE
 
-# --- 窗口常量 (按需缩减 1/4) ---
+# --- Viewport constants ---
 VIEWPORT_W = 900 
 VIEWPORT_H = 400
-# 全局视角下的缩放倍率 (适配 900 宽度的窗口)
+# Global-view scaling tuned for the 900-pixel viewport width.
 GLOBAL_SCALE = 9.5 
 
 TERRAIN_STEP = 14 / SCALE
@@ -45,7 +45,7 @@ TERRAIN_GRASS = 10
 TERRAIN_STARTPAD = 20
 FRICTION = 2.5
 
-# --- 物理定义 ---
+# --- Physics definitions ---
 HULL_FD = fixtureDef(
     shape=polygonShape(vertices=[(x / SCALE, y / SCALE) for x, y in HULL_POLY]),
     density=5.0,
@@ -78,7 +78,7 @@ class BipedalWalkerCustom(BipedalWalker):
         super().__init__(render_mode=render_mode, hardcore=hardcore)
         self.custom_layout = None
         self.terrain_roughness = 1.0
-        self.use_global_view = True # 默认开启上帝视角
+        self.use_global_view = True # Enable the global overview by default.
         
     def set_custom_layout(self, layout_list):
         self.custom_layout = layout_list
@@ -111,7 +111,7 @@ class BipedalWalkerCustom(BipedalWalker):
                 leg.linearVelocity = (0, 0)
                 leg.angularVelocity = 0
             
-            # 4. Refresh observation to reflect new state by taking a dummy step
+            # 4. Refresh the observation with a zero-action step.
             obs, _, _, _, _ = super().step(np.zeros(4, dtype=np.float32))
 
         return obs, info
@@ -244,7 +244,7 @@ class BipedalWalkerCustom(BipedalWalker):
             self.terrain_poly.append((poly, color))
         self.terrain.reverse()
 
-    # --- 覆盖渲染函数，专门开发全局视角 ---
+    # --- Override rendering to support the full-course global view ---
     def render(self):
         if self.render_mode is None: return
         try:
@@ -253,8 +253,9 @@ class BipedalWalkerCustom(BipedalWalker):
         except ImportError as e:
             raise DependencyNotInstalled('pygame is not installed') from e
 
-        # 如果开启上帝视角，我们动态调整视角
-        # 跑道总长约 93.3 物理单位。如果缩放到 11.0 倍，总宽 = 1026 像素。完美适配 1200 宽窗口。
+        # Adjust the camera dynamically when global view is enabled.
+        # The full track is about 93.3 physics units long; scaling by 11.0
+        # yields roughly 1026 pixels, which fits a 1200px-wide window well.
         scl = GLOBAL_SCALE if self.use_global_view else SCALE
         scroll_val = 0 if self.use_global_view else self.scroll
         
@@ -266,25 +267,25 @@ class BipedalWalkerCustom(BipedalWalker):
             self.clock = pygame.time.Clock()
 
         self.surf = pygame.Surface((VIEWPORT_W, VIEWPORT_H))
-        self.surf.fill((215, 215, 255)) # 背景色
+        self.surf.fill((215, 215, 255))  # Background color
 
-        # 绘制云朵 (上帝视角下取消位差，让云铺满全场)
+        # Draw clouds. In global view, remove parallax so they span the full course.
         offset_x = 20 if self.use_global_view else -scroll_val * scl
         for poly, x1, x2 in self.cloud_poly:
-            # 移除 0.5 的系数，让云的坐标和地面 1:1 对应
+            # Remove the 0.5 factor so cloud coordinates align 1:1 with the ground.
             cloud_scl = scl if self.use_global_view else scl * 0.5
             cloud_off = offset_x if self.use_global_view else offset_x * 0.5
             scaled_poly = [((p[0]*cloud_scl + cloud_off), p[1]*scl) for p in poly]
             pygame.draw.polygon(self.surf, color=(255, 255, 255), points=scaled_poly)
             gfxdraw.aapolygon(self.surf, scaled_poly, (255, 255, 255))
 
-        # 绘制地形
+        # Draw terrain.
         for poly, color in self.terrain_poly:
             if not self.use_global_view:
                 if poly[1][0] < scroll_val: continue
                 if poly[0][0] > scroll_val + VIEWPORT_W / scl: continue
             
-            # 由于是上帝视角，我们把起点挪到稍微靠左的位置
+            # In global view, shift the origin slightly left for framing.
             offset_x = 20 if self.use_global_view else -scroll_val * scl
             scaled_poly = []
             for coord in poly:
@@ -292,13 +293,13 @@ class BipedalWalkerCustom(BipedalWalker):
             pygame.draw.polygon(self.surf, color=color, points=scaled_poly)
             gfxdraw.aapolygon(self.surf, scaled_poly, color)
 
-        # 绘制旗帜 (红色小三角)
+        # Draw the goal flag (red triangle).
         flag_x = (TERRAIN_STEP * (TERRAIN_LENGTH-TERRAIN_GRASS)) * scl + (20 if self.use_global_view else -scroll_val * scl)
         flag_y1 = TERRAIN_HEIGHT * scl
-        flag_y2 = flag_y1 + 50 # 旗杆顶端
+        flag_y2 = flag_y1 + 50  # Top of the flagpole
         pygame.draw.line(self.surf, (0,0,0), (flag_x, flag_y1), (flag_x, flag_y2), 2)
         
-        # 红色三角形旗帜坐标
+        # Coordinates of the red triangular flag.
         flag_poly = [
             (flag_x, flag_y2), 
             (flag_x, flag_y2 - 15), 
@@ -306,7 +307,7 @@ class BipedalWalkerCustom(BipedalWalker):
         ]
         pygame.draw.polygon(self.surf, color=(230, 51, 0), points=flag_poly)
 
-        # 绘制所有物体 (机器人)
+        # Draw all dynamic bodies, including the robot.
         offset_x = 20 if self.use_global_view else -scroll_val * scl
         for obj in self.drawlist:
             for f in obj.fixtures:
@@ -331,7 +332,8 @@ class BipedalWalkerCustom(BipedalWalker):
             self.clock.tick(self.metadata["render_fps"])
             pygame.display.flip()
         
-        # 无论哪种模式，都返回画面缓冲，这样 data_collect 或 wandb 去调用时总能正常获取而不是拿到 None
+        # Always return the frame buffer so data collection and W&B logging
+        # can consume a valid image instead of None.
         return np.transpose(
             np.array(pygame.surfarray.pixels3d(self.surf)), axes=(1, 0, 2)
         )

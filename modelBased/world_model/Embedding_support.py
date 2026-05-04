@@ -23,12 +23,12 @@ class EmbeddingModule(nn.Module):
         self.bn2 = nn.BatchNorm2d(embed_dim)
         self.relu = nn.ReLU(inplace=True)
 
-        # 2. 展平操作，将 (B, embed_dim, H, W) 展平为 (B, embed_dim, H*W)
+        # Flatten spatial dimensions from (B, embed_dim, H, W) to (B, embed_dim, H*W).
         self.flatten = nn.Flatten(2)
-        # 位置编码：为每个 patch 学习一个位置编码，形状为 (1, height*width, embed_dim)
+        # Learn one positional embedding per patch with shape (1, H*W, embed_dim).
         self.pos_embedding = nn.Parameter(torch.randn(1, mask_size * mask_size, embed_dim))
 
-        # 3. 动作嵌入：将离散动作编码为与 embed_dim 相同的向量
+        # Action fusion projects action information into the same embedding space.
         self.fuse_fc = nn.Linear(embed_dim * 2, embed_dim)
 
         self.pre_fc1 = nn.Linear(embed_dim, 2 * embed_dim)
@@ -37,8 +37,8 @@ class EmbeddingModule(nn.Module):
 
     def forward(self, state, action):
         orginal_dim = state.ndim
-        if orginal_dim == 3:  # 单个样本
-            state = state.unsqueeze(0)  # 变为 (1, C, H, W)
+        if orginal_dim == 3:  # Single sample
+            state = state.unsqueeze(0)  # Expand to (1, C, H, W).
             action = torch.tensor([action]).to(state.device)
         B, C, H, W = state.size()
         
@@ -59,21 +59,21 @@ class EmbeddingModule(nn.Module):
 
         x = self.relu(self.bn1(self.conv1(state_emb)))
         x = self.relu(self.bn2(self.conv2(x)))
-        # 2. 展平空间维度，将 (B, embed_dim, 5, 5) 转换为 (B, embed_dim, 25)
+        # Flatten spatial dimensions from (B, embed_dim, H, W) to (B, embed_dim, H*W).
         x = self.flatten(x)
-        # 转置为 (B, 25, embed_dim) 作为 Transformer 的输入
+        # Transpose to (B, H*W, embed_dim) for transformer-style token processing.
         x = x.transpose(1, 2)
-        # 3. 添加位置编码
+        # Add positional embeddings.
         x = x + self.pos_embedding  # (B, 25, embed_dim)
 
-        # 4. 融合动作信息
-        # 假设 action 为离散变量，shape (B,)
-        # 将 action_emb 扩展至 (B, 25, embed_dim)（对每个 token都添加相同的动作信息）
+        # Fuse action information.
+        # `action` is assumed to be discrete with shape (B,).
+        # Broadcast `action_emb` to every spatial token.
         action_emb = action_emb.unsqueeze(1).expand(-1, x.size(1), -1)
         fused = torch.cat([x, action_emb], dim=-1)  # (B, 25, embed_dim*2)
         x = self.fuse_fc(fused)  # (B, 25, embed_dim)
 
-        # 5. 预测
+        # Prediction head.
         x = self.pre_fc1(x)
         x = self.pre_fc2(x)
         x = self.pre_fc3(x)
@@ -88,5 +88,4 @@ class EmbeddingModule(nn.Module):
 
 
     
-
 

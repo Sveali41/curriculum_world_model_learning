@@ -42,7 +42,7 @@ domains:
       inv: 3.0
       div: 1
       inv_change: 2
-      layout_change: 0         # [NEW] 鼓励地形发生动态交互的辅助奖励 (上限 2.0)
+      layout_change: 0         # Auxiliary reward for dynamic terrain interactions
       inv_change_norm_slots: 3.0
       bias: 0.5
       clip: 20.0

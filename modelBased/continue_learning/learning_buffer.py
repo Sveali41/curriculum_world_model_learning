@@ -7,14 +7,14 @@ class EnvLearningBuffer:
         self.max_size = max_size
 
     def add(self, entity: dict):
-        """添加一个环境 entry（dict）"""
+        """Add one environment entry (dict)."""
         self.list.append(entity)
         if len(self.list) > self.max_size:
-            self.list = self.list[-self.max_size:]  # 保留最新的 max_size 个
+            self.list = self.list[-self.max_size:]  # Keep only the newest `max_size` entries.
 
     def remove(self, env_map):
         """
-        从 buffer 中移除与给定 env_map 相同的 entry
+        Remove the entry whose `map` matches the provided `env_map`.
         """
         for i, entry in enumerate(self.list):
             if np.array_equal(entry.get('map'), env_map):

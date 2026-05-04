@@ -174,7 +174,7 @@ def is_reachable(grid: np.ndarray, key_door: bool = False) -> bool:
     if not goal_exists:
         return False
 
-    # --- key_door 模式：要求完整路径（起点→钥匙→门→目标）
+    # --- key_door mode requires a full path: start -> key -> door -> goal ---
     if key_door:
         WALL, KEY, DOOR, GOAL = 2, 5, 4, 8
 
@@ -234,49 +234,49 @@ def is_reachable(grid: np.ndarray, key_door: bool = False) -> bool:
             return False  # Enclosure detected (some area still unreachable)
     
     else:
-        # 查找目标点（'G'）的位置
+        # Collect all non-wall starting positions.
         starts = np.argwhere(grid != 2)
 
-        # BFS 遍历从所有起始点及目标可达性
+        # Run BFS to verify reachability and detect enclosed regions.
         visited = set()
         queue = deque()
 
-        # 将所有起始点加入队列
+        # Seed the queue with the first traversable tile.
         queue.append(starts[0])
 
-        # 标记目标是否可达
+        # Track whether the goal is reachable.
         reached_goal = False
 
         while queue:
             y, x = queue.popleft()
 
-            # 如果当前位置是目标，标记为到达目标
+            # Mark goal reachability when the search touches the goal.
             if grid[y, x] == 8:
                 reached_goal = True
 
-            # 如果已经访问过这个节点，跳过
+            # Skip nodes that were already visited.
             if (y, x) in visited:
                 continue
 
-            # 标记为已访问
+            # Mark the node as visited.
             visited.add((y, x))
 
-            # 4个方向扩展
+            # Expand in the four cardinal directions.
             for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 ny, nx = y + dy, x + dx
                 if 1 <= ny < h-1 and 1 <= nx < w-1 and (ny, nx) not in visited:
                     ntile = grid[ny, nx]
-                    if ntile != 2:  # 如果不是墙壁，继续扩展
+                    if ntile != 2:  # Continue unless the tile is a wall.
                         queue.append((ny, nx))
 
         if not reached_goal:
-            return False  # 如果目标不可达，返回 False
+            return False  # The goal is unreachable.
 
-        # 检查所有非墙壁区域是否都被访问，确保没有封闭区域
+        # Ensure all non-wall tiles are visited so there are no enclosed regions.
         if len(visited) == len(starts):
-            return True  # 没有封闭区域并且目标可达
+            return True  # Goal reachable and no enclosed regions remain.
         else:
-            return False  # 存在封闭区域
+            return False  # An enclosed region still exists.
 
 
 
@@ -302,14 +302,14 @@ def visualize_grid(grid, count=10, save_flag=False, save_path='', idx =''):
         custom_cmap = LinearSegmentedColormap.from_list("custom", colors, N=256)    
         if save_flag:
             save_file_name = os.path.join(save_path, f'gen_{index}.png')
-            plt.imshow(map, cmap=custom_cmap)  # 显示图像
+            plt.imshow(map, cmap=custom_cmap)  # Render the grid.
             plt.colorbar()
-            plt.savefig(save_file_name)  # 保存图像
-            plt.close()  # 关闭图像，避免显示
+            plt.savefig(save_file_name)  # Save the image.
+            plt.close()  # Close the figure to avoid interactive display.
         else:
-            plt.imshow(map, cmap=custom_cmap)  # 显示图像
+            plt.imshow(map, cmap=custom_cmap)  # Render the grid.
             plt.colorbar()
-            plt.show()  # 显示图像
+            plt.show()  # Display the image.
             
     if singlet:
         show_grid(grid, idx)
@@ -335,7 +335,7 @@ def generate_path_branch(height, width, path_length=50, branch_num=5, branch_len
     path.append((y, x))
     directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
-    # 主路径
+    # Main path
     for _ in range(path_length):
         random.shuffle(directions)
         for dy, dx in directions:
@@ -346,7 +346,7 @@ def generate_path_branch(height, width, path_length=50, branch_num=5, branch_len
                 path.append((y, x))
                 break
 
-    # 分支路径
+    # Branch paths
     for _ in range(branch_num):
         if not path:
             break
@@ -361,8 +361,8 @@ def generate_path_branch(height, width, path_length=50, branch_num=5, branch_len
                     path.append((sy, sx))
                     break
 
-    # --- 添加 key 和 door ---
-    path_no_goal = [pos for pos in path if pos != goal]  # 排除 goal 位置
+    # --- Add key and door tiles ---
+    path_no_goal = [pos for pos in path if pos != goal]  # Exclude the goal position.
     random.shuffle(path_no_goal)
 
     num_keys = int(len(path_no_goal) * key_prob)
@@ -376,7 +376,7 @@ def generate_path_branch(height, width, path_length=50, branch_num=5, branch_len
     for y, x in door_positions:
         grid[y, x] = 4  # door
 
-    # 设置目标点
+    # Place the goal tile.
     grid[goal] = 8
     return grid
 
@@ -397,9 +397,9 @@ def generate_path_branch(height, width, path_length=50, branch_num=5, branch_len
 #             if 1 <= ny < height-1 and 1 <= nx < width-1 and grid[ny, nx] == 2:
 #                 grid[ny, nx] = 1
 #                 path.append((ny, nx))
-#                 break  # 添加一格就 break，控制路径连贯性
+#                 break  # Stop after adding one tile to keep the path coherent.
 
-#     # 随机在主路径周围扩张空地（支路）
+#     # Randomly expand side branches around the main path.
 #     for _ in range(path_len * 2):
 #         y, x = random.choice(path)
 #         random.shuffle(directions)
@@ -460,7 +460,7 @@ def generate_single_env(height, width, mode, wall_prob=0.3, key_prob=0.15, door_
     return grid
 
 # =========================
-# 2. 行为描述子提取
+# 2. Behavior descriptor extraction
 # =========================
 def compute_descriptors(grid):
     empty_ratio = np.mean(grid == 1)

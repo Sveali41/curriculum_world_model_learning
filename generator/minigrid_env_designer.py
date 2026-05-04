@@ -20,7 +20,7 @@ from collections import deque
 from typing import Optional, Tuple, Union
 
 
-# 定义常量
+# Constants
 WALL  = OBJECT_TO_IDX['wall']
 EMPTY = OBJECT_TO_IDX['empty']
 DOOR  = OBJECT_TO_IDX['door']
@@ -33,11 +33,11 @@ BLUE   = COLOR_TO_IDX['blue']
 GREEN  = COLOR_TO_IDX['green']
 GREY   = COLOR_TO_IDX['grey']
 
-# --- 核心映射表 ---
+# --- Core action mapping ---
 # action map for generator agent output
-# 格式: Action_ID: (Type, Color)
+# Format: `Action_ID -> (Type, Color)`
 ACTION_MAP = {
-    # 0: Keep (特殊处理)
+    # 0: Keep (handled separately)
     1: (KEY, YELLOW),
     2: (KEY, RED),
     3: (KEY, BLUE),
@@ -152,12 +152,12 @@ def map_editor(base_map_obj, base_map_col, action_grid):
     new_obj = base_map_obj.copy()
     new_col = base_map_col.copy()
     
-    # 遍历除了 0 (Keep) 以外的所有动作
+    # Iterate over all actions except 0 (`Keep`).
     for act_id, (type_val, color_val) in ACTION_MAP.items():
-        # 找到执行该动作的所有位置
+        # Find all positions assigned to this action.
         mask = (action_grid == act_id)
         
-        # 统一修改
+        # Apply the corresponding object and color updates.
         new_obj[mask] = type_val
         new_col[mask] = color_val
         

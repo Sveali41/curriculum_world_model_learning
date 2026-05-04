@@ -31,9 +31,10 @@ class CustomMetaWorldEnv(gym.Env):
         
     def set_custom_layout(self, obj_pos=None, goal_pos=None):
         """
-        供 UED Curriculum 生成器调用。根据输入连续坐标动态控制 Mini Task 难度。
-        obj_pos: [x, y, z] 物体初始坐标
-        goal_pos: [x, y, z] 目标终点坐标
+        Called by the UED curriculum generator to control mini-task difficulty
+        through continuous object and goal coordinates.
+        obj_pos: [x, y, z] initial object position
+        goal_pos: [x, y, z] target goal position
         """
         if obj_pos is not None:
             self.custom_obj_pos = np.array(obj_pos, dtype=np.float32)
@@ -47,10 +48,10 @@ class CustomMetaWorldEnv(gym.Env):
 
     def set_custom_layout_from_str(self, layout_str: str):
         """
-        供 UED Curriculum 生成器调用（基于连续坐标字符串表征）。
-        格式要求: "obj_x,obj_y,obj_z;goal_x,goal_y,goal_z"
-        例如: "0.0,0.6,0.02;0.2,0.8,0.0"
-        若传入 "" 或 "TARGET" 则恢复随机发牌。
+        Called by the UED curriculum generator using a string-encoded continuous layout.
+        Expected format: "obj_x,obj_y,obj_z;goal_x,goal_y,goal_z"
+        Example: "0.0,0.6,0.02;0.2,0.8,0.0"
+        Passing "" or "TARGET" restores the default randomized layout.
         """
         if not layout_str or layout_str.upper() == "TARGET":
             self.set_custom_layout(None, None)
@@ -68,9 +69,10 @@ class CustomMetaWorldEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         """
-        重置环境。如果设定了 custom_layout，则接管初始化并将环境强制设置在指定参数下。
+        Reset the environment. If `custom_layout` is set, override the default
+        initialization with the provided task parameters.
         """
-        # 1. 正常执行底层重置，使 MuJoCo 刷新并随机分配
+        # 1. Run the base reset so MuJoCo refreshes internal state.
         result = self.env.reset()
         
         # Old Gym API (MetaWorld v2 often returns just obs) vs Gymnasium API
@@ -80,20 +82,20 @@ class CustomMetaWorldEnv(gym.Env):
             obs = result
             info = {}
 
-        # 2. 如果存在外部干预参数，强制修改 Mujuco 底层对象位置和目标点
+        # 2. If external layout parameters are provided, overwrite the object and goal.
         if self.custom_obj_pos is not None or self.custom_goal_pos is not None:
             
-            # (A) 修改目标点 (Target Goal)
+            # (A) Override the target goal.
             if self.custom_goal_pos is not None:
                 self.env._target_pos = self.custom_goal_pos.copy()
                 try:
-                    # 将目标位置点同步到 MuJoCo 渲染 site (某些环境叫 'goal')
+                    # Keep the MuJoCo render site in sync with the target position.
                     site_id = self.env.model.site_name2id('goal')
                     self.env.model.site_pos[site_id] = self.custom_goal_pos
                 except Exception:
                     pass 
             
-            # (B) 修改物体初始位置 (Object Position)
+            # (B) Override the object's initial position.
             if self.custom_obj_pos is not None:
                 self.env.obj_init_pos = self.custom_obj_pos.copy()
                 try:
@@ -101,10 +103,10 @@ class CustomMetaWorldEnv(gym.Env):
                 except AttributeError:
                     pass
             
-            # 3. 产生修改后的新观察值
+            # 3. Recompute the observation after applying overrides.
             obs = self.env._get_obs()
 
-        # 将解析出来的实体字典植入 info，方便 P2E 的 WM 使用
+        # Attach parsed entities to `info` for the P2E world model.
         entities = self._vector_to_entity_dict(obs)
         info['entities'] = entities
             
@@ -112,10 +114,11 @@ class CustomMetaWorldEnv(gym.Env):
 
     def _vector_to_entity_dict(self, obs_vector):
         """
-        把连续的 39 维向量状态截断打包为 WM 需要的实体 Attention 格式。
-        根据 SawyerXYZ 的一般定义：
-        [0:4]   机器人末端执行器 xyz 和 夹爪状态开合度
-        [4:18]  物体位置及四元数
+        Pack the continuous 39D vector state into the entity-attention format
+        expected by the world model.
+        Based on the standard SawyerXYZ layout:
+        [0:4]   end-effector xyz and gripper openness
+        [4:18]  object position and quaternion
         """
         target = self.env._target_pos if hasattr(self.env, '_target_pos') else np.zeros(3)
         return {
@@ -127,7 +130,7 @@ class CustomMetaWorldEnv(gym.Env):
     def step(self, action):
         step_returns = self.env.step(action)
         
-        # 兼容处理老 gym 的 4 个返回值，和最新 Gymnasium 的 5 个返回值
+        # Support both the legacy Gym 4-tuple and the Gymnasium 5-tuple API.
         if len(step_returns) == 4:
             obs, reward, done, info = step_returns
             terminated = done
@@ -148,7 +151,7 @@ class CustomMetaWorldEnv(gym.Env):
             self.env.close()
 
 if __name__ == "__main__":
-    # 基础测试脚本
+    # Basic smoke test.
     print("Testing CustomMetaWorldEnv...")
     env = CustomMetaWorldEnv('sweep-into-v3', render_mode=None)
     

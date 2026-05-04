@@ -199,7 +199,7 @@ def collect_data():
         print(f"\n[Collection] Processing Target Task: {task}")
         
         with open_dict(cfg):
-            # 强制指定为 Uniform 采集模式，步数增加以覆盖 31x31 大图
+            # Force uniform collection mode and increase the step budget for larger maps.
             cfg.env.collect.data_type = "uniform"
             cfg.env.collect.max_steps = 1000
             cfg.env.collect.uniform_reset_steps = 50
@@ -210,7 +210,7 @@ def collect_data():
             level_folder = "bipedal_walker" if domain_name == "bipedalwalker" else domain_name
             cfg.env.env_path = os.path.join(PROJECT_ROOT, f"trainer/level/{level_folder}/target_tasks/{task}.txt")
             
-            # 使用配置里的后缀，如果没配置则默认为 _uniform.npz
+            # Use the configured suffix, defaulting to `_uniform.npz`.
             suffix = getattr(domain_cfg, "target_task_suffix", "_uniform.npz")
             cfg.env.collect.data_save_path = os.path.join(target_tasks_folder, f"{task}{suffix}")
             

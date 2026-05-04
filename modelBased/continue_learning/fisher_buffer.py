@@ -124,11 +124,11 @@ class FisherReplayBuffer:
             else:
                 loss = [F.mse_loss(pred_for_loss[i], obs_next_masked[i]).item() for i in range(len(pred_for_loss))]
 
-            # 可选加权项，例如状态变化量
+            # Optional weighting term, e.g. based on state change magnitude.
             obs_full = batch["obs"].float()
             obs_next_full = batch["obs_next"].float()
             delta = [(obs_next_full[i] - obs_full[i]).abs().mean().item() for i in range(len(obs_next_full))]
-            score = [l + 0.1 * d for l, d in zip(loss, delta)]  # 组合得分
+            score = [l + 0.1 * d for l, d in zip(loss, delta)]  # Combined score.
         
             scored_samples = list(zip(score, [dict(obs=samples['obs'][i],
                                                    act=samples['act'][i],
@@ -166,11 +166,11 @@ class FisherReplayBuffer:
     ):
         """
         Input:
-        - ratio: 从当前 samples 中按比例采样
-        - static_ratio: 在选中样本中，静态样本占比
+        - ratio: sample this fraction from the current samples
+        - static_ratio: desired fraction of static samples among selected items
 
-        静态样本: obs_next 与 obs 完全一致
-        动态样本: 有任意位置不同
+        Static samples: `obs_next` is exactly identical to `obs`.
+        Dynamic samples: at least one position differs.
         """
         total_len = len(samples['obs'])
         if total_len == 0:
@@ -180,7 +180,7 @@ class FisherReplayBuffer:
         if insert_k <= 0:
             return
 
-        # === 判断变化位置 ===
+        # === Detect changed positions ===
         obs = torch.tensor(samples['obs'])         # (B, C, H, W)
         obs_next = torch.tensor(samples['obs_next'])
         changed_mask = (obs != obs_next).any(dim=1).any(dim=1).any(dim=1)  # shape: (B,)
@@ -246,15 +246,16 @@ class FisherReplayBuffer:
 
     def get_agent_near_elements_mask(self, obs: torch.Tensor):
         """
-        返回一个布尔 mask，表示哪些样本中 agent 紧邻 key/door/lava。
-        agent 由 obj_map 中值为 10 的位置定义。
+        Return a boolean mask indicating which samples place the agent next to
+        key/door/lava elements.
+        The agent is identified from the object map.
         obs: Tensor of shape (B, C, H, W) or (B, H, W, C)
         return: BoolTensor of shape (B,)
         """
         if obs.dim() == 4 and obs.shape[1] != obs.shape[-1]:  # (B, C, H, W)
-            obj_map = obs[:, 0]  # object 通道
+            obj_map = obs[:, 0]  # Object channel
         else:  # (B, H, W, C)
-            obj_map = obs[..., 0]  # object 通道
+            obj_map = obs[..., 0]  # Object channel
 
         B, H, W = obj_map.shape
         near_mask = torch.zeros(B, dtype=torch.bool, device=obs.device)
@@ -275,7 +276,7 @@ class FisherReplayBuffer:
             if agent_pos.numel() == 0:
                 continue
 
-            y, x = agent_pos[0]  # 假设一个 agent
+            y, x = agent_pos[0]  # Assume a single agent.
             neighbors = []
             if y > 0:
                 neighbors.append(obj_map[b, y - 1, x])
@@ -295,9 +296,9 @@ class FisherReplayBuffer:
 
     def update_combined(self, samples, current_sample_ratio=0.5, fisher_buffer_elements_ratio=0.9, target_shape=None):
         """
-        综合插入策略（基于当前 sample 数量）：
-        1) 从 samples 中抽取 ratio 百分比数据
-        2) 其中 key/door 样本占 keydoor_ratio 比例
+        Combined insertion strategy based on the current sample count:
+        1. draw a `ratio` fraction from `samples`
+        2. reserve a configured portion for key/door or salient-element samples
         """
         # Calculate how many samples to add based on ratio of current buffer size
         # But ensure we add at least some if buffer is empty
@@ -310,7 +311,7 @@ class FisherReplayBuffer:
         if total_quota <= 0:
             return
 
-        # === Part 1: key/door 样本 ===
+        # === Part 1: salient element samples ===
         obs = samples['obs']
         is_vector_obs = (
             (isinstance(obs, np.ndarray) and obs.ndim == 2) or
@@ -381,7 +382,7 @@ class FisherReplayBuffer:
                 # A min distance below 0.8 typically means there's an obstacle ahead (stump, stairs, pit edge)
                 near_mask = lidar_readings.min(dim=-1)[0] < 0.8
                 
-                # [NEW] Contact label mask (Index 8 is leg_1, Index 13 is leg_2)
+                # Contact label mask (index 8 is leg_1, index 13 is leg_2).
                 contact_mask = (obs_tensor[..., 8] > 0.5) | (obs_tensor[..., 13] > 0.5)
                 no_contact_mask = ~contact_mask
 
@@ -407,31 +408,31 @@ class FisherReplayBuffer:
             pick_n = min(elements_quota, len(near_indices_all))
             elements_selected = np.random.choice(near_indices_all, pick_n, replace=False).tolist()
         
-        # === Part 2: 剩余 quota 从其他样本中随机选择 (加入接触标签平衡) ===
+        # === Part 2: fill the remaining quota with random samples, optionally balancing contact labels ===
         remaining_quota = total_quota - len(elements_selected)
         total_indices = list(range(total_len))
         non_elements_pool = [i for i in total_indices if i not in elements_selected]
         
         random_selected = []
         if is_vector_obs and 'contact_indices_all' in locals() and len(contact_indices_all) > 0:
-            # 将候选池划分为 有接触(Contact=1) 和 无接触(Contact=0)
+            # Split the pool into contact-positive and contact-negative samples.
             pool_contact = [i for i in non_elements_pool if i in contact_indices_all]
             pool_no_contact = [i for i in non_elements_pool if i in no_contact_indices_all]
             random.shuffle(pool_contact)
             random.shuffle(pool_no_contact)
             
-            # 按配置比例采样：contact_positive_ratio 给有接触的，剩余给无接触的
+            # Allocate samples according to the configured contact-positive ratio.
             contact_quota = int(remaining_quota * self.contact_positive_ratio)
             pick_c = min(contact_quota, len(pool_contact))
-            # 如果某一方不够，把配额让给另一方
+            # Reassign unused quota if one side does not have enough samples.
             pick_nc = min(remaining_quota - pick_c, len(pool_no_contact))
-            # 再反过来补偿一遍，防止无接触的一方也不够但有接触的还有剩余
+            # Rebalance once more in the opposite direction if capacity remains.
             pick_c = min(remaining_quota - pick_nc, len(pool_contact)) 
             
             random_selected.extend(pool_contact[:pick_c])
             random_selected.extend(pool_no_contact[:pick_nc])
             
-            # 如果还有剩余，随机兜底
+            # If quota still remains, fill it from the leftover pool at random.
             leftover = remaining_quota - len(random_selected)
             if leftover > 0:
                 left_pool = [i for i in non_elements_pool if i not in random_selected]
@@ -441,7 +442,7 @@ class FisherReplayBuffer:
             random.shuffle(non_elements_pool)
             random_selected = non_elements_pool[:remaining_quota]
 
-        # === 合并采样并打乱 ===
+        # === Merge selections and shuffle ===
         all_selected_indices = elements_selected + random_selected
         random.shuffle(all_selected_indices)
 
@@ -451,7 +452,7 @@ class FisherReplayBuffer:
 
         self.buffer.extend(selected)
 
-        # === 裁剪 buffer ===
+        # === Trim the buffer back to capacity ===
         if len(self.buffer) > self.max_size:
             num_to_remove = len(self.buffer) - self.max_size
             all_indices = list(range(len(self.buffer)))

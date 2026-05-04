@@ -71,7 +71,7 @@ if __name__ == "__main__":
     import time
     print("Testing Advanced CustomBipedalEnv with Physical Parameters...")
     try:
-        # 开启 "human" 渲染模式
+        # Enable `human` render mode.
         env = CustomBipedalEnv(render_mode="human")
         
         def run_visual_episode(env, layout_str, frames=200):
@@ -81,26 +81,26 @@ if __name__ == "__main__":
             print("Layout Applied: ", env.layout_list)
             
             for _ in range(frames):
-                # 在没有训练好的策略时，我们随便给点向前的力矩（或者随机动作）来看看地形长什么样
+                # Use exploratory actions to inspect the generated terrain layout.
                 action = env.action_space.sample() 
                 obs, reward, terminated, truncated, info = env.step(action)
                 
-                # 减慢一点帧率，方便肉眼看清地形积木
+                # Slow the frame rate slightly for easier visual inspection.
                 time.sleep(0.02)
                 
                 if terminated or truncated:
                     break
         
-        # # 演示 1: stump mini env
+        # # Example 1: stump mini environment
         # run_visual_episode(env, "G20 S3.0 ")
         
-        # # 演示 2: pit mini env
+        # # Example 2: pit mini environment
         # run_visual_episode(env, "G20 P4.0")
         
-        # 演示 3: stairs mini env
+        # Example 3: stairs mini environment
         run_visual_episode(env, "G20 T4 G40")
 
-        # # 演示 4: target env
+        # # Example 4: target environment
         # run_visual_episode(env, "R5")
         
         env.close()

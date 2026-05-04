@@ -17,18 +17,18 @@ class ResidualMLP(nn.Module):
 class CustomTransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dropout=0.1):
         """
-        :param d_model: 特征维度
-        :param nhead: 注意力头数
-        :param dropout: dropout 比例
+        :param d_model: feature dimension
+        :param nhead: number of attention heads
+        :param dropout: dropout ratio
         """
         super(CustomTransformerEncoderLayer, self).__init__()
-        # 使用 nn.MultiheadAttention，batch_first=True 便于使用形状 (B, seq_len, d_model)
+        # Use `nn.MultiheadAttention` with `batch_first=True` for (B, seq_len, d_model).
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-        # 前馈网络
+        # Feed-forward network.
         self.linear1 = nn.Linear(d_model, d_model * 4)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(d_model * 4, d_model)
-        # 两个 LayerNorm 层
+        # Two LayerNorm layers.
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
@@ -36,22 +36,22 @@ class CustomTransformerEncoderLayer(nn.Module):
 
     def forward(self, src, src_mask=None, src_key_padding_mask=None):
         """
-        :param src: 输入张量，形状 (B, seq_len, d_model)
+        :param src: input tensor with shape (B, seq_len, d_model)
         :return:
-            - src: Transformer Encoder 层输出 (B, seq_len, d_model)
-            - attn_weights: 注意力权重，形状 (B, num_heads, seq_len, seq_len)
+            - src: transformer-encoder output with shape (B, seq_len, d_model)
+            - attn_weights: attention weights with shape (B, num_heads, seq_len, seq_len)
         """
-        # 计算自注意力，并返回注意力权重
+        # Compute self-attention and return the attention weights.
         attn_output, attn_weights = self.self_attn(
             src, src, src,
             attn_mask=src_mask,
             key_padding_mask=src_key_padding_mask,
             need_weights=True
         )
-        # 残差连接 + LayerNorm
+        # Residual connection + LayerNorm.
         src = src + self.dropout1(attn_output)
         src = self.norm1(src)
-        # 前馈网络部分
+        # Feed-forward block.
         ff_output = self.linear2(self.dropout(F.relu(self.linear1(src))))
         src = src + self.dropout2(ff_output)
         src = self.norm2(src)
@@ -79,17 +79,17 @@ class CustomTransformerEncoderLayer(nn.Module):
 #         self.relu = nn.ReLU(inplace=True)
 #         self.to_gamma_beta = nn.Linear(embed_dim, 2 * embed_dim)
 
-#         # 2. 展平操作，将 (B, embed_dim, H, W) 展平为 (B, embed_dim, H*W)
+#         # Flatten spatial dimensions from (B, embed_dim, H, W) to (B, embed_dim, H*W).
 #         self.flatten = nn.Flatten(2)
-#         # 位置编码：为每个 patch 学习一个位置编码，形状为 (1, height*width, embed_dim)
+#         # Learn one positional embedding per patch with shape (1, H*W, embed_dim).
 #         # self.pos_embedding = nn.Parameter(torch.randn(1, mask_size * mask_size, embed_dim))
 #         self.pos_embedding = nn.Parameter(torch.zeros(1, mask_size * mask_size, embed_dim))
-#         nn.init.trunc_normal_(self.pos_embedding, std=0.02)  # 更稳的初始化
+#         nn.init.trunc_normal_(self.pos_embedding, std=0.02)  # More stable initialization.
 
-#         # 3. 动作嵌入：将离散动作编码为与 embed_dim 相同的向量
+#         # Project action information into the same embedding space.
 #         self.fuse_fc = nn.Linear(embed_dim * 2, embed_dim)
 
-#         # 4. 多层自定义 Transformer Encoder 层
+#         # Stack custom transformer encoder layers.
 #         self.transformer_layers = nn.ModuleList([
 #             CustomTransformerEncoderLayer(d_model=embed_dim, nhead=num_heads)
 #             for _ in range(1)
@@ -100,8 +100,8 @@ class CustomTransformerEncoderLayer(nn.Module):
 
 #     def forward(self, state, action, info):
 #         orginal_dim = state.ndim
-#         if orginal_dim == 3:  # 单个样本
-#             state = state.unsqueeze(0)  # 变为 (1, C, H, W)
+#         if orginal_dim == 3:  # Single sample
+#             state = state.unsqueeze(0)  # Expand to (1, C, H, W).
 #             action = torch.tensor([action]).to(state.device)
 #         B, C, H, W = state.size()
         
@@ -132,27 +132,27 @@ class CustomTransformerEncoderLayer(nn.Module):
 
 #         x = self.relu(self.bn1(self.conv1(state_emb)))
 #         x = self.relu(self.bn2(self.conv2(x)))
-#         # 2. 展平空间维度，将 (B, embed_dim, 5, 5) 转换为 (B, embed_dim, 25)
+#         # Flatten spatial dimensions from (B, embed_dim, H, W) to (B, embed_dim, H*W).
 #         x = self.flatten(x)
-#         # 转置为 (B, 25, embed_dim) 作为 Transformer 的输入
+#         # Transpose to (B, H*W, embed_dim) for transformer processing.
 #         x = x.transpose(1, 2)
-#         # 3. 添加位置编码
+#         # Add positional embeddings.
 #         x = x + self.pos_embedding  # (B, 25, embed_dim)
 
 
-#         # 4. 融合动作信息
-#         # 假设 action 为离散变量，shape (B,)
-#         # 将 action_emb 扩展至 (B, 25, embed_dim)（对每个 token都添加相同的动作信息）
+#         # Fuse action information.
+#         # `action` is assumed to be discrete with shape (B,).
+#         # Broadcast `action_emb` to every token.
 #         action_emb = action_emb.unsqueeze(1).expand(-1, x.size(1), -1)
 #         fused = torch.cat([x, action_emb], dim=-1)  # (B, 25, embed_dim*2)
 #         x = self.fuse_fc(fused)  # (B, 25, embed_dim)
 
-#         # 5. 依次通过 Transformer Encoder 层
+#         # Pass through the transformer encoder layers.
 #         attn_weights = None
 #         for layer in self.transformer_layers:
 #             x, attn_weights = layer(x)
 
-#         # 6. 最终输出
+#         # Final output projection.
 #         x = self.fc(x)
 #         x = x.transpose(1, 2).reshape(B, C, H, W)
 
@@ -356,14 +356,14 @@ class AttentionModule(nn.Module):
                 x_out = x_out.squeeze(0)
             return x_out, attn_weights, {"contact_logits": contact_logits}
 
-        if orginal_dim == 3:  # 单个样本
+        if orginal_dim == 3:  # Single sample
             state = state.unsqueeze(0)
             action = torch.tensor([action]).to(state.device)
         B, TotalC, H, W = state.size()
         K = self.frame_stack
         C_base = TotalC // K
 
-        # ==== 状态编码 ====
+        # ==== State encoding ====
         if self.data_type == 'discrete':
             all_frames_emb = []
             for k in range(K):
@@ -390,14 +390,14 @@ class AttentionModule(nn.Module):
         else:
             state_emb = state
 
-        # ==== 卷积提取局部特征 ====
+        # ==== Convolutional feature extraction ====
         x = self.relu(self.bn1(self.conv1(state_emb)))
         x = self.relu(self.bn2(self.conv2(x)))
         x = self.dropout_conv(x)
         x = self.flatten(x).transpose(1, 2)  # (B, N, D)
-        x = x + self.pos_embedding  # 加入位置编码
+        x = x + self.pos_embedding  # Add positional encoding.
 
-        # ==== 准备动作嵌入 ====
+        # ==== Prepare action embedding ====
         if self.data_type == 'discrete':
             action_emb = self.action_embedding(action)  # (B, D)
         else:
@@ -405,7 +405,7 @@ class AttentionModule(nn.Module):
 
         action_emb = action_emb.unsqueeze(1).expand(-1, x.size(1), -1)  # (B, N, D)
 
-        # ==== 携带上下文信息（钥匙/背包）嵌入并广播 ====
+        # ==== Embed and broadcast context information (key/inventory) ====
         if self.env_type == 'crafter':
             if inv is not None:
                 context_emb = self.inv_fc(inv)  # (B, D)
@@ -428,7 +428,7 @@ class AttentionModule(nn.Module):
 
         context_emb = context_emb.unsqueeze(1).expand(-1, x.size(1), -1)  # (B, N, D)
 
-        # ==== 融合三个信息：patch + action + context ====
+        # ==== Fuse patch, action, and context features ====
         fused = torch.cat([x, action_emb, context_emb], dim=-1)  # (B, N, 3D)
         x = self.fuse_fc(fused)  # (B, N, D)
 
@@ -440,7 +440,7 @@ class AttentionModule(nn.Module):
         # ==== Residual MLP before FC ====
         x = self.res_mlp(x)  # shape: (B, N, D)
 
-        # ==== 输出层 ====
+        # ==== Output head ====
         x_out = self.fc(x)
         x_out = x_out.transpose(1, 2).reshape(B, self.out_channel, H, W)
 

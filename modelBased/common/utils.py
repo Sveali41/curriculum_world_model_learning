@@ -25,7 +25,7 @@ def extract_masked_state_support(state, agent_position_yx, mask_size, pad_value=
     y, x = agent_position_yx
     half = mask_size // 2
     
-    # 使用指定的 pad_value 初始化区域 (Crafter=1, MiniGrid=0)
+    # Initialize the region with the requested pad value (Crafter=1, MiniGrid=0).
     region = np.full((channels, mask_size, mask_size), pad_value, dtype=state.dtype)
 
     src_slice_y = slice(max(y - half, 0), min(y + half + 1, rows))
@@ -34,7 +34,7 @@ def extract_masked_state_support(state, agent_position_yx, mask_size, pad_value=
     dest_slice_y = slice(max(0, half - y), max(0, half - y) + (min(y + half + 1, rows) - max(y - half, 0)))
     dest_slice_x = slice(max(0, half - x), max(0, half - x) + (min(x + half + 1, cols) - max(x - half, 0)))
 
-    # 将 state 中的有效区域复制到预填充区域中
+    # Copy the valid region from state into the padded window.
     region[:, dest_slice_y, dest_slice_x] = state[:, src_slice_y, src_slice_x]
     return region
 

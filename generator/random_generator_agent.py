@@ -27,8 +27,8 @@ class RandomGeneratorAgent:
             stats_action: [B, 32] <-- Inventory actions (32 piano keys)
             logprob: [B]
             value: [B]
-            topk_mask: [B, num_actions] (dummy)
-            global_ctx: [1, context_dim] (dummy)
+            topk_mask: [B, num_actions] (placeholder)
+            global_ctx: [1, context_dim] (placeholder)
         """
         B, C, H, W = base_map.shape
         num_cells = H * W

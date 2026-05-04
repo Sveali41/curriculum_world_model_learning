@@ -52,7 +52,7 @@ class GeneratorInterface:
 
         if self.is_crafter:
             # Crafter: use custom seeder, actions, and map sizes
-            # NOTE: map_height now ONLY includes the physical layout (No more +1 hack!)
+            # `map_height` now refers only to the physical layout.
             self.map_height = hparams.map_height
             self.map_width = hparams.map_width
             self.seeder = CrafterPCGSeeder(height=self.map_height, width=self.map_width)
@@ -570,7 +570,7 @@ class GeneratorInterface:
         is_warmup = (iteration < warmup_iters)
         num_random = self.batch_size
 
-        # [NEW] Robust prev_data unpacking for all envs (MiniGrid: 2 elements, others: 3)
+        # Unpack `prev_data` across environments with different tuple layouts.
         p_maps, p_terrain, p_stats = None, None, None
         if self.prev_data is not None:
             if len(self.prev_data) == 3:
@@ -593,7 +593,7 @@ class GeneratorInterface:
 
             zm, zh, _ = self._zero_context(1, self.map_height, self.map_width)
             
-            # [MODIFIED] Universal adaptive context forwarding for all environments
+            # Forward context adaptively across environments.
             if p_maps is not None:
                 idx = r_idx % p_maps.shape[0] if p_maps.shape[0] > 0 else 0
                 context_maps.append(p_maps[idx:idx+1])
@@ -768,15 +768,13 @@ class GeneratorInterface:
                         print(f"[Feedback-Debug] Iter {iteration} Env {i}: Heatmap is zero.")
 
                 if self.is_bipedal:
-                    # [MODIFIED] Semantic + Physical Error Attribution
-                    # Now we combine which obstacle types were present AND the physical failures
+                    # Combine semantic obstacle usage with physical error signals.
                     
                     # 1. Semantic (10-dim)
                     sem_err = np.zeros(10, dtype=np.float32)
                     actions_np = actions.detach().cpu().numpy()
                     
-                    # [BUG FIX] Only consider actions within the `active_width` (e.g. first 6 slots).
-                    # Otherwise, Grass (0) from the 18 static uneditable slots is ALWAYS included!
+                    # Only consider actions within the editable `active_width`.
                     active_w = getattr(self, "active_bipedal_width", 6)
                     current_actions = actions_np[i].flatten()[:active_w]
                     used_actions = np.unique(current_actions)
@@ -886,7 +884,7 @@ class GeneratorInterface:
              }
              solved = np.any((task_npz['e']) & (task_npz['d'] > 0))
              
-             # [NEW] Compute average episode length for survival reward
+             # Compute average episode length for the survival reward.
              done_flags = task_npz['e'].astype(bool).flatten()
              num_dones = max(1, int(done_flags.sum()))
              total_steps = len(done_flags)
@@ -916,7 +914,7 @@ class GeneratorInterface:
                  print(f"[GeneratorInterface] Validation failed for {save_name}: {e}")
                  traceback.print_exc()
 
-             # [NEW] Compute theoretical shortest path for MiniGrid reporting
+             # Compute the theoretical shortest path for MiniGrid reporting.
              shortest_dist = 0.0
              if env_type == "minigrid":
                  _, shortest_dist = check_solvability(map_np)
@@ -1223,7 +1221,7 @@ class GeneratorInterface:
                 inv_norm = max(inv_change_norm_slots, 1e-6)
                 inv_change_bonus = min(inv_changed / inv_norm, 1.0)
 
-                # [ABLATION] no_diversity: zero out diversity + inv_change rewards
+                # `no_diversity` ablation disables diversity and inventory-change rewards.
                 if self.ablation_type == "no_diversity":
                     div_score = 0.0
                     inv_change_bonus = 0.0
@@ -1253,11 +1251,10 @@ class GeneratorInterface:
             contact_bce = float(inv_loss) if inv_loss is not None else 0.0
             total_loss = float(raw_loss)
 
-            # [MODIFIED] Using Log-Scale for MSE to maintain reward signal at fine-grained scales.
+            # Use log-scaled MSE to preserve reward resolution at small error values.
             mse_reward_term = float(np.log10(total_loss * 50.0 + 1.0))
 
-            # [NEW] Survival as an independent additive reward term.
-            # Directly use avg episode length as the reward signal: longer = better.
+            # Add survival as an independent reward term based on episode length.
             survival_ratio = avg_ep_len
             w_survival = float(getattr(reward_cfg, "survival", 3.0))
 
@@ -1290,7 +1287,7 @@ class GeneratorInterface:
             inv_norm = max(inv_change_norm_slots, 1e-6)
             inv_change_bonus = min(inv_changed / inv_norm, 1.0)
 
-            # [ABLATION] no_diversity: zero out diversity + inv_change rewards
+                # `no_diversity` ablation disables diversity and inventory-change rewards.
             if self.ablation_type == "no_diversity":
                 div_score = 0.0
                 inv_change_bonus = 0.0

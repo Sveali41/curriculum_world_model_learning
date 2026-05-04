@@ -376,11 +376,11 @@ class CustomCrafterEnv(gym.Env):
         self._move_actions = [1, 2, 3, 4]
 
     def _extract_obs(self):
-        # 替换 RGB Image，直接调用原生符号化提取 (H, W, 2)
+        # Replace the RGB view with the native symbolic extraction `(H, W, 2)`.
         symbolic_grid = extract_tensor_grid(self.env)
         player = self.env._player
         
-        # 提取四大生理属性 + 十二种物品背包数量 (总计 16 维)
+        # Extract the four status attributes and twelve inventory counts (16 dims total).
         inv_list = [
             float(player.health), 
             float(player.inventory.get('food', 0)), 
@@ -515,7 +515,7 @@ class CustomCrafterEnv(gym.Env):
         # --- 5. Return standard Gym-style outputs ---
         self.current_step += 1
         
-        # 触发 done 的条件：耗尽步数或玩家死亡
+        # Episode terminates when the step budget is exhausted or the player dies.
         reward = 0.0
         done = (self.current_step >= self.max_steps) or (self.env._player.health <= 0)
         info = {}

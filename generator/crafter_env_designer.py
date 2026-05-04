@@ -1,7 +1,7 @@
 import numpy as np
 import random
 
-# 定义对齐 CustomCrafterEnv 的物理 ID 映射
+# Object-ID mapping aligned with `CustomCrafterEnv`.
 CRAFTER_OBJ_MAP = {
     'none': 0, 'water': 1, 'grass': 2, 'stone': 3, 'path': 4,
     'sand': 5, 'tree': 6, 'lava': 7, 'coal': 8, 'iron': 9,
@@ -27,9 +27,9 @@ CRAFTER_ACTION_MAP = {
 
 class CrafterPCGSeeder:
     """
-    为 Crafter 定制的 PCG 生成器。
-    它负责吐出含有“一圈水墙边界”、“随机撒落的初始资源”以及“连通性校验”的 2D 矩阵。
-    现在的地图是 100% 纯物理布局。
+    PCG seeder specialized for Crafter.
+    It generates a 2D map with a water boundary ring, randomly placed
+    initial resources, and basic connectivity handling.
     """
     def __init__(
         self,
@@ -48,14 +48,13 @@ class CrafterPCGSeeder:
         self.structure_mode = structure_mode
 
     def _is_walkable(self, tile_id):
-        # 凡是需要工具砍伐挖掘的“实体方块”都不算真正的空地（防止无脑堆树堆石头）
-        # 只有真正无消耗通行的格子才算 walkable:
+        # Tiles that require tools or blocking interactions are treated as non-walkable.
         walkable_tiles = [
             CRAFTER_OBJ_MAP['grass'],
             CRAFTER_OBJ_MAP['path'],
             CRAFTER_OBJ_MAP['sand'],
             CRAFTER_OBJ_MAP['agent'],
-            CRAFTER_OBJ_MAP['plant'], # 植物走上去只扣饱食度，不算阻塞实体
+            CRAFTER_OBJ_MAP['plant'], # Plants are traversable.
             CRAFTER_OBJ_MAP['none'],
         ]
         return tile_id in walkable_tiles
@@ -67,20 +66,20 @@ class CrafterPCGSeeder:
         return True, {'max_dist': 0, 'ratio': 1.0}
 
     def _raw_generate(self):
-        # 构建全草地的空白画布 [H, W]
+        # Start from an all-grass canvas of shape `[H, W]`.
         grid = np.full((self.H, self.W), CRAFTER_OBJ_MAP['grass'], dtype=int)
 
-        # 1. 设置物理边界 (水) - 这一圈是一定有的
+        # 1. Add the fixed water boundary.
         grid[0, :] = CRAFTER_OBJ_MAP['water']
         grid[-1, :] = CRAFTER_OBJ_MAP['water']
         grid[:, 0] = CRAFTER_OBJ_MAP['water']
         grid[:, -1] = CRAFTER_OBJ_MAP['water']
 
-        # 2. 放置 Agent (放在非边界区域)
+        # 2. Place the agent away from the boundary.
         ay, ax = random.randint(2, self.H-3), random.randint(2, self.W-3)
         grid[ay, ax] = CRAFTER_OBJ_MAP['agent']
 
-        # 3. 随机撒入资源
+        # 3. Randomly place resources.
         inner_coords = [
             (i, j) for i in range(1, self.H-1) for j in range(1, self.W-1)
             if grid[i, j] == CRAFTER_OBJ_MAP['grass']
@@ -116,5 +115,5 @@ class CrafterPCGSeeder:
                     return grid, {"structure_mode": self.structure_mode, "connected": True}
                 return grid
         
-        # 如果实在运气不好，返回最后一张
+        # Fall back to the final sampled map if all retries fail.
         return grid

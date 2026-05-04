@@ -169,7 +169,7 @@ def map_index_to_value(pred_classes, class_values):
         pred_classes (torch.Tensor): The predicted classes.
         idx_to_value (dict): A dictionary mapping indices to values.
     """
-    idx_to_value = {i: v for i, v in enumerate(class_values)}  # 类别索引到数值的反向映射
+    idx_to_value = {i: v for i, v in enumerate(class_values)}  # Reverse map from class index to value.
     pred_map = pred_classes.clone()
     for idx, val in idx_to_value.items():
         pred_map[pred_classes == idx] = val

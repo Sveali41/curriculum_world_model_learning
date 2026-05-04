@@ -28,8 +28,8 @@ def set_seed(seed: int):
 
 def count_data_in_dataset(file_name):
     """
-    输入: data 文件名（例如 'only_lava_minitask_test.npz'）
-    输出: 样本数量（data['a'].shape[0]）
+    Input: dataset filename, e.g. `only_lava_minitask_test.npz`
+    Output: number of samples, i.e. `data['a'].shape[0]`
     """
     data_path = TRAINER_PATH / 'data' / file_name
     if not os.path.exists(data_path):
@@ -140,7 +140,7 @@ def collect_data_general(
     support = Support(cfg)
 
     # -----------------------------
-    # 0. Print environment info (Optional but helpful for debugging)
+    # 0. Print environment info.
     # -----------------------------
     env_type = getattr(cfg.attention_model, "env_type", "")
     is_crafter = (env_type == "crafter")
@@ -339,7 +339,7 @@ def train_wm_with_subsets(
 
         # Count how many transitions used in this iteration
         transitions_this_iter = subset["a"].shape[0]
-        phase_transitions_used += transitions_this_iter   # <--- 统计累计使用 transitions
+        phase_transitions_used += transitions_this_iter   # Accumulate transitions consumed in this phase.
 
         # ---- write subset to temp npz ----
         temp_path = os.path.join(temp_dir, f"subset_{idx}.npz")
@@ -626,7 +626,7 @@ def extract_loss_map_over_validations(
     prev_keep_cell_loss = cfg.attention_model.keep_cell_loss
     prev_data_dir = cfg.attention_model.data_dir
 
-    # 开启WM的验证模式、保留热图模式
+    # Enable world-model validation mode while keeping per-cell loss for heatmaps.
     cfg.attention_model.freeze_weight = True
     cfg.attention_model.keep_cell_loss = True
     cfg.attention_model.data_dir = data_dir
@@ -646,7 +646,7 @@ def extract_loss_map_over_validations(
 
     try:
         for _ in range(valid_times):
-            # 执行一轮验证
+            # Run one validation pass.
             val_result, _, model = AttentionWM_training.train_api(cfg, net, old_params, None)
             loss_map = model.loss_map_result  # (H,W) array
 
@@ -710,7 +710,7 @@ def extract_loss_map_over_validations(
         cfg.attention_model.keep_cell_loss = prev_keep_cell_loss
         cfg.attention_model.data_dir = prev_data_dir
 
-    # 计算均值
+    # Compute the mean loss map.
     avg_loss_map = sum_map / valid_times
 
     if is_crafter:

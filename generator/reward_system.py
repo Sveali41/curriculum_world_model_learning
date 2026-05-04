@@ -16,7 +16,7 @@ from torch.nn import functional as F
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 # ==========================================
-# 1. 连通性检查 (Validity - BFS)
+# 1. Solvability check (Validity - BFS)
 # ==========================================
 from collections import deque
 import numpy as np
@@ -93,7 +93,7 @@ def check_solvability(grid_obj_np):
 
 
 # ==========================================
-# 2. 多样性打分 (Diversity - RND + Archive)
+# 2. Diversity scoring (RND + archive)
 # ==========================================
 class DiversityModule(nn.Module):
     def __init__(self, input_h=15, input_w=15, k=10, max_archive_size=1000, device=None, env_type='minigrid'):
@@ -107,7 +107,7 @@ class DiversityModule(nn.Module):
         else:
             self.device = torch.device(device)
         
-        # === 1. 类数定义与特征头 ===
+        # === 1. Class definitions and feature heads ===
         if self.env_type == 'crafter':
             self.num_obj_types = 25 # Crafter map elements (up to 16, leaving room)
             self.num_colors = 5    # Crafter player directions (0..4)
@@ -131,10 +131,10 @@ class DiversityModule(nn.Module):
             self.inv_encoder = None
             self.joint_dim = 64
 
-        # 输入通道数 = 物体类别数 + 颜色/方向数
+        # Input channels = object classes + color/direction classes.
         input_channels = self.num_obj_types + self.num_colors 
         
-        # === 2. 地图编码器 CNN (或 MLP) ===
+        # === 2. Map encoder (CNN or MLP) ===
         if self.env_type == 'bipedalwalker':
             # Bipedal is just 1x5 with 10 one-hot classes = 50 dims. MLP is enough.
             self.encoder = nn.Sequential(
@@ -174,7 +174,7 @@ class DiversityModule(nn.Module):
         elif self.env_type != 'bipedalwalker':
             obj_ids_clean[obj_ids_clean == 10] = 1 # MiniGrid Agent (10) -> Empty (1)
 
-        # One-Hot 编码 (注意: F.one_hot 第一个维是 B，输出是 [B, H, W, N])
+        # One-hot encoding. `F.one_hot` returns `[B, H, W, N]`.
         obj_oh = F.one_hot(obj_ids_clean, num_classes=self.num_obj_types).permute(0, 3, 1, 2).float()
         
         if self.env_type == 'bipedalwalker':
@@ -186,19 +186,19 @@ class DiversityModule(nn.Module):
 
     def get_reward(self, map_vec_tensor, inventory_vec=None):
         """
-        输入: 
+        Inputs:
             map_vec_tensor: [1, 2, H, W] 
             inventory_vec: [1, 16] (Numpy or Tensor)
-        输出: float
+        Output: float
         """
         map_vec_tensor = map_vec_tensor.to(self.device)
         
         with torch.no_grad():
-            # 1. 地图特征 [1, 64]
+            # 1. Map feature [1, 64]
             x = self._preprocess(map_vec_tensor)
             emb_map = self.encoder(x) # [1, 64]
             
-            # 2. 背包特征 [1, 16] (可选)
+            # 2. Inventory feature [1, 16] (optional)
             if self.env_type == 'crafter' and inventory_vec is not None:
                 if not isinstance(inventory_vec, torch.Tensor):
                     inventory_vec = torch.from_numpy(inventory_vec).float().to(self.device)
@@ -209,11 +209,11 @@ class DiversityModule(nn.Module):
             else:
                 emb_raw = emb_map # [1, 64]
             
-            # 3. 联合指纹归一化 (Unit Norm on Hypersphere)
+            # 3. Normalize the joint embedding on the unit hypersphere.
             norm = torch.norm(emb_raw, p=2, dim=1, keepdim=True)
             emb = (emb_raw / (norm + 1e-8)).cpu().numpy().flatten()
             
-        # 4. KNN 距离计算 (新颖性)
+        # 4. KNN distance for novelty estimation
         if len(self.archive) == 0:
              reward = 0.0
         else:
@@ -224,7 +224,7 @@ class DiversityModule(nn.Module):
             nearest_k = dists[:current_k]
             reward = np.mean(nearest_k)
             
-        # 5. 更新档案 (FIFO)
+        # 5. Update the archive (FIFO)
         self.archive.append(emb)
         if len(self.archive) > self.max_size:
             self.archive.pop(0)
@@ -233,19 +233,18 @@ class DiversityModule(nn.Module):
 
 def calculate_lp_reward(world_model, trajectory_data, lr=1e-3):
     """
-    计算 Head-only Learning Progress (LP).
+    Compute head-only learning progress (LP).
 
-    核心思想：
-    - 只对预测头（head / decoder 等）做一次“影子更新”
-    - 测量 loss_before - loss_after 作为学习潜力
-    - 所有参数在函数结束时都会被完整恢复，不污染主训练
+    Core idea:
+    - apply a temporary update only to the prediction head
+    - measure `loss_before - loss_after` as the learning signal
+    - restore all parameters before returning so the main model is unchanged
     """
 
     import torch
 
     # ============================================================
-    # 1. Snapshot：只保存【参数数值】，不使用 state_dict()
-    #    （避免 Lightning / ShardedTensor 的 hook 问题）
+    # 1. Snapshot parameter values directly instead of using `state_dict()`.
     # ============================================================
     original_params = {
         name: param.detach().clone()
@@ -253,7 +252,7 @@ def calculate_lp_reward(world_model, trajectory_data, lr=1e-3):
     }
 
     # ============================================================
-    # 2. 冻结 Backbone，只解冻 Head
+    # 2. Freeze the backbone and update only the head.
     # ============================================================
     params_to_update = []
 
@@ -264,7 +263,7 @@ def calculate_lp_reward(world_model, trajectory_data, lr=1e-3):
         else:
             param.requires_grad = False
 
-    # 兜底：如果没找到 head（名字不匹配）
+    # Fallback in case no head parameters are matched.
     if len(params_to_update) == 0:
         print("[LP Warning] No head parameters found, fallback to all parameters.")
         for param in world_model.parameters():
@@ -272,31 +271,30 @@ def calculate_lp_reward(world_model, trajectory_data, lr=1e-3):
             params_to_update.append(param)
 
     # ============================================================
-    # 3. 临时优化器（Shadow Optimizer）
-    #    单步 SGD，避免 optimizer state snapshot
+    # 3. Temporary optimizer with a single SGD step.
     # ============================================================
     temp_optimizer = torch.optim.SGD(params_to_update, lr=lr)
 
     # ============================================================
-    # 4. Loss Before（更新前）
+    # 4. Loss before the temporary update
     # ============================================================
     loss_before = world_model.calc_loss(trajectory_data)
 
     # ============================================================
-    # 5. Shadow Update（只更新 head）
+    # 5. Temporary head-only update
     # ============================================================
     temp_optimizer.zero_grad(set_to_none=True)
     loss_before.backward()
     temp_optimizer.step()
 
     # ============================================================
-    # 6. Loss After（更新后）
+    # 6. Loss after the temporary update
     # ============================================================
     with torch.no_grad():
         loss_after = world_model.calc_loss(trajectory_data)
 
     # ============================================================
-    # 7. Restore：恢复所有参数数值 + requires_grad 状态
+    # 7. Restore parameter values and `requires_grad` flags
     # ============================================================
     with torch.no_grad():
         for name, param in world_model.named_parameters():
@@ -310,5 +308,5 @@ def calculate_lp_reward(world_model, trajectory_data, lr=1e-3):
     # ============================================================
     lp_reward = loss_before.item() - loss_after.item()
 
-    # 过滤数值抖动导致的极小负值
+    # Clamp tiny negative values caused by numerical noise.
     return max(0.0, lp_reward)

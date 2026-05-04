@@ -48,7 +48,7 @@ class ValidationDataModule(WMRLDataModule):
         # Use 100% data for test
         # Create a Subset that covers the full range
         self.data_test = torch.utils.data.Subset(data, range(0, len(data)))
-        # Train set is empty or just dummy
+        # Training split is intentionally empty in validation-only mode.
         self.data_train = torch.utils.data.Subset(data, range(0, 0))
         
         print(f"[ValidationDataModule] Used 100% data ({len(self.data_test)} samples) for validation.")
@@ -138,7 +138,7 @@ def run(
     should_use_validation_mode = cfg.attention_model.freeze_weight
     
     if should_use_validation_mode:
-        # User requested "Validation Only" mode (100% data, no split check)
+        # Validation-only mode uses 100% of the data without a train/val split.
         datamodule = ValidationDataModule(hparams=cfg.attention_model, data=direct_data, replay_data=None)
     elif cfg.attention_model.continue_learning:
         datamodule = WMRLDataModule(hparams=cfg.attention_model, data=direct_data, replay_data=replay_data)
@@ -149,9 +149,8 @@ def run(
     wandb_logger = None
     if use_wandb:
         wandb_logger = WandbLogger(project="Local_Attention_Training", log_model=True, reinit=True)
-        # Fix: Do NOT watch model during validation loop. 
-        # Watching adds hooks to the persistent 'net', which reference this temporary 'wandb_logger'.
-        # When 'wandb_logger' is GC'ed after this function returns, the hooks break.
+        # Avoid attaching W&B watch hooks during validation-only execution.
+        # Those hooks would outlive the temporary logger instance.
         if not cfg.attention_model.freeze_weight:
             # wandb_logger.experiment.watch(net, log='all', log_freq=1000)
             pass
@@ -219,10 +218,10 @@ def run(
         # ===== training =====
         trainer.fit(net, datamodule)
 
-        # 保存旧参数
+        # Save the current parameters as the consolidation anchor.
         old_params = net.save_old_params()
 
-        # 计算 Fisher
+        # Estimate the Fisher information matrix.
         fisher_samples = int(getattr(cfg.attention_model, "fisher_samples", 3000))
         scale_factor = cfg.attention_model.scale_factor
         new_fisher = net.compute_fisher(
@@ -231,7 +230,7 @@ def run(
             scale_factor=scale_factor
         )
 
-        # EMA 合并 Fisher
+        # Merge Fisher estimates with EMA smoothing.
         if fisher is not None:
             fisher = {
                 k: (1.0 - fisher_beta) * fisher[k] + fisher_beta * new_fisher[k]
@@ -241,7 +240,7 @@ def run(
             fisher = new_fisher
 
     # ... (in run)
-        # 保存 checkpoint
+        # Save the training checkpoint.
         model_pth = cfg.attention_model.model_save_path
         trainer.save_checkpoint(model_pth)
         if use_wandb:

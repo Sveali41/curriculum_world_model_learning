@@ -567,7 +567,7 @@ def p2e_baseline_experiment(cfg: DictConfig):
                 "inv_next": inv_next_n,
             }
 
-            # [NEW] Manual Save to .npz for auditing (stored together with random baselines)
+            # Save the collected data to `.npz` for later auditing.
             try:
                 save_dir = TRAINER_PATH / "data" / domain / "target_tasks"
                 os.makedirs(save_dir, exist_ok=True)

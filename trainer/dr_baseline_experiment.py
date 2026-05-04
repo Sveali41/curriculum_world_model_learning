@@ -153,7 +153,7 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         cfg.attention_model.data_type = d_cfg.data_type
     _apply_domain_collection_budget(cfg, domain_name)
 
-    # [NEW] Force Fresh Start (Delete existing checkpoint if requested)
+    # Optionally start from a clean checkpoint state.
     ckpt_path = cfg.attention_model.model_save_path
     force_fresh_start = bool(getattr(cfg, "force_fresh_start", False))
     if force_fresh_start:
@@ -176,7 +176,7 @@ def run_dr_baseline_experiment(cfg: DictConfig):
     temp_data_dir = Path(cfg.dr_temp_data_dir)
     os.makedirs(temp_data_dir, exist_ok=True)
     
-    # 强制将所有 UED 收集到的数据存在 dr temp 文件夹中
+    # Store all DR-collected data in the dedicated temporary directory.
     cfg.env.collect.data_folder = str(temp_data_dir) + "/"
 
     mask_suffix = f"_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"

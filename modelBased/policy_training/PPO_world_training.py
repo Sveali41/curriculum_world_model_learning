@@ -152,7 +152,7 @@ def run_ppo_wm(cfg):
             'embedding': Embedding_support.EmbeddingModule,
             'mlp': MLP_support.SimpleNNModule
         }
-    # 初始化模型
+    # Initialize the world model.
     module_class = MODEL_MAPPING.get(hparams_world_model.model_type.lower())
     if module_class is not None:
         model = module_class(
@@ -310,7 +310,7 @@ def run_ppo_wm(cfg):
             #         ppo_agent.update()
             #     else:
             #         print(f"[WARNING] Buffer mismatch, skipping update. Rewards={len(ppo_agent.buffer.rewards)}, StateValues={len(ppo_agent.buffer.state_values)}")
-            #         ppo_agent.buffer.clear()  # 强制清空，防止累积污染
+            #         ppo_agent.buffer.clear()  # Force-clear the buffer to avoid stale accumulation.
 
 
 
@@ -365,7 +365,7 @@ def run_ppo_wm(cfg):
             #endregion
 
             # break; if the episode is over
-            # 触发 update 的两种情况：
+            # Update is triggered in either of these two cases:
             if time_step % update_timestep == 0 or done or t >= max_ep_len:
                 need_update = True
 
@@ -375,7 +375,7 @@ def run_ppo_wm(cfg):
                 else:
                     print(f"[WARNING] Buffer mismatch, skipping update. Rewards={len(ppo_agent.buffer.rewards)}, StateValues={len(ppo_agent.buffer.state_values)}")
                     ppo_agent.buffer.clear()
-                break  # ← update 后必须跳出，防止污染 buffer
+                break  # Break immediately after update to avoid buffer contamination.
 
         print_running_reward += current_ep_reward
         print_running_episodes += 1

@@ -8,7 +8,7 @@ from generator.crafter_env_designer import CRAFTER_OBJ_MAP
 
 
 class ResBlock(nn.Module):
-    """标准残差块"""
+    """Standard residual block."""
     def __init__(self, channels: int):
         super().__init__()
         self.conv = nn.Sequential(

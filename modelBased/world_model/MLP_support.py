@@ -28,8 +28,8 @@ class SimpleNNModule(pl.LightningModule):
 
     def forward(self, state, action):
         orginal_dim = state.ndim
-        if orginal_dim == 3:  # 单个样本
-            state = state.unsqueeze(0)  # 变为 (1, C, H, W)
+        if orginal_dim == 3:  # Single sample
+            state = state.unsqueeze(0)  # Expand to (1, C, H, W).
             action = torch.tensor([action]).to(state.device)
         B, C, H, W = state.size()
         state = state.flatten(1)
@@ -85,7 +85,6 @@ class SimpleNNModule(pl.LightningModule):
     #     extracted_regions = torch.gather(state, dim=1, index=topk_indices.unsqueeze(-1).expand(-1, -1, state.size(-1)))
 
     #     return extracted_regions, topk_indices
-
 
 
 

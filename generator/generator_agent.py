@@ -103,7 +103,7 @@ class GeneratorPPO:
 
         self.mse = nn.MSELoss()
 
-        # === PPO Buffer (统一单样本维度) ===
+        # === PPO buffer with a consistent per-sample layout ===
         self.buffer = {
             "curr_map": [],
             "prev_map": [],
@@ -141,12 +141,12 @@ class GeneratorPPO:
     # ------------------------------------------------------------------
     def _compute_global_context_dual(self, prev_map, terrain_heat, stats_heat, top_k_features=16):
         """
-        聚合物理布局失败特征 (Spatial) 和 物资数值失败特征 (Inventory).
+        Aggregate spatial failure features and inventory failure features.
         For Crafter/MiniGrid we keep both:
         - local per-sample history context
         - global batch summary context
         """
-        # 使用更新后的 HistoryEncoder 提取每个样本的综合失败特征
+        # Use the HistoryEncoder to extract per-sample failure features.
         ctx = self.encoder(prev_map, terrain_heat, stats_heat) # [B, context_dim]
 
         if self.is_bipedal:
@@ -154,17 +154,17 @@ class GeneratorPPO:
         
         local_ctx = F.normalize(ctx, p=2, dim=1)
 
-        # 跨 Batch 取并集 (Max-Pooling)
+        # Aggregate across the batch with max pooling.
         v_ctx, _ = torch.max(ctx, dim=0, keepdim=True) # [1, context_dim]
 
-        # 显著性过滤 (Top-K Sparsification)
+        # Keep only the most salient features via top-k sparsification.
         if v_ctx.size(1) > top_k_features:
             top_val, _ = torch.topk(v_ctx, k=top_k_features, dim=1)
             min_val = top_val[:, -1:]
             mask = (v_ctx >= min_val).float()
             v_ctx = v_ctx * mask
 
-        # 数值归一化
+        # Normalize feature magnitudes.
         global_ctx = F.normalize(v_ctx, p=2, dim=1)
         global_ctx = global_ctx.expand(local_ctx.size(0), -1)
         return torch.cat([local_ctx, global_ctx], dim=1)
@@ -181,7 +181,7 @@ class GeneratorPPO:
             phs = None
         else:
             if prev_data is None:
-                # 初始状态：空地图、空热图、空背包热图
+                # Initial state: empty map, empty terrain heatmap, empty inventory heatmap.
                 H, W = base_map.size(2), base_map.size(3)
                 # pm: prev_map, pht: prev_heat_terrain, phs: prev_heat_stats
                 pm = torch.zeros((1, 3, H, W), device=device)
@@ -271,13 +271,13 @@ class GeneratorPPO:
     # ------------------------------------------------------------------
     def update(self, iteration=None):
             """
-            PPO 更新逻辑：
-            1. 从 Buffer 中提取并处理本轮收集到的所有经验。
-            2. 重新计算上下文 (Global Context) 以便更新 HistoryEncoder 的参数。
-            3. 计算 PPO 裁剪损失、价值损失以及熵损失。
-            4. 执行反向传播并同步策略。
+            PPO update logic:
+            1. Extract and process rollout data from the buffer.
+            2. Recompute context features for the HistoryEncoder.
+            3. Compute clipped PPO loss, value loss, and entropy loss.
+            4. Backpropagate and synchronize the old policy.
             """
-            # --- Step 0: 安全检查 ---
+            # --- Step 0: Safety checks ---
             if len(self.buffer["curr_map"]) == 0:
                 print("[GeneratorPPO] Warning: Buffer is empty, skipping update.")
                 return 0.0, 0.0
@@ -285,10 +285,10 @@ class GeneratorPPO:
                 self.round_lengths.append(self.current_round_count)
                 self.current_round_count = 0
 
-            # --- Step 1: 基础数据准备与归一化 ---
+            # --- Step 1: Basic data preparation and normalization ---
             rewards = torch.tensor(self.buffer["reward"], device=device)
 
-            # [Monitor] 打印平均奖励，用于判断策略是否收敛 (Mean Reward should increase)
+            # Monitor the mean reward as a coarse convergence signal.
             mean_reward = rewards.mean().item()
             self.last_mean_reward = mean_reward
             print(f"[GeneratorPPO] Mean Reward: {mean_reward:.4f}")
@@ -300,7 +300,7 @@ class GeneratorPPO:
                 f"{len(self.buffer['reward'])} samples"
             )
             
-            # 奖励归一化：保证奖励量级稳定
+            # Normalize rewards when there is meaningful variance.
             # FIX: Only normalize if there is variance. If all rewards are -5.0 (failure),
             # subtracting mean makes them all 0.0, killing the negative signal.
             if len(rewards) > 1 and rewards.std() > 1e-4:
@@ -310,7 +310,7 @@ class GeneratorPPO:
                 # Keep them as is so the agent knows it's failing.
                 pass
 
-            # 拼接 Buffer 里的张量并搬运到 GPU
+            # Concatenate buffered tensors and move them to the target device.
             curr_map = torch.cat(self.buffer["curr_map"]).to(device)
             mask = torch.cat(self.buffer["mask"]).to(device)
             action = torch.cat(self.buffer["action"]).to(device)
@@ -320,13 +320,13 @@ class GeneratorPPO:
             topk_mask = torch.cat(self.buffer["topk_mask"]).to(device)
             stats_topk_mask = torch.cat(self.buffer["stats_topk_mask"]).to(device)
 
-            # 获取用于 HistoryEncoder 的素材
+            # Gather HistoryEncoder inputs.
             prev_map = torch.cat(self.buffer["prev_map"]).to(device)
             prev_heat_terrain = torch.cat(self.buffer["prev_heat"]).to(device) # [B, 1, H, W]
             prev_heat_stats = torch.cat(self.buffer["stats_heat"]).to(device)     # [B, 16]
 
-            # --- Step 2: 优势函数归一化 (Advantage Normalization) ---
-            # 优势 = 实际奖励 - 预测价值。这是 PPO 稳定性的基石。
+            # --- Step 2: Advantage normalization ---
+            # Advantage = reward - value estimate.
             advantages = rewards - old_value.detach()
             
             # FIX: Only normalize advantages if they have variance.
@@ -335,7 +335,7 @@ class GeneratorPPO:
 
             last_loss = 0.0
 
-            # --- Step 3: PPO K-Epochs 训练循环 ---
+            # --- Step 3: PPO K-epoch training loop ---
             for i in range(self.K_epochs):
                 if self.encoder is None:
                     ctx = None
@@ -365,30 +365,30 @@ class GeneratorPPO:
 
                 ratio = torch.exp(total_logp - old_logprob.detach())
 
-                # 计算 PPO 裁剪后的 Surrogate Loss (防止策略更新过猛)
+                # Compute the clipped PPO surrogate loss.
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
 
-                # 4. 损失函数组合
-                # - Policy Loss: 让奖励高的动作概率变大
-                # - Value Loss: 让 Critic 估分更准 (MSE)
-                # - Entropy Loss: 不要太大，否则会强迫生成器永远随机乱下棋 (Reduced from 0.05 to 0.01 for stability)
+                # 4. Loss composition:
+                # - policy loss increases the probability of rewarding actions
+                # - value loss improves critic estimates
+                # - entropy loss preserves exploration
                 loss_policy = -torch.min(surr1, surr2).mean()
                 loss_value = 0.5 * self.mse(value, rewards)
                 loss_entropy = -current_entropy_coef * entropy.mean()
 
                 total_loss = loss_policy + loss_value + loss_entropy
                 
-                # --- 数值安全性检查 ---
+                # --- Numerical safety check ---
                 if torch.isnan(total_loss):
                     print(f"[GeneratorPPO] Warning: NaN detected in Epoch {i}. Stopping update.")
                     return 0.0, 0.0 
 
-                # --- Step 4: 反向传播与梯度裁剪 ---
+                # --- Step 4: Backpropagation and gradient clipping ---
                 self.optimizer.zero_grad()
                 total_loss.backward()
                 
-                # 同时裁剪 Policy 网络和 HistoryEncoder 的梯度，防止梯度爆炸
+                # Clip gradients for both the policy and the HistoryEncoder.
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
 
                 if self.encoder is not None:
@@ -399,12 +399,12 @@ class GeneratorPPO:
 
                 last_loss = total_loss.item()
 
-            # --- Step 5: 状态同步与清理 ---
-            # 更新完成后，将旧策略同步到最新状态，并清空 Buffer 迎接下一轮采样
+            # --- Step 5: State synchronization and cleanup ---
+            # Synchronize the old policy and trim the rollout buffer.
             self.policy_old.load_state_dict(self.policy.state_dict())
             self._trim_buffer_to_recent_rounds()
             
-            # [MODIFIED] Return entropy for monitoring
+            # Return entropy for monitoring.
             return last_loss, entropy.mean().item()
 
     # ------------------------------------------------------------------

@@ -90,7 +90,7 @@ def validate_policy(cfg):
             state_norm = normalize_obs(state, obs_norm_values)
             if isinstance(state_norm, np.ndarray):
                 state_norm = torch.tensor(state_norm, dtype=torch.float32).to(device)
-                # ---- 获取动作 ----
+                # ---- Select action ----
             action_out = ppo_agent.select_action(state_norm.flatten())
 
         if isinstance(action_out, tuple):

@@ -11,11 +11,11 @@ ACTION_SAMPLERS = {
     1: lambda: ('S', get_noisy_val(1.0, 0.4)),    # Small Stump (0.6 ~ 1.4)
     2: lambda: ('S', get_noisy_val(2.0, 0.4)),    # Medium Stump (1.6 ~ 2.4)
     3: lambda: ('S', get_noisy_val(3.0, 0.4)),    # Large Stump (2.6 ~ 3.4)
-    # 4~5: 坑 (PIT) - MUST BE INTEGER (Grid alignment)
+    # 4~5: Pit obstacles. Values must remain integer-aligned.
     4: lambda: ('P', random.randint(1, 2)),       # Small Pit (Width 1~2)
     5: lambda: ('P', random.randint(3, 4)),       # Large Pit (Width 3~4)
 
-    # 6~8: 台阶 (STAIRS) - MUST BE INTEGER (Number of steps)
+    # 6~8: Stair obstacles. Values must remain integer step counts.
     6: lambda: ('T', random.randint(2, 3)),       # Low Stairs Up (2~3 steps)
     7: lambda: ('T', random.randint(4, 6)),       # High Stairs Up (4~6 steps)
     8: lambda: ('T', random.randint(-3, -2)),     # Low Stairs Down (2~3 steps down)
@@ -24,7 +24,7 @@ ACTION_SAMPLERS = {
 
 # In BipedalWalker, the action map is practically identity-like because GeneratorInterface
 # will directly store the action_id into the grid to be interpreted later.
-# We expose a dummy table for the PPO agent to know the action space dimension.
+# Expose a simple lookup so the PPO agent can infer the action-space size.
 ACTION_TABLE_BIPEDAL = {i: i for i in range(10)}
 
 class BipedalPCGSeeder:

@@ -32,8 +32,8 @@ class AttentionWorldModel(pl.LightningModule):
         self.visualize_every = hparams.visualize_every
         self.step_counter = 0  
         self.data_type = hparams.data_type
-        self.ewc_ratio = getattr(hparams, "ewc_ratio", 0.2)           # 目标占比：EWC ≈ 20% * obs_loss；想手动控制就在 yaml 里设为 null
-        self.lambda_ema = getattr(hparams, "lambda_ema", 0.1)         # λ 的 EMA 平滑系数
+        self.ewc_ratio = getattr(hparams, "ewc_ratio", 0.2)           # Target ratio: EWC ~= 20% of obs_loss; set null in yaml to disable manual control.
+        self.lambda_ema = getattr(hparams, "lambda_ema", 0.1)         # EMA smoothing factor for lambda.
         self.lambda_ewc_min = getattr(hparams, "lambda_ewc_min", 1e-4)
         self.lambda_ewc_max = getattr(hparams, "lambda_ewc_max", 1e3)
         self.lambda_ewc = float(getattr(hparams, "lambda_ewc", 1.0))
@@ -45,9 +45,9 @@ class AttentionWorldModel(pl.LightningModule):
 
 
 
-        # 慢速外环（漂移）相关
+        # Slow outer-loop drift controller.
         self.warmup_steps = getattr(hparams, "warmup_steps", 100)
-        self.drift_cooldown = getattr(hparams, "drift_cooldown", 200)  # 多久允许调整一次
+        self.drift_cooldown = getattr(hparams, "drift_cooldown", 200)  # Minimum steps between adjustments.
         self._last_drift_update_step = -10**9
         self.drift_threshold = getattr(hparams, "drift_threshold", 1e-3)
         self.fisher = 0
@@ -65,7 +65,7 @@ class AttentionWorldModel(pl.LightningModule):
             'embedding': Embedding_support.EmbeddingModule,
             'mlp': MLP_support.SimpleNNModule
         }
-        # 初始化模型
+        # Initialize the prediction model.
         module_class = MODEL_MAPPING.get(hparams.model_type.lower())
         if module_class is not None:
             self.model = module_class(
@@ -109,10 +109,10 @@ class AttentionWorldModel(pl.LightningModule):
         return float(self.bipedal_token_loss_weights.get(token_name, 1.0))
     
     # def load_old_params(self, old_params):
-    #     """加载旧参数并应用到当前模型"""
+    #     """Load previous-task parameters into the current model."""
     #     for n, p in self.named_parameters():
     #         if n in old_params:
-    #             p.data.copy_(old_params[n])  # 使用旧参数的值替换当前参数
+    #             p.data.copy_(old_params[n])  # Overwrite the current parameter with the saved value.
 
     def compute_avg_param_drift(self) -> float:
         drift_sum = 0.0
@@ -132,22 +132,23 @@ class AttentionWorldModel(pl.LightningModule):
         Removed to ensure stability. Now uses fixed self.lambda_ewc.
         """
         pass 
-        # Stability fix: Do NOT dynamically change lambda based on inverse of drift.
+        # Keep lambda updates independent from inverse-drift heuristics.
         # This caused exploding updates or vanishing constraints.
         # We rely on fixed lambda_ewc set in config.
 
     def update_lambda_ewc(self, avg_drift: float):
         """
-        慢速外环：基于参数漂移 avg_drift 的 λ 调整（与快速占比控制器互补）
-        - warmup 自动学习 drift_threshold（当 hparams.drift_threshold 为 None 时）
-        - 冷却时间 cooldown：减少与快速控制器的相互干扰
-        - 滞回区间 hysteresis：超出阈值范围才调整
-        - 对数域微调：上下调更平滑，再做 EMA 平滑与边界裁剪
+        Slow outer-loop controller for `lambda` based on average parameter drift.
+        It complements the fast ratio controller by:
+        - learning `drift_threshold` during warmup when it is unset
+        - using a cooldown window to reduce interference with fast updates
+        - applying hysteresis so adjustments happen only outside a safe band
+        - updating in log space, then smoothing with EMA and clamping to bounds
         """
         import math
         import torch
 
-        # —— 保护性默认值（若没设定）——
+        # Protective defaults.
         if not hasattr(self, "lambda_ewc"):
             self.lambda_ewc = float(getattr(self.hparams, "lambda_ewc", 1.0))
         if not hasattr(self, "_drift_values"):
@@ -155,34 +156,34 @@ class AttentionWorldModel(pl.LightningModule):
         if not hasattr(self, "_last_drift_update_step"):
             self._last_drift_update_step = -10**9
 
-        # —— 读超参（允许在 hparams 或实例属性上覆盖）——
+        # Read hyperparameters, allowing overrides from `hparams` or instance attributes.
         warmup_steps = getattr(self.hparams, "warmup_steps", getattr(self, "warmup_steps", 100))
         cooldown = getattr(self.hparams, "drift_cooldown", getattr(self, "drift_cooldown", 200))
-        hi_ratio = getattr(self.hparams, "drift_hi", 1.10)  # 高于阈值 110% 才上调
-        lo_ratio = getattr(self.hparams, "drift_lo", 0.70)  # 低于阈值 70% 才下调
-        up_step = getattr(self.hparams, "drift_up_step", 0.10)  # 对数域上调步长
-        down_step = getattr(self.hparams, "drift_down_step", 0.05)  # 对数域下调步长
+        hi_ratio = getattr(self.hparams, "drift_hi", 1.10)  # Increase only above 110% of the threshold.
+        lo_ratio = getattr(self.hparams, "drift_lo", 0.70)  # Decrease only below 70% of the threshold.
+        up_step = getattr(self.hparams, "drift_up_step", 0.10)  # Log-space step size for increasing lambda.
+        down_step = getattr(self.hparams, "drift_down_step", 0.05)  # Log-space step size for decreasing lambda.
         lam_min = getattr(self.hparams, "lambda_ewc_min", getattr(self, "lambda_ewc_min", 1e-4))
         lam_max = getattr(self.hparams, "lambda_ewc_max", getattr(self, "lambda_ewc_max", 1e3))
         lam_ema = getattr(self.hparams, "lambda_ema", getattr(self, "lambda_ema", 0.1))
 
-        # —— 记录漂移日志 —— 
+        # Log drift statistics.
         self.log("train/avg_param_drift", avg_drift)
 
-        # —— warmup：若阈值为 None，则用前 warmup_steps 个漂移的均值做阈值 —— 
+        # During warmup, infer the threshold from the running drift mean if needed.
         if getattr(self, "drift_threshold", None) is None:
             self._drift_values.append(float(avg_drift))
             if len(self._drift_values) >= warmup_steps:
                 self.drift_threshold = float(sum(self._drift_values) / len(self._drift_values))
                 print(f"[Auto-tuned] drift_threshold set to {self.drift_threshold:.6f}")
-            # warmup 期间不调 λ
+            # Do not adjust lambda during warmup.
             return
 
-        # —— 冷却：避免频繁与快速控制器打架 —— 
+        # Cooldown prevents frequent interference with the fast controller.
         if self.global_step - self._last_drift_update_step < cooldown:
             return
 
-        # —— 滞回区间：超过才调 —— 
+        # Only adjust outside the hysteresis band.
         hi = self.drift_threshold * hi_ratio
         lo = self.drift_threshold * lo_ratio
 
@@ -199,11 +200,11 @@ class AttentionWorldModel(pl.LightningModule):
 
         if changed:
             lam_new = math.exp(lam_log)
-            # 边界裁剪
+            # Clamp to configured bounds.
             lam_new = float(torch.clamp(torch.tensor(lam_new), lam_min, lam_max))
-            # EMA 平滑
+            # Apply EMA smoothing.
             self.lambda_ewc = (1.0 - lam_ema) * self.lambda_ewc + lam_ema * lam_new
-            # 更新时间戳
+            # Update the last-adjustment step.
             self._last_drift_update_step = self.global_step
 
     def load_old_params(self, old_params):
@@ -386,18 +387,19 @@ class AttentionWorldModel(pl.LightningModule):
 
     def set_consolidation(self, old_params: dict, fisher: dict, load_weights: bool = True):
         """
-        设置 EWC 的“锚点”信息（旧参数 + Fisher），并可选地加载旧参数权重到当前模型。
+        Register the EWC anchor state (old parameters + Fisher matrix) and
+        optionally load the old parameters into the current model.
 
         Args:
-            old_params (dict): 上一阶段保存的模型参数 (state_dict)
-            fisher (dict): Fisher 信息矩阵
-            load_weights (bool): 是否将旧参数直接加载到当前模型
+            old_params (dict): Parameters saved from the previous phase.
+            fisher (dict): Fisher information matrix.
+            load_weights (bool): Whether to load the old weights into the model.
         """
         # ----------------------------------------------------------
-        # (1) 旧参数部分
+        # (1) Old-parameter anchor
         # ----------------------------------------------------------
         if old_params is not None:
-            # 保存旧参数为 CPU 版本 (float32)
+            # Store the old parameters on CPU in float32.
             self.old_params = {k: v.detach().cpu().float() for k, v in old_params.items()}
 
             if load_weights:
@@ -421,7 +423,7 @@ class AttentionWorldModel(pl.LightningModule):
             print("[EWC] No old_params provided — starting from scratch.")
 
         # ----------------------------------------------------------
-        # (2) Fisher 信息矩阵部分
+        # (2) Fisher information matrix
         # ----------------------------------------------------------
         if fisher is not None:
             self.fisher = {k: v.detach().cpu().float() for k, v in fisher.items()}
@@ -433,10 +435,12 @@ class AttentionWorldModel(pl.LightningModule):
 
     def ewc_loss(self):
         """
-        返回“原始 EWC 值”（未乘 lambda_ewc），在 fp32 中计算。
-        这里做了两个稳定化：
-        1) 显式 to(device)+float()，避免半精度参与
-        2) 按参数规模做平均（/count），让尺度与模型大小无关
+        Return the raw EWC value before multiplying by `lambda_ewc`, computed
+        in fp32 for stability.
+
+        Stabilization details:
+        1. Explicitly move tensors to device and cast to float32.
+        2. Normalize by model scale so the value is less sensitive to size.
         """
         device = next(self.parameters()).device
         if self.fisher is None or self.old_params is None:
@@ -445,7 +449,7 @@ class AttentionWorldModel(pl.LightningModule):
         total = torch.zeros((), device=device, dtype=torch.float32)
         count = 0
 
-        # 关闭 autocast，确保 fp32
+        # Disable autocast so the EWC term is always evaluated in fp32.
         with torch.amp.autocast("cuda", enabled=False):
             for n, p in self.named_parameters():
                 if not p.requires_grad:
@@ -459,17 +463,18 @@ class AttentionWorldModel(pl.LightningModule):
                 count += d.numel()
 
             if count > 0:
-                # 科学折中：不除以总参数数(会太小)，也不完全不除(会太大)。
-                # 我们除以参与参数化的“层”的数量（大约 50-100 层），让量级回到 1-10 之间。
+                # Use a moderate normalization factor: dividing by all parameters
+                # makes the term too small, while not normalizing at all makes it
+                # too large. Averaging over trainable layers keeps the scale usable.
                 num_layers = len([n for n, p in self.named_parameters() if p.requires_grad])
                 total = total / (num_layers * 2.0)
 
-        return total  # 注意：这里不乘 lambda
+        return total  # Intentionally return the raw term without multiplying by lambda.
     
     def accumulate_loss(self, loss_map, agent_pos):
         """
-        loss_map: (mask_size, mask_size)  局部loss
-        agent_pos: (y, x) 智能体在全局地图中的位置
+        loss_map: (mask_size, mask_size) local loss values
+        agent_pos: (y, x) agent position on the full map
         """
         ay, ax = agent_pos
         half = self.mask_size // 2
@@ -479,13 +484,13 @@ class AttentionWorldModel(pl.LightningModule):
                 global_y = ay + (dy - half)
                 global_x = ax + (dx - half)
 
-                # 边界检查，防止越界
+                # Bounds check to avoid indexing outside the full map.
                 if 0 <= global_y < self.row and 0 <= global_x < self.col:
                     value = loss_map[dy, dx].item()
                     self.loss_accumulator[global_y][global_x].append(value)
 
     def compute_cell_loss(self, next_pred, next_true):
-        # 计算每个位置的误差
+        # Compute the per-cell error map.
         if self.env_type == 'crafter':
             # Classification loss per cell (with target clamping)
             loss_map = crafter_classification_loss(
@@ -675,15 +680,15 @@ class AttentionWorldModel(pl.LightningModule):
 
 
     def configure_optimizers(self):
-        # 针对分类头 (self.fc) 使用更高的学习率，以加快对新环境瓦片的适应
-        # 其他参数使用标准学习率
+        # Use a higher learning rate for the classification head so it adapts
+        # faster to new environment tiles, while keeping the base model stable.
         head_params = []
         base_params = []
         
         for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
-            # 'fc' 是负责地图 Tile 分类的输出层
+            # `fc` is the output head that predicts tile classes.
             if 'model.fc.' in name:
                 head_params.append(param)
             else:
@@ -691,7 +696,7 @@ class AttentionWorldModel(pl.LightningModule):
 
         optimizer = optim.Adam([
             {'params': base_params, 'lr': self.lr},
-            {'params': head_params, 'lr': self.lr * 2.0} # 分类头学习率翻倍
+            {'params': head_params, 'lr': self.lr * 2.0}  # Double the learning rate for the head.
         ], betas=(0.9, 0.999), eps=1e-6, weight_decay=self.weight_decay)
 
         reduce_lr_on_plateau = ReduceLROnPlateau(optimizer, mode='min', min_lr=1e-8)
@@ -732,7 +737,7 @@ class AttentionWorldModel(pl.LightningModule):
         # extract positions where objects are located (use the most recent frame if stacked)
         C_base = 2 if self.env_type == 'crafter' else 3
         curr_obj_idx = (self.frame_stack - 1) * C_base
-        object_map = obs_masked[:, curr_obj_idx]  # 取最后一帧的第0通道 (B,H,W)
+        object_map = obs_masked[:, curr_obj_idx]  # Object channel from the most recent frame: (B, H, W).
         if self.env_type == 'crafter':
             # Interactive elements in Crafter: Cow(14), Zombie(15), Skeleton(16), Arrow(17), Plant(18)
             # Exclusion: Player(13) must be predicted precisely, Table(11)/Furnace(12) are static.
@@ -749,11 +754,11 @@ class AttentionWorldModel(pl.LightningModule):
 
 
     def training_step(self, batch, batch_idx):
-        # —— 前向 & 主损失 —— #
+        # Forward pass and primary loss.
         obs, act, obs_next, info, elements_mask, agent_pos, inv, inv_next = self.preprocess_batch(batch, True)
         obs_pred, attentionWeight, aux_pred = self(obs, act, info, inv=inv)
 
-        # [NEW] Crafter WM Visualization (Only in LAST EPOCH to save time)
+        # Restrict Crafter visualization to the final epoch to reduce overhead.
         is_last_epoch = False
         try:
             is_last_epoch = (self.current_epoch == self.trainer.max_epochs - 1)
@@ -815,13 +820,13 @@ class AttentionWorldModel(pl.LightningModule):
                         log_name = f"train/token_{token_name}_mse"
                     self.train_token_loss_accumulator[token_name].append(float(token_loss.detach().cpu()))
         
-        # —— raw EWC（未乘 λ）—— #
+        # Raw EWC term before multiplying by lambda.
         ewc_raw = self.ewc_loss()
 
-        # —— 快控制：这里用 Weighted Loss 来平衡 EWC，因为它们都在 "Optimization Space" —— #
+        # Fast controller: balance EWC against the weighted optimization loss.
         self.update_lambda_ewc_by_ratio(weighted_obs_loss, ewc_raw, self.ewc_ratio)
 
-        # —— 合成总损失 —— #
+        # Compose the total loss.
         ewc_term = self.lambda_ewc * ewc_raw
         loss_total = weighted_obs_loss + ewc_term
         if self.is_bipedal and aux_pred is not None and "contact_logits" in aux_pred:
@@ -856,11 +861,11 @@ class AttentionWorldModel(pl.LightningModule):
                 inv_loss = (F.mse_loss(inv_pred, inv_next.float(), reduction='none') * inv_weights).mean()
             else:
                 inv_loss = F.mse_loss(inv_pred, inv_next.float())
-            # 加大背包损失权重 (从 15.0 -> 5.0)，平衡背包与地图信号
+            # Keep the inventory term amplified so it stays competitive with map prediction.
             loss_total = loss_total + 5.0 * inv_loss
             self.log("train/inv_loss", inv_loss, prog_bar=True, on_step=True, on_epoch=True)
 
-        # —— 统一日志 —— #
+        # Unified logging.
         # Log raw_mse as 'loss_obs' for compatibility
         self.log("loss_obs", raw_mse, prog_bar=True, on_step=True, on_epoch=True)
         
@@ -950,10 +955,10 @@ class AttentionWorldModel(pl.LightningModule):
         #         flat_idx = max_indices[idx].item()
         #         pred_val = obs_pred[idx].reshape(-1)[flat_idx].item()
         #         true_val = obs_next[idx].reshape(-1)[flat_idx].item()
-        #         print(f"索引 {idx.item()} 最大差值: {max_diff_per_group[idx].item():.4f}, "
+        #         print(f"Index {idx.item()} max diff: {max_diff_per_group[idx].item():.4f}, "
         #             f"pred={pred_val:.4f}, true={true_val:.4f}")
         
-        # 将loss映射回全局并保存到列表中
+        # Map local loss back to global coordinates and store it.
         if getattr(self.hparams, "keep_cell_loss", False) and not getattr(self, 'is_bipedal', False):
             loss_map = self.compute_cell_loss(obs_pred, obs_next)
             batch_size = loss_map.shape[0]
@@ -986,7 +991,7 @@ class AttentionWorldModel(pl.LightningModule):
                 batch_semantic = torch.stack([hull_err, leg1_err, leg2_err, lidar_err, contact_err], dim=1) # [B, 5]
                 self.bipedal_semantic_acc.append(batch_semantic.cpu())
         
-        # [NEW] Crafter WM Visualization for Validation (Dataset 2)
+        # Crafter validation visualization for the secondary dataset.
         if self.visualizationFlag and (not self.is_bipedal) and batch_idx == 0:
             if self.env_type == 'crafter':
                 visualize_crafter_wm(obs, obs_next, obs_pred, int(act[0].item()), self.step_counter, 

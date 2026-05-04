@@ -477,29 +477,29 @@ def augment_interactions_keydoor_only(
 
 def run_env_worker(args):
     env_fn, cfg, wandb_run, policy, rmax_exploration, save_img = args
-    env = env_fn()  # 每个子进程单独创建自己的环境
+    env = env_fn()  # Each subprocess creates its own environment instance.
     return run_env(env, cfg, wandb_run, policy, rmax_exploration, save_img)
 
 def run_env_multiprocess(cfg, wandb_run, policy=None, rmax_exploration=None, save_img=False, num_workers=4):
     import multiprocessing as mp
     from modelBased.common.utils import get_env
 
-    # 设置多进程启动方式（只需设置一次）
+    # Configure the multiprocessing start method once.
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
-        pass  # 如果已经设置过就忽略
+        pass  # Ignore the error if it was already configured.
 
-    # 环境构造函数：每个子进程用它创建独立环境
+    # Environment factory used by each subprocess.
     env_fn = lambda: get_env(cfg.env.name)
 
-    # 多个子进程的参数列表
+    # Argument list for all subprocess workers.
     args_list = [(env_fn, cfg, wandb_run, policy, rmax_exploration, save_img) for _ in range(num_workers)]
 
     with mp.Pool(processes=num_workers) as pool:
         results = pool.map(run_env_worker, args_list)
 
-    # 合并结果
+    # Merge worker outputs.
     obs_np, obs_next_np, act_np, rew_np, done_np, info_np = zip(*results)
 
     return (
@@ -519,8 +519,8 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     inv_list_cur, inv_list_next = [], []  # Crafter only: inventory (16-dim)
     episodes = 0
     obs = env.reset()[0]
-    has_carried_key_this_episode = False  # 新增：本轮是否已经捡过钥匙
-    step_in_episode = 0  # 当前 episode 中的 step 计数器
+    has_carried_key_this_episode = False  # Track whether a key was carried in this episode.
+    step_in_episode = 0  # Step counter within the current episode.
     max_x_in_episode = 0.0  # BipedalWalker only: Odometry tracking
     max_x_global = 0.0  # BipedalWalker only: max distance across the full collection run
     collect_cfg = cfg.env.collect if hasattr(cfg, "env") else cfg.collect
@@ -543,7 +543,7 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
     if randomize_inventory and is_crafter:
         cg = env.unwrapped.char_grid
         h_grid, w_grid = cg.shape
-        # Collect all non-water tiles
+        # Collect all non-water tiles.
         all_terrestrial = [(c, r) for r in range(h_grid) for c in range(w_grid) if cg[r,c] != 'W']
         np.random.shuffle(all_terrestrial)
         ground_tiles_queue = all_terrestrial
@@ -553,9 +553,9 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
         nonlocal ground_tiles_queue
         if not ground_tiles_queue:
             return None
-        # Use simple cycling: pop from start
+        # Cycle through the queue by popping from the front.
         pt = ground_tiles_queue.pop(0)
-        # Re-append to end to keep it infinite but exhaustive
+        # Re-append to keep the queue exhaustive across repeated passes.
         ground_tiles_queue.append(pt)
         return pt
 
@@ -595,9 +595,9 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
             setattr(player, stat, float(np.random.randint(5, 10)))
         all_possible_items = ['wood', 'stone', 'coal', 'iron', 'diamond', 'sapling', 'wood_pickaxe', 'stone_pickaxe', 'iron_pickaxe', 'wood_sword', 'stone_sword', 'iron_sword']
         for item in all_possible_items:
-            # 强化高级工具概率 (70% 概率携带)
+            # Bias toward carrying advanced tools with 70% probability.
             player.inventory[item] = 1.0 if (('pickaxe' in item or 'sword' in item) and np.random.random() < 0.7) else float(np.random.randint(0, 5))
-        # 立即同步观测数据
+        # Refresh the observation immediately after inventory edits.
         obs = env.unwrapped._extract_obs()
 
 
@@ -722,23 +722,23 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
             if randomize_inventory and is_crafter:
                 player = env.unwrapped.env._player
                 
-                # 生理指标均匀采样 [1, 9]
+                # Sample survival stats uniformly from [1, 9].
                 for stat in ['health', 'food', 'drink', 'energy']:
                     setattr(player, stat, float(np.random.randint(1, 10)))
                 
-                # 基础材料均匀采样 [0, 9]
+                # Sample basic materials uniformly from [0, 9].
                 materials = ['wood', 'stone', 'coal', 'iron', 'diamond', 'sapling']
                 for item in materials:
                     player.inventory[item] = float(np.random.randint(0, 10))
                 
-                # 工具/武器均匀化分布采样
+                # Sample tools and weapons from a uniform subset distribution.
                 tools = ['wood_pickaxe', 'stone_pickaxe', 'iron_pickaxe', 'wood_sword', 'stone_sword', 'iron_sword']
                 num_tools = np.random.randint(0, len(tools) + 1)
                 selected_tools = np.random.choice(tools, num_tools, replace=False)
                 for t in tools:
                     player.inventory[t] = 1.0 if t in selected_tools else 0.0
                 
-                # 同步观测
+                # Refresh the observation after editing the inventory.
                 obs = env.unwrapped._extract_obs()
 
             # Record observation
@@ -845,7 +845,7 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
 
             #     obs_diff = obs_next['image'].astype(int) - obs['image'].astype(int)
             #     tqdm.write(f"obs_next - obs (nonzero count): {obs_diff}")
-            #     # 可选：如果图像小，可以直接打印出差值矩阵
+            #     # Optional: print the raw difference matrix directly for tiny images.
             #     # tqdm.write(f"Diff:\n{obs_diff}")
 
             #     has_carried_key_this_episode = True
@@ -959,7 +959,7 @@ def run_env(env, cfg: DictConfig, wandb_run, log_name, policy=None, rmax_explora
                     obs = env.unwrapped._extract_obs()
 
                 info_list.append([{'carrying_key': False}])  
-                has_carried_key_this_episode = False  # 重置本轮状态
+                has_carried_key_this_episode = False  # Reset per-episode state.
                 step_in_episode = 0
             else:
                 obs = obs_next
@@ -1164,7 +1164,7 @@ def run_env_uniform(env, cfg, wandb_run, log_name, policy=None, rmax_exploration
                     obs_dict = env.reset()[0]
                     env.unwrapped.agent_pos = (x, y)
                     env.unwrapped.agent_dir = dir
-                    obs = env.unwrapped._extract_obs() # 立即同步观测
+                    obs = env.unwrapped._extract_obs()  # Refresh the observation immediately.
                 except Exception:
                     continue
 
@@ -1395,32 +1395,32 @@ def sample_keydoor_pref(
 
 def filter_keydoor_only(env, obs, obs_next, act, rew, done, info, move_keep_ratio=0.2):
     """
-    保留与 key/door 有关的交互行为，丢弃大部分 random move。
+    Keep interactions related to key/door mechanics and discard most random movement.
     - keydoor: pickup / toggle / carrying_key=True
-    - move: 其他动作，仅保留一定比例
+    - move: all other actions, retained only at a configurable ratio
     """
     num = obs.shape[0]
     flat_act = act.reshape(num)
 
-    # 关键动作（key, door交互）
+    # Key interaction actions (key / door related).
     KEYDOOR_ACTIONS = [env.unwrapped.actions.pickup, env.unwrapped.actions.toggle]
 
     is_keydoor = np.zeros(num, dtype=bool)
     for a in KEYDOOR_ACTIONS:
         is_keydoor |= (flat_act == a)
 
-    # carrying key 的步骤也保留
+    # Also retain steps where the agent is carrying a key.
     is_keydoor |= np.array([i.get("carrying_key", False) for i in info])
 
-    # Movement action → 剩余的全是移动
+    # Remaining actions are treated as movement.
     move_idx = np.where(~is_keydoor)[0]
     keep_move = np.random.rand(len(move_idx)) < move_keep_ratio
     move_keep_idx = move_idx[keep_move]
 
-    # 保留的关键交互
+    # Indices for retained key/door interactions.
     keydoor_idx = np.where(is_keydoor)[0]
 
-    # 合并最终保留的 index
+    # Merge the final retained indices.
     final_idx = np.concatenate([keydoor_idx, move_keep_idx])
     np.random.shuffle(final_idx)
 
@@ -1454,23 +1454,24 @@ def _keydoor_mask(env, obs, obs_next, act, info, require_changed=True):
 def downsample_moves_only(
     env,
     obs, obs_next, act, rew, done, info,
-    move_keep_ratio,     # 仅对“非 key/door”样本随机保留这部分比例
-    require_changed=True,     # 只把真正改变状态的样本视为 key/door
-    min_keep_moves=1,         # 至少保留这么多移动样本，防止空
+    move_keep_ratio,     # Randomly retain this fraction of non-key/door samples.
+    require_changed=True,     # Treat a sample as key/door only if it changes state.
+    min_keep_moves=1,         # Keep at least this many movement samples.
     shuffle=True
 ):
     """
     downsampling the data which is just moving around,
     to improving the training of the interact with key-door info
     """
-    # 统一 info 为 list
+    # Normalize `info` to a Python list.
     info_list = info if isinstance(info, list) else list(info)
 
     is_keydoor = _keydoor_mask(env, obs, obs_next, act, info_list, require_changed=require_changed)
     kd_idx  = np.where(is_keydoor)[0]
     mov_idx = np.where(~is_keydoor)[0]
 
-    # 若没有 key/door 样本（例如 Empty），直接按比例下采移动；否则仅对 mov 下采
+    # If there are no key/door samples, downsample movement directly.
+    # Otherwise, only downsample the movement subset.
     if kd_idx.size == 0:
         keep_mask = np.random.rand(mov_idx.size) < move_keep_ratio
         mov_keep_idx = mov_idx[keep_mask]
@@ -1486,7 +1487,7 @@ def downsample_moves_only(
         final_idx = np.concatenate([kd_idx, mov_keep_idx])
 
     if final_idx.size == 0:
-        # 兜底：至少保留一条
+        # Fallback: keep at least one sample.
         final_idx = np.array([0])
 
     if shuffle:
@@ -1525,7 +1526,7 @@ def data_collect(cfg: DictConfig):
                                    ai_enabled=stochastic, slippery_prob=slippery_prob)
     elif env_type == "bipedalwalker":
         if mode != 'human':
-            # 强制 PyGame 不要创建任何物理窗口（部分系统 HIDDEN 依然会闪屏）
+            # Force PyGame into headless mode; some systems still flash a window otherwise.
             os.environ["SDL_VIDEODRIVER"] = "dummy"
         
         env_path = getattr(cfg.env, "env_path", None)
@@ -1778,17 +1779,17 @@ def _finalize_and_save(
 
 def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverage"):
     """
-    可视化数据集中 agent 的位置覆盖热力图
-    - 自动调用 get_agent_position() 提取 agent 坐标
+    Visualize agent-position coverage as a heatmap over the dataset.
+    - Automatically extracts agent coordinates with `get_agent_position()`
     """
 
     # -------------------------------
-    # Step 1: 调用已有函数提取位置
+    # Step 1: extract positions with the existing helper.
     # -------------------------------
     obs_np = data['a']
     raw_obs = obs_np
-    # 如果是 (N, H, W, C) 则转换，否则保持不变 (注意 Crafter 符号化是 C=2)
-    if obs_np.shape[1] not in [2, 3, 4, 5]:  # 通道数异常 -> 应该是放在最后
+    # If the array is NHWC, convert it to NCHW; Crafter symbolic observations use C=2.
+    if obs_np.shape[1] not in [2, 3, 4, 5]:  # Unusual channel count likely means channels-last.
         obs_np = np.moveaxis(obs_np, -1, 1)
         
     is_crafter_symbolic = (obs_np.shape[1] == 2)
@@ -1801,7 +1802,7 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
     else:
         positions = get_agent_position(obs_np)  # (N, 2)
 
-    # 自动推断地图大小 (Standardized to NCHW from save_experiments)
+    # Infer the map size automatically after standardizing to NCHW.
     if isinstance(obs_np, torch.Tensor):
         obs_np = obs_np.detach().cpu().numpy()
     
@@ -1813,7 +1814,7 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
         positions = get_agent_position(obs_np)  # Returns (y, x) for NCHW
 
     # -------------------------------
-    # Step 2: 统计访问次数
+    # Step 2: count visits at each position.
     # -------------------------------
     heatmap = np.zeros((Height, Width)) 
     

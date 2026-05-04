@@ -81,11 +81,11 @@ attention_model:
   frame_stack: 1  # K=1 for deterministic Crafter (no need for temporal context)
 
   # freeze weights
-  freeze_weight: False  # 置true 会加载权重，不会训练模型，用于验证
+  freeze_weight: False  # When true, load weights and skip further training.
   model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_${env.env_type}.ckpt
 
   # resume training
-  resume_training: False  # 是否继续训练
+  resume_training: False  # Resume training from a previous checkpoint when enabled.
   resume_path: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_${env.env_type}_old.ckpt
   fisher_buffer_size: 500000
 
@@ -96,13 +96,13 @@ attention_model:
   direction_map: {0: 'right', 1: 'down', 2: 'left', 3: 'up'}
   action_map: {0: 'left', 1: 'right', 2: 'forward', 3: 'pickup', 4: 'toggle'}
   continue_learning: True
-  lambda_ewc: 100         # ← 从 1e8 改到 1.0
-  ewc_ratio: 0.2           # ← 开启“按占比自适应”，想手动就设 null
+  lambda_ewc: 100         # EWC regularization strength
+  ewc_ratio: 0.2           # Adaptive ratio target; set to `null` for manual control
   lambda_ema: 0.1
   lambda_ewc_min: 10
   lambda_ewc_max: 1.0e3
   scale_factor: 1.0
-  drift_threshold: null     # ← 让它自动 warmup 学出来
+  drift_threshold: null     # Learned automatically during warmup when left unset
   warmup_steps: 100
   drift_cooldown: 200
   drift_hi: 1.10
@@ -180,4 +180,3 @@ R_max:
   exploration_timesteps: 1e4
   num_iterations: 1
   exploration_threshold: 10
-

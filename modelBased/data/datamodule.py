@@ -136,27 +136,27 @@ class WMRLDataset(Dataset):
     @func_set_timeout(1000)
     def make_data(self, loaded, replay_data=None):
         """
-        准备训练数据集：将当前迭代的新数据与历史 Replay Buffer 数据进行混合。
-        
-        核心逻辑：
-        1. **回放控制 (Replay Control)**：为了防止海量历史数据淹没当前的新数据（导致“灾难性遗忘”当前任务），
-           强制限制 Replay 数据的数量不超过当前数据的一定比例（默认 50%）。
-        2. **随机采样 (Sampling)**：如果 Replay Buffer 的数据量超过了上述限制，则进行随机抽样。
-        3. **目标计算 (Target Calculation)**：计算 `obs_delta` (下一帧 - 当前帧) 作为 World Model 的预测目标，
-           而不是直接预测原始的下一帧图像。这能显著提高学习的数值稳定性。
-        
+        Build the training dataset by mixing newly collected data with replay-buffer data.
+
+        Core logic:
+        1. Replay control: cap replay volume so historical data does not drown out
+           the current iteration's samples.
+        2. Sampling: subsample replay data when it exceeds the allowed ratio.
+        3. Target construction: use `obs_delta` (next frame minus current frame)
+           as the world-model target when appropriate for better numerical stability.
+
         Args:
-            loaded (dict): 包含当前迭代新数据的字典 (obs, next, act, info)。
-            replay_data (dict, optional): 来自 Replay Buffer 的历史数据字典。
+            loaded (dict): Current-iteration samples (obs, next, act, info).
+            replay_data (dict, optional): Historical samples from the replay buffer.
         """
         import numpy as np
         seed = getattr(self.hparams, "seed", None)
         if seed is None:
             env_seed = os.environ.get("PYTHONHASHSEED")
             seed = int(env_seed) if env_seed is not None else 0
-        rng = np.random.default_rng(int(seed))  # 统一随机源，并与全局 seed 对齐
+        rng = np.random.default_rng(int(seed))  # Use one RNG aligned with the global seed.
 
-        # ===== 基础取数 =====
+        # ===== Load raw arrays =====
         mask_size = self.hparams.attention_mask_size
         env_type  = self.hparams.env_type
         obs, obs_next, act = loaded['a'], loaded['b'], loaded['c']
@@ -178,7 +178,7 @@ class WMRLDataset(Dataset):
         current_n = len(obs)
         assert current_n == len(obs_next) == len(act), "[BUG] Current lengths inconsistent!"
 
-        # [NEW] Training Sample Capping: Only use a subset if specified
+        # Optional training-sample cap: use only a subset if configured.
         max_train_samples = int(getattr(self.hparams, "max_train_samples", 0))
         if 0 < max_train_samples < current_n:
             indices = rng.choice(current_n, size=max_train_samples, replace=False)
@@ -191,7 +191,7 @@ class WMRLDataset(Dataset):
             current_n = max_train_samples
             print(f"[Dataset] Capped current task data to {max_train_samples} samples.")
 
-        # [NEW] Check for empty current and replay datasets immediately
+        # Short-circuit when both current and replay datasets are empty.
         if current_n == 0 and (replay_data is None or len(replay_data.get('obs', [])) == 0):
             return {'obs': np.array([]), 'obs_next': np.array([]), 'act': np.array([])}
 
@@ -218,8 +218,8 @@ class WMRLDataset(Dataset):
              # If stack=1, we do NOTHING. Exactly like original.
              pass
 
-        # ===== (1) 控制 replay 占比：replay ≤ new =====
-        # 从 hparams 读取可选的比例配置；默认 0.5
+        # ===== (1) Control the replay ratio: replay <= configured fraction of new data =====
+        # Read the optional replay ratio from hparams; default is 0.5.
         replay_frac = float(getattr(self.hparams, "replay_frac", 0.5))
         replay_frac = max(0.0, min(50.0, replay_frac))  # Allow higher ratios (e.g., 6.0 user request)
         
@@ -230,7 +230,7 @@ class WMRLDataset(Dataset):
 
         if replay_data is not None and 'obs' in replay_data and replay_data['obs'] is not None:
             R = len(replay_data['obs'])
-            # 只抽取不超过 max_replay 的样本
+            # Sample at most `max_replay` items from the replay buffer.
             if R > max_replay and max_replay > 0:
                 idx = rng.choice(R, size=max_replay, replace=False)
                 r_obs      = replay_data['obs'][idx]
@@ -275,7 +275,7 @@ class WMRLDataset(Dataset):
                 r_obs = self._sanitize_minigrid_channels(r_obs, tag="replay_obs")
                 r_obs_next = self._sanitize_minigrid_channels(r_obs_next, tag="replay_obs_next")
 
-            # 拼接 (Note: r_obs must have same shape as obs, i.e. already stacked if frame_stack > 1)
+            # Concatenate replay data. `r_obs` must already match the current input shape.
             if r_obs.shape[1:] == obs.shape[1:]:
                 obs      = np.concatenate([obs,      r_obs     ], axis=0) if current_n > 0 else r_obs
                 obs_next = np.concatenate([obs_next, r_obs_next], axis=0) if current_n > 0 else r_obs_next
@@ -289,7 +289,7 @@ class WMRLDataset(Dataset):
             else:
                 print(f"Warning: Replay buffer obs shape {r_obs.shape} does not match current obs shape {obs.shape}. Skipping replay.")
 
-            # 统一洗牌
+            # Shuffle all samples together.
             N = len(obs)
             if N > 0:
                 perm = rng.permutation(N)
@@ -316,7 +316,7 @@ class WMRLDataset(Dataset):
         # Use the latest frame in stacked obs to calculate delta against obs_next
         obs_latest = obs[:, -C_base:] if (obs.ndim > 1 and obs.shape[1] > C_base) else obs
 
-        # ===== (2) 生成目标 =====
+        # ===== (2) Build training targets =====
         if self.hparams.data_type == 'norm':
             obs_f      = normalize_obs(obs,      self.obs_norm_values).astype(np.float32)
             obs_next_f = normalize_obs(obs_next, self.obs_norm_values).astype(np.float32)
@@ -336,7 +336,7 @@ class WMRLDataset(Dataset):
                         f"valid=[0, {int(self.act_norm_values) - 1}]"
                     )
                     np.clip(act_f, 0, int(self.act_norm_values) - 1, out=act_f)
-            obs_f = obs  # 保留原离散值以便可视化/调试
+            obs_f = obs  # Keep discrete values unchanged for visualization/debugging.
 
             if env_type == 'crafter':
                 # For Crafter: predict the ABSOLUTE next frame (not delta).
@@ -352,7 +352,7 @@ class WMRLDataset(Dataset):
         else:
             raise ValueError(f"Invalid data type: {self.hparams.data_type}")
 
-        # ===== (3) 打包 =====
+        # ===== (3) Package the dataset =====
         data = {'obs': obs_f, 'obs_next': obs_delta, 'act': act_f}
         if env_type == 'with_obj' and info is not None:
             data['info'] = info
@@ -370,7 +370,7 @@ class WMRLDataset(Dataset):
         lengths = [len(self.data[k]) for k in self.data]
         if not all(l == lengths[0] for l in lengths):
             print(f"[BUG] Inconsistent lengths! { {k: len(self.data[k]) for k in self.data} }")
-        return lengths[0]  # 以第一个 key 的长度为准
+        return lengths[0]  # Use the first key as the canonical dataset length.
 
     def __getitem__(self, idx):
         try:
