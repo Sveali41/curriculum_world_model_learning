@@ -29,5 +29,6 @@ trainer/logs
 trainer/data
 trainer/results
 trainer/*.png
+trainer/experiments_visualization.ipynb
 my_research_project.egg-info/
-
+trainer/experiments_visualization.ipynb
