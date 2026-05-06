@@ -269,9 +269,9 @@ generator_agent:
   div_reset_interval: 20
 
 ablation:
-  type: "no_history" # "none"|"no_diversity"|"no_history"
+  type: "no_diversity" # "none"|"no_diversity"|"no_history"
 
-seed: 20
+seed: 4
 force_fresh_start: true         # Set to true to delete old model and start from scratch
 
 # Temporary NPZ path used during MAC WM retraining

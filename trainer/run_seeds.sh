@@ -4,7 +4,7 @@
 
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
-for SEED in 2 3 4; do
+for SEED in 1 2 3 4; do
     echo "=========================================================="
     echo "PHASE: Running Seed $SEED"
     echo "=========================================================="
@@ -18,12 +18,12 @@ for SEED in 2 3 4; do
     # python3 trainer/target_baseline_experiment.py seed=$SEED
 
     # 3. run dr baseline experiment
-    echo "[DR] Starting random baseline collection and training..."
-    python trainer/dr_baseline_experiment.py seed=$SEED
+    # echo "[DR] Starting random baseline collection and training..."
+    # python trainer/dr_baseline_experiment.py seed=$SEED
 
     # 4. run mac baseline experiment
-    # echo "[MAC] Starting random baseline collection and training..."
-    # python trainer/mac_wm_learning.py seed=$SEED
+    echo "[MAC] Starting random baseline collection and training..."
+    python trainer/mac_wm_learning.py seed=$SEED
     
     # echo "----------------------------------------------------------"
     # echo "[Done] Seed $SEED experiments completed."

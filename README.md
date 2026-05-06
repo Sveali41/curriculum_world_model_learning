@@ -90,114 +90,58 @@ Some dependencies are environment-specific or GPU-specific, especially:
 
 If you are reproducing only a subset of experiments, you may need to adapt those packages to your local CUDA / OS setup.
 
-## Main Entry Points
+## 1. Dataset Generation (Pre-requisite)
 
-### Standalone dataset collection
+### Uniform Validation Data Collection 
 
-Collect a dataset using the default config in `modelBased/config/config.yaml`:
-
-```bash
-python modelBased/data/data_collect.py domain=crafter
-python modelBased/data/data_collect.py domain=minigrid
-python modelBased/data/data_collect.py domain=bipedalwalker
-```
-
-### Standalone world model training
-
-Train the world model from the collected dataset:
+To ensure fair evaluation and a rigorous comparison across all baselines, we first collect a unified, fixed uniform validation dataset. This guarantees that all reported metrics are evaluated on the exact same test distribution, eliminating variance from random dataset generation.
 
 ```bash
-python modelBased/world_model/AttentionWM_training.py domain=crafter
-python modelBased/world_model/AttentionWM_training.py domain=minigrid
-python modelBased/world_model/AttentionWM_training.py domain=bipedalwalker
+python modelBased/data/data_collect.py domain=crafter env.collect.data_type=uniform
+python modelBased/data/data_collect.py domain=minigrid env.collect.data_type=uniform
+python modelBased/data/data_collect.py domain=bipedalwalker env.collect.data_type=uniform
 ```
 
-### Standalone policy training / testing
+*Note: After generating the uniform datasets, ensure that the `validation_data_dir` parameter in your configurations (e.g., `modelBased/config/config.yaml` or under `trainer/conf/`) points to the resulting `*_uniform.npz` files before running the baselines.*
 
+*(Optional) To collect standard random datasets or run standalone world-model/policy training, refer to the scripts in `modelBased/data/` and `modelBased/world_model/`.*
+
+## 2. Main Experiments & Baselines
+
+All experiment drivers use Hydra configs under [`trainer/conf/`](trainer/conf/). You can run any baseline by specifying the target `domain` and `seed`.
+
+**1. MAC / adversarial curriculum generation (Ours)**
 ```bash
-python modelBased/policy_training/PPO_world_training.py domain=minigrid
-python modelBased/policy_training/PPO_world_test.py domain=minigrid
+python trainer/mac_wm_learning.py domain=<domain> seed=0
 ```
+*Ablations: append `ablation.type=no_history` or `ablation.type=no_diversity`.*
 
-## Main Experiments
-
-All experiment drivers use Hydra configs under [`trainer/conf/`](trainer/conf/).
-
-### 1. MAC / curriculum generation
-
-Config: `trainer/conf/config_mac.yaml`
-
+**2. DR baseline (domain randomization)**
 ```bash
-python trainer/mac_wm_learning.py domain=crafter seed=0
-python trainer/mac_wm_learning.py domain=minigrid seed=0
-python trainer/mac_wm_learning.py domain=bipedalwalker seed=0
+python trainer/dr_baseline_experiment.py domain=<domain> seed=0
 ```
 
-Ablations:
-
+**3. Target-task baseline**
 ```bash
-python trainer/mac_wm_learning.py domain=crafter seed=0 ablation.type=no_history
-python trainer/mac_wm_learning.py domain=crafter seed=0 ablation.type=no_diversity
+python trainer/target_baseline_experiment.py domain=<domain> seed=0
 ```
 
-### 2. DR baseline
-
-Config: `trainer/conf/config_dr.yaml`
-
+**4. P2E baseline**
 ```bash
-python trainer/dr_baseline_experiment.py domain=crafter seed=0
-python trainer/dr_baseline_experiment.py domain=minigrid seed=0
-python trainer/dr_baseline_experiment.py domain=bipedalwalker seed=0
+python trainer/p2e_baseline.py domain=<domain> seed=0
 ```
 
-### 3. Target-task baseline
-
-Config: `trainer/conf/config_target_baseline.yaml`
-
-```bash
-python trainer/target_baseline_experiment.py domain=crafter seed=0
-python trainer/target_baseline_experiment.py domain=minigrid seed=0
-python trainer/target_baseline_experiment.py domain=bipedalwalker seed=0
-```
-
-### 4. P2E baseline
-
-Config: `trainer/conf/config_p2e.yaml`
-
-```bash
-python trainer/p2e_baseline.py domain=crafter seed=0
-python trainer/p2e_baseline.py domain=minigrid seed=0
-python trainer/p2e_baseline.py domain=bipedalwalker seed=0
-```
-
-### 5. Multi-seed runs
-
-An example shell runner is provided in [`trainer/run_seeds.sh`](trainer/run_seeds.sh).
-
+**Multi-seed execution:**
+For statistical significance across multiple seeds, use our provided shell runner:
 ```bash
 bash trainer/run_seeds.sh
 ```
 
-Before using it, verify which experiment blocks are commented/uncommented.
+## 3. Evaluation and Logged Outputs
 
-## Evaluation and Logged Outputs
+Evaluation is seamlessly integrated into the experiment drivers. During training, the scripts periodically validate on the uniform datasets generated in Step 1 and automatically write the metrics to CSV logs (e.g., `trainer/logs/results/`). 
 
-Evaluation is integrated into the main experiment scripts. During training, the scripts periodically validate on held-out or target-task datasets and write CSV logs.
-
-Typical output locations:
-
-- `trainer/logs/results/` for MAC
-- `trainer/logs/results_dr/` for DR
-- `trainer/logs/results_target_baseline/` for target baselines
-- `trainer/logs/results_p2e/` for P2E
-
-Representative output files:
-
-- `trainer/logs/results/<domain>_ued_results_mask*.csv`
-- `trainer/logs/results_dr/dr_summary_<domain>_mask*.csv`
-- `trainer/logs/results_target_baseline/target_baseline_<domain>_mask*.csv`
-
-These CSVs are the primary artifacts used to reproduce result tables and plots.
+Please refer to the **Reproducibility Table** below for the exact mapping between each experiment command and its specific output artifact.
 
 ## Reproducibility Table
 
