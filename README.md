@@ -46,9 +46,10 @@ The world-model implementation is maintained in the separate
 that repository and does not keep a second copy of `modelBased/` or the shared
 `domain/` adapters.
 
-For local development, install the sibling WM checkout:
+For local development, initialize and install the WM submodule:
 
 ```bash
+git submodule update --init --recursive
 pip install -r requirements-local-wm.txt
 ```
 

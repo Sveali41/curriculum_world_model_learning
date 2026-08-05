@@ -1,0 +1,3 @@
+[submodule "wm"]
+	path = wm
+	url = https://github.com/Sveali41/Agent-Centric-Attentive-World-Model.git

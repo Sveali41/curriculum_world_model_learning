@@ -1,2 +1,2 @@
 # Local development dependency: keep WM source in the sibling canonical repo.
--e ../Agent-Centric-Attentive-World-Model
+-e ./wm
