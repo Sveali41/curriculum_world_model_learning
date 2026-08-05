@@ -67,9 +67,10 @@ def _resolve_bipedal_dataset_path(cfg, domain_name):
 def setup_env():
     os.environ["PROJECT_ROOT"] = PROJECT_ROOT
     os.environ["TRAINER_PATH"] = os.path.join(PROJECT_ROOT, "trainer")
-    os.environ["WORLD_MODEL_PATH"] = os.path.join(PROJECT_ROOT, "modelBased")
-    os.environ["TRAIN_DATASET_PATH"] = os.path.join(PROJECT_ROOT, "modelBased/data/train_world_model")
-    os.environ["MODEL_FPATH"] = os.path.join(PROJECT_ROOT, "modelBased/models")
+    wm_root = os.environ.get("WM_ROOT", PROJECT_ROOT)
+    os.environ["WORLD_MODEL_PATH"] = os.path.join(wm_root, "modelBased")
+    os.environ["TRAIN_DATASET_PATH"] = os.path.join(wm_root, "modelBased/data/train_world_model")
+    os.environ["MODEL_FPATH"] = os.path.join(wm_root, "modelBased/models")
 
 def setup_config():
     # Use Hydra's compose API to properly load defaults (like config_ued)

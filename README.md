@@ -112,14 +112,14 @@ If you are reproducing only a subset of experiments, you may need to adapt those
 To ensure fair evaluation and a rigorous comparison across all baselines, we first collect a unified, fixed uniform validation dataset. This guarantees that all reported metrics are evaluated on the exact same test distribution, eliminating variance from random dataset generation.
 
 ```bash
-python modelBased/data/data_collect.py domain=crafter env.collect.data_type=uniform
-python modelBased/data/data_collect.py domain=minigrid env.collect.data_type=uniform
-python modelBased/data/data_collect.py domain=bipedalwalker env.collect.data_type=uniform
+python -m modelBased.data.data_collect domain=crafter env.collect.data_type=uniform
+python -m modelBased.data.data_collect domain=minigrid env.collect.data_type=uniform
+python -m modelBased.data.data_collect domain=bipedalwalker env.collect.data_type=uniform
 ```
 
 *Note: After generating the uniform datasets, ensure that the `validation_data_dir` parameter in your configurations (e.g., `modelBased/config/config.yaml` or under `trainer/conf/`) points to the resulting `*_uniform.npz` files before running the baselines.*
 
-*(Optional) To collect standard random datasets or run standalone world-model/policy training, refer to the scripts in `modelBased/data/` and `modelBased/world_model/`.*
+*(Optional) To collect standard random datasets or run standalone world-model/policy training, use the installed WM package modules under `modelBased.data` and `modelBased.world_model`.*
 
 ## 2. Main Experiments & Baselines
 
