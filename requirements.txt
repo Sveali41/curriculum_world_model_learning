@@ -238,3 +238,4 @@ widgetsnbextension==4.0.15
 yarg==0.1.9
 yarl==1.9.4
 zipp==3.23.0
+agent-centric-attentive-world-model @ git+https://github.com/Sveali41/Agent-Centric-Attentive-World-Model.git

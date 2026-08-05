@@ -45,6 +45,21 @@ requirements.txt                Python dependencies
 
 ## Environment Setup
 
+The world-model implementation is maintained in the separate
+`Agent-Centric-Attentive-World-Model` repository. Curriculum code consumes
+that repository and does not keep a second copy of `modelBased/` or the shared
+`domain/` adapters.
+
+For local development, install the sibling WM checkout:
+
+```bash
+pip install -r requirements-local-wm.txt
+```
+
+For a clean environment, `requirements.txt` installs the WM package from its
+GitHub repository. Source `.env` before running experiments so that curriculum
+paths and WM paths remain distinct.
+
 ### 1. Create a Python environment
 
 `requirements.txt` is the main dependency specification for this repository.
