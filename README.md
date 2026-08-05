@@ -29,12 +29,8 @@ It also includes standalone code for:
 ## Repository Structure
 
 ```text
-domain/                         environment-specific wrappers and utilities
 generator/                      curriculum / generator models and interfaces
-modelBased/
-  data/                         data collection and dataloaders
-  world_model/                  Attention-based world model training
-  policy_training/              PPO and planning utilities
+curriculum_domain/              curriculum-only domain extensions
 trainer/
   conf/                         Hydra experiment configs
   level/                        task definitions for each domain
@@ -117,7 +113,7 @@ python -m modelBased.data.data_collect domain=minigrid env.collect.data_type=uni
 python -m modelBased.data.data_collect domain=bipedalwalker env.collect.data_type=uniform
 ```
 
-*Note: After generating the uniform datasets, ensure that the `validation_data_dir` parameter in your configurations (e.g., `modelBased/config/config.yaml` or under `trainer/conf/`) points to the resulting `*_uniform.npz` files before running the baselines.*
+*Note: The shared WM configuration lives in the Agent-Centric repository under `modelBased/config/config.yaml`; update it or the relevant `trainer/conf/` configuration to point to the resulting `*_uniform.npz` files.*
 
 *(Optional) To collect standard random datasets or run standalone world-model/policy training, use the installed WM package modules under `modelBased.data` and `modelBased.world_model`.*
 
