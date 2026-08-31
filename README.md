@@ -151,7 +151,25 @@ bash trainer/run_seeds.sh
 
 ## 3. Evaluation and Logged Outputs
 
-Evaluation is seamlessly integrated into the experiment drivers. During training, the scripts periodically validate on the uniform datasets generated in Step 1 and automatically write the metrics to CSV logs (e.g., `trainer/logs/results/`). 
+Evaluation is seamlessly integrated into the experiment drivers. During training, the scripts periodically validate on the uniform datasets generated in Step 1 and automatically write metrics below `outputs/results/`.
+
+Hydra run metadata and console logs for all curriculum and baseline entry points
+are stored in the single workspace-level `outputs/` directory. World-model
+entry points use the separate `wm/outputs/` directory, including planner,
+policy-evaluation, coverage, and visualization artifacts. Both locations are
+resolved absolutely, so running a command from `trainer/`, `wm/`, or the
+workspace root does not create another nested `outputs/` directory.
+
+The workspace output tree is organized as follows:
+
+- `outputs/hydra/`: Hydra run logs and multiruns
+- `outputs/results/`: MAC, DR, P2E, target-baseline, and continual-learning metrics
+- `outputs/visualizations/`: dataset, environment, error, and model figures
+- `outputs/wandb/`: local Weights & Biases run files
+
+Generated datasets stay under `trainer/data/`, and reusable model checkpoints
+stay under `wm/modelBased/models/`; these are persistent inputs/artifacts rather
+than run output.
 
 Please refer to the **Reproducibility Table** below for the exact mapping between each experiment command and its specific output artifact.
 
@@ -161,18 +179,18 @@ The table below links each experiment family to the exact command and the expect
 
 | Setting | Domain flag | Command | Main output |
 | --- | --- | --- | --- |
-| MAC | `domain=crafter` | `python trainer/mac_wm_learning.py domain=crafter seed=0` | `trainer/logs/results/crafter_ued_results_mask*.csv` |
-| MAC | `domain=minigrid` | `python trainer/mac_wm_learning.py domain=minigrid seed=0` | `trainer/logs/results/minigrid_ued_results_mask*.csv` |
-| MAC | `domain=bipedalwalker` | `python trainer/mac_wm_learning.py domain=bipedalwalker seed=0` | `trainer/logs/results/bipedalwalker_ued_results*.csv` |
-| DR | `domain=crafter` | `python trainer/dr_baseline_experiment.py domain=crafter seed=0` | `trainer/logs/results_dr/dr_summary_crafter_mask*.csv` |
-| DR | `domain=minigrid` | `python trainer/dr_baseline_experiment.py domain=minigrid seed=0` | `trainer/logs/results_dr/dr_summary_minigrid_mask*.csv` |
-| DR | `domain=bipedalwalker` | `python trainer/dr_baseline_experiment.py domain=bipedalwalker seed=0` | `trainer/logs/results_dr/dr_summary_bipedalwalker_mask*.csv` |
-| Target baseline | `domain=crafter` | `python trainer/target_baseline_experiment.py domain=crafter seed=0` | `trainer/logs/results_target_baseline/target_baseline_crafter_mask*.csv` |
-| Target baseline | `domain=minigrid` | `python trainer/target_baseline_experiment.py domain=minigrid seed=0` | `trainer/logs/results_target_baseline/target_baseline_minigrid_mask*.csv` |
-| Target baseline | `domain=bipedalwalker` | `python trainer/target_baseline_experiment.py domain=bipedalwalker seed=0` | `trainer/logs/results_target_baseline/target_baseline_bipedalwalker_mask*.csv` |
-| P2E | `domain=crafter` | `python trainer/p2e_baseline.py domain=crafter seed=0` | `trainer/logs/results_p2e/` |
-| P2E | `domain=minigrid` | `python trainer/p2e_baseline.py domain=minigrid seed=0` | `trainer/logs/results_p2e/` |
-| P2E | `domain=bipedalwalker` | `python trainer/p2e_baseline.py domain=bipedalwalker seed=0` | `trainer/logs/results_p2e/` |
+| MAC | `domain=crafter` | `python trainer/mac_wm_learning.py domain=crafter seed=0` | `outputs/results/mac/crafter_ued_results_mask*.csv` |
+| MAC | `domain=minigrid` | `python trainer/mac_wm_learning.py domain=minigrid seed=0` | `outputs/results/mac/minigrid_ued_results_mask*.csv` |
+| MAC | `domain=bipedalwalker` | `python trainer/mac_wm_learning.py domain=bipedalwalker seed=0` | `outputs/results/mac/bipedalwalker_ued_results*.csv` |
+| DR | `domain=crafter` | `python trainer/dr_baseline_experiment.py domain=crafter seed=0` | `outputs/results/dr/dr_summary_crafter_mask*.csv` |
+| DR | `domain=minigrid` | `python trainer/dr_baseline_experiment.py domain=minigrid seed=0` | `outputs/results/dr/dr_summary_minigrid_mask*.csv` |
+| DR | `domain=bipedalwalker` | `python trainer/dr_baseline_experiment.py domain=bipedalwalker seed=0` | `outputs/results/dr/dr_summary_bipedalwalker_mask*.csv` |
+| Target baseline | `domain=crafter` | `python trainer/target_baseline_experiment.py domain=crafter seed=0` | `outputs/results/target_baseline/target_baseline_crafter_mask*.csv` |
+| Target baseline | `domain=minigrid` | `python trainer/target_baseline_experiment.py domain=minigrid seed=0` | `outputs/results/target_baseline/target_baseline_minigrid_mask*.csv` |
+| Target baseline | `domain=bipedalwalker` | `python trainer/target_baseline_experiment.py domain=bipedalwalker seed=0` | `outputs/results/target_baseline/target_baseline_bipedalwalker_mask*.csv` |
+| P2E | `domain=crafter` | `python trainer/p2e_baseline.py domain=crafter seed=0` | `outputs/results/p2e/` |
+| P2E | `domain=minigrid` | `python trainer/p2e_baseline.py domain=minigrid seed=0` | `outputs/results/p2e/` |
+| P2E | `domain=bipedalwalker` | `python trainer/p2e_baseline.py domain=bipedalwalker seed=0` | `outputs/results/p2e/` |
 
 ## Reporting Final Results
 

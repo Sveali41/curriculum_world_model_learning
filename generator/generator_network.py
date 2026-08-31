@@ -32,11 +32,13 @@ class MapEditorActorCritic(nn.Module):
         context_dim=64,
         ablation_type="none",
         env_type="minigrid",
+        spatial_dpp_sigma=1.5,
     ):
         super().__init__()
         self.env_type = str(env_type).lower()
         self.is_bipedal = ("bipedal" in self.env_type)
         self.is_crafter = ("crafter" in self.env_type)
+        self.is_minigrid = (self.env_type == "minigrid")
 
         if self.is_crafter:
             max_obj_id = max(CRAFTER_OBJ_MAP.values())
@@ -60,10 +62,11 @@ class MapEditorActorCritic(nn.Module):
         actual_sta_dim = 1 if self.is_bipedal else self.emb_dim_state
         
         self.ablation_type = ablation_type
+        self.spatial_dpp_sigma = max(float(spatial_dpp_sigma), 1e-3)
 
         # === 2. Input Channels ===
         base_in_channels = (self.emb_dim_obj + actual_col_dim + actual_sta_dim) + 2  
-        if self.ablation_type == "no_history":
+        if self.ablation_type == "no_history" or self.is_minigrid:
             total_in_channels = base_in_channels 
         else:
             total_in_channels = base_in_channels + context_dim
@@ -87,6 +90,25 @@ class MapEditorActorCritic(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_dim // 2, num_actions, 1),
         )
+
+        # MiniGrid position quality is computed only from the current base map.
+        # Semantic history is fused afterward as a residual on edit-type logits,
+        # so a previous failure can request "what" to revisit without anchoring
+        # the edit to the previous absolute coordinate.
+        if self.is_minigrid and self.ablation_type != "no_history":
+            self.history_fusion = nn.Sequential(
+                nn.Conv2d(hidden_dim + context_dim, hidden_dim, 1),
+                nn.ReLU(inplace=True),
+                ResBlock(hidden_dim),
+            )
+            self.history_type_actor = nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim // 2, 3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hidden_dim // 2, num_actions - 1, 1),
+            )
+        else:
+            self.history_fusion = None
+            self.history_type_actor = None
 
         # B. Stats Head (32 Buttons Config: 2 rows x 16 slots)
         self.num_stats_slots = 32 
@@ -115,6 +137,9 @@ class MapEditorActorCritic(nn.Module):
         nn.init.orthogonal_(self.actor[-1].weight, gain=0.01)
         nn.init.constant_(self.actor[-1].bias, 0)
         self.actor[-1].bias.data[0] = 0.0
+        if self.history_type_actor is not None:
+            nn.init.orthogonal_(self.history_type_actor[-1].weight, gain=0.01)
+            nn.init.constant_(self.history_type_actor[-1].bias, 0)
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):
@@ -149,7 +174,7 @@ class MapEditorActorCritic(nn.Module):
             feat_sta = self.emb_state(base_map_vec[:, 2].long()).permute(0, 3, 1, 2)
         xx, yy = self.get_coordinate_channels(B, H, W, base_map_vec.device)
         
-        if self.ablation_type == "no_history" or context_vec is None:
+        if self.is_minigrid or self.ablation_type == "no_history" or context_vec is None:
             x = torch.cat([feat_obj, feat_col, feat_sta, xx, yy], dim=1)
         else:
             context_tiled = context_vec.view(B, -1, 1, 1).expand(-1, -1, H, W)
@@ -159,7 +184,25 @@ class MapEditorActorCritic(nn.Module):
         x = self.res_blocks(x)
         return x
 
+    def _minigrid_logits(self, features, context_vec):
+        """Return history-free placement logits and semantic type logits."""
+        base_logits = self.actor(features)
+        if self.history_fusion is None or context_vec is None:
+            return base_logits, base_logits, features
+
+        B, _, H, W = features.shape
+        context_tiled = context_vec.view(B, -1, 1, 1).expand(-1, -1, H, W)
+        conditioned_features = self.history_fusion(
+            torch.cat([features, context_tiled], dim=1)
+        )
+        logits = base_logits.clone()
+        logits[:, 1:] = logits[:, 1:] + self.history_type_actor(conditioned_features)
+        return base_logits, logits, conditioned_features
+
     def _get_topk_mask(self, logits, max_edits, action_mask=None):
+        if self.is_crafter or self.is_bipedal:
+            return self._get_legacy_topk_mask(logits, max_edits, action_mask)
+
         probs = F.softmax(logits, dim=1)
         prob_change = 1.0 - probs[:, 0, :, :]
         
@@ -169,15 +212,86 @@ class MapEditorActorCritic(nn.Module):
              prob_change = prob_change.masked_fill(action_mask.squeeze(1) > 0.5, -1.0)
              
         B, H, W = prob_change.shape
+        flat_mask = torch.zeros_like(prob_change, dtype=torch.bool).view(B, -1)
+        yy, xx = torch.meshgrid(
+            torch.arange(H, device=logits.device, dtype=logits.dtype),
+            torch.arange(W, device=logits.device, dtype=logits.dtype),
+            indexing="ij",
+        )
+        coords = torch.stack([yy.flatten(), xx.flatten()], dim=1)
+        sigma_sq = self.spatial_dpp_sigma ** 2
+
+        for batch_idx in range(B):
+            editable = torch.ones((H, W), dtype=torch.bool, device=logits.device)
+            editable[[0, -1], :] = False
+            editable[:, [0, -1]] = False
+            if action_mask is not None:
+                editable &= action_mask[batch_idx, 0] < 0.5
+            candidate_indices = torch.where(editable.flatten())[0]
+            if candidate_indices.numel() == 0:
+                continue
+
+            k = min(
+                max(0, int(round(float(max_edits) * candidate_indices.numel()))),
+                candidate_indices.numel(),
+            )
+            if k == 0:
+                continue
+            quality = prob_change[batch_idx].flatten()[candidate_indices].clamp_min(1e-6)
+            candidate_coords = coords[candidate_indices]
+            distances = torch.cdist(candidate_coords, candidate_coords).pow(2)
+            similarity = torch.exp(-distances / (2.0 * sigma_sq))
+            quality_root = quality.sqrt()
+            kernel = quality_root[:, None] * similarity * quality_root[None, :]
+
+            selected = []
+            remaining = list(range(candidate_indices.numel()))
+            for _ in range(k):
+                best_local = None
+                best_logdet = -float("inf")
+                for local_idx in remaining:
+                    trial = selected + [local_idx]
+                    sub_kernel = kernel[trial][:, trial]
+                    sub_kernel = sub_kernel + torch.eye(
+                        len(trial), device=kernel.device, dtype=kernel.dtype
+                    ) * 1e-6
+                    sign, logdet = torch.linalg.slogdet(sub_kernel)
+                    score = float(logdet) if float(sign) > 0 else -float("inf")
+                    if score > best_logdet:
+                        best_local = local_idx
+                        best_logdet = score
+                if best_local is None:
+                    best_local = max(
+                        remaining,
+                        key=lambda idx: float(quality[idx]),
+                    )
+                selected.append(best_local)
+                remaining.remove(best_local)
+
+            flat_mask[batch_idx, candidate_indices[selected]] = True
+        return flat_mask.view(B, H, W)
+
+    def _get_legacy_topk_mask(self, logits, max_edits, action_mask=None):
+        probs = F.softmax(logits, dim=1)
+        prob_change = 1.0 - probs[:, 0, :, :]
+        if action_mask is not None:
+            prob_change = prob_change.masked_fill(
+                action_mask.squeeze(1) > 0.5, -1.0
+            )
+        B, H, W = prob_change.shape
         flat_probs = prob_change.view(B, -1)
-        num_cells = (action_mask < 0.5).sum(dim=(1, 2, 3)).float().mean().item() if action_mask is not None else H*W
-        k = max(1, min(int(round(max_edits * num_cells)), H * W))
-        
-        # When flat_probs are equal (uniform), torch.topk returns the first k elements
-        # Without the mask fill above, it always picked the top-left corner (the walls!)
-        topk_vals, topk_indices = torch.topk(flat_probs, k=k, dim=1)
+        if action_mask is not None:
+            num_cells = (action_mask < 0.5).sum(dim=(1, 2, 3))
+        else:
+            num_cells = torch.full(
+                (B,), H * W, device=logits.device, dtype=torch.long
+            )
         flat_mask = torch.zeros_like(flat_probs, dtype=torch.bool)
-        flat_mask.scatter_(1, topk_indices, True)
+        for batch_idx in range(B):
+            editable_count = int(num_cells[batch_idx].item())
+            k = max(1, min(int(round(float(max_edits) * editable_count)), H * W))
+            _, topk_indices = torch.topk(flat_probs[batch_idx], k=k)
+            flat_mask[batch_idx, topk_indices] = True
         return flat_mask.view(B, H, W)
 
     def _get_stats_topk_mask(self, logits_stats, max_stats_edit_ratio):
@@ -197,8 +311,14 @@ class MapEditorActorCritic(nn.Module):
         B, _, H, W = map_vec.shape
 
         # A. Terrain Sampling
-        logits = self.actor(features)
-        topk_mask = self._get_topk_mask(logits, max_edits, action_mask)
+        if self.is_minigrid:
+            placement_logits, logits, critic_features = self._minigrid_logits(
+                features, context_vec
+            )
+        else:
+            placement_logits = logits = self.actor(features)
+            critic_features = features
+        topk_mask = self._get_topk_mask(placement_logits, max_edits, action_mask)
         logits[:, 0, :, :].masked_fill_(~topk_mask, 1e9)
         logits[:, 1:, :, :].masked_fill_(~topk_mask.unsqueeze(1), -1e9)
         dist = Categorical(logits=logits.permute(0, 2, 3, 1))
@@ -206,9 +326,10 @@ class MapEditorActorCritic(nn.Module):
         action_logprob = dist.log_prob(action)
 
         # B. Stats (32 Piano Buttons) Sampling
-        # Bipedal does not use stats actions for environment editing.
-        # Keep stats branch as a strict no-op to avoid injecting noise into PPO logprob.
-        if self.is_bipedal:
+        # Only Crafter edits inventory statistics. MiniGrid and Bipedal do not
+        # consume stats actions, so their policy likelihood must not contain an
+        # unrelated 32-action branch.
+        if not self.is_crafter:
             stats_action = torch.zeros(
                 (B, self.num_stats_slots), device=map_vec.device, dtype=torch.long
             )
@@ -234,7 +355,7 @@ class MapEditorActorCritic(nn.Module):
             stats_action = stats_dist.sample()
             stats_logprob = stats_dist.log_prob(stats_action).sum(dim=-1)
 
-        value = self.critic(features)
+        value = self.critic(critic_features)
         return (
             action.detach(),
             stats_action.detach(),
@@ -260,16 +381,24 @@ class MapEditorActorCritic(nn.Module):
         B, _, H, W = map_vec.shape
 
         # A. Terrain Eval
-        logits = self.actor(features)
+        if self.is_minigrid:
+            _, logits, critic_features = self._minigrid_logits(features, context_vec)
+        else:
+            logits = self.actor(features)
+            critic_features = features
         if target_topk_mask is not None:
              logits[:, 0, :, :].masked_fill_(~target_topk_mask, 1e9)
              logits[:, 1:, :, :].masked_fill_(~target_topk_mask.unsqueeze(1), -1e9)
         dist = Categorical(logits=logits.permute(0, 2, 3, 1))
         action_logprobs = dist.log_prob(terrain_action)
-        dist_entropy = dist.entropy().mean()
+        if self.is_minigrid and target_topk_mask is not None:
+            selected = target_topk_mask.to(dtype=logits.dtype)
+            dist_entropy = (dist.entropy() * selected).sum() / selected.sum().clamp_min(1.0)
+        else:
+            dist_entropy = dist.entropy().mean()
 
         # B. Stats Eval
-        if self.is_bipedal:
+        if not self.is_crafter:
             stats_logprobs = torch.zeros(B, device=map_vec.device, dtype=logits.dtype)
             stats_entropy = torch.zeros((), device=map_vec.device, dtype=logits.dtype)
         else:
@@ -289,6 +418,6 @@ class MapEditorActorCritic(nn.Module):
             stats_logprobs = stats_dist.log_prob(stats_action).sum(dim=-1)
             stats_entropy = stats_dist.entropy().mean()
 
-        value = self.critic(features)
+        value = self.critic(critic_features)
         total_entropy = dist_entropy + stats_entropy
         return action_logprobs, stats_logprobs, value, total_entropy

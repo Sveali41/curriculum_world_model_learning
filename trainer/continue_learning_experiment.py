@@ -1,19 +1,27 @@
 import os
 import sys
+import math
 import torch
 import numpy as np
 import pandas as pd
 import copy
+from pathlib import Path
 from omegaconf import OmegaConf, open_dict
 from hydra import initialize, compose
 
 # Add project root to path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.append(PROJECT_ROOT)
+DEFAULT_WM_ROOT = os.path.join(PROJECT_ROOT, "wm")
+WM_ROOT = os.environ.get("WM_ROOT", DEFAULT_WM_ROOT)
+for import_root in (PROJECT_ROOT, WM_ROOT):
+    if import_root not in sys.path:
+        sys.path.insert(0, import_root)
 
 from modelBased.data.data_collect import data_collect
 from modelBased.world_model import AttentionWM_training
 from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
+from modelBased.common.artifacts import align_world_model_artifact_path
+from trainer.common.paths import RESULTS_ROOT, VISUALIZATIONS_ROOT
 
 
 def _normalize_train_api_result(train_api_output):
@@ -67,7 +75,8 @@ def _resolve_bipedal_dataset_path(cfg, domain_name):
 def setup_env():
     os.environ["PROJECT_ROOT"] = PROJECT_ROOT
     os.environ["TRAINER_PATH"] = os.path.join(PROJECT_ROOT, "trainer")
-    wm_root = os.environ.get("WM_ROOT", PROJECT_ROOT)
+    wm_root = os.environ.get("WM_ROOT", DEFAULT_WM_ROOT)
+    os.environ["WM_ROOT"] = wm_root
     os.environ["WORLD_MODEL_PATH"] = os.path.join(wm_root, "modelBased")
     os.environ["TRAIN_DATASET_PATH"] = os.path.join(wm_root, "modelBased/data/train_world_model")
     os.environ["MODEL_FPATH"] = os.path.join(wm_root, "modelBased/models")
@@ -113,20 +122,13 @@ def _collect_single_bipedal_dataset(cfg, domain_name, task_group, task_folder, t
         cfg_collect.env.collect.episodes = max(int(getattr(cfg_collect.env.collect, "episodes", 1000)), 1000)
         cfg_collect.env.collect.save_env_visualize = True
         cfg_collect.env.collect.save_coverage_visualize = True
-        if str(task_group) == "target":
-            cfg_collect.env.collect.env_visualize_save_path = os.path.join(
-                PROJECT_ROOT, "trainer", "logs", "env_visualization", "target", "bipedal"
-            )
-            cfg_collect.env.collect.visualize_save_path = os.path.join(
-                PROJECT_ROOT, "trainer", "logs", "dataset_visualization", "target", "bipedal"
-            )
-        else:
-            cfg_collect.env.collect.env_visualize_save_path = os.path.join(
-                PROJECT_ROOT, "trainer", "logs", "env_visualization", "minitask", "bipedal"
-            )
-            cfg_collect.env.collect.visualize_save_path = os.path.join(
-                PROJECT_ROOT, "trainer", "logs", "dataset_visualization", "minitask", "bipedal"
-            )
+        phase_kind = "target" if str(task_group) == "target" else "minitask"
+        cfg_collect.env.collect.env_visualize_save_path = str(
+            VISUALIZATIONS_ROOT / "environments" / phase_kind / "bipedal"
+        )
+        cfg_collect.env.collect.visualize_save_path = str(
+            VISUALIZATIONS_ROOT / "datasets" / phase_kind / "bipedal"
+        )
         cfg_collect.env.collect.env_visualize_filename = f"{task_name}_{data_type}_env.png"
         cfg_collect.env.collect.visualize_filename = f"{task_name}_{data_type}_coverage.png"
 
@@ -181,55 +183,153 @@ def collect_data():
     """
     setup_env()
     cfg, _ = setup_config()
+    align_world_model_artifact_path(cfg)
     
     domain_name = getattr(cfg, "domain", "crafter")
     domain_cfg = cfg.domains[domain_name]
     
-    task_prefix = getattr(domain_cfg, "target_task_prefix", f"{domain_name}_target_task_")
-    task_start = int(getattr(domain_cfg, "target_task_start_idx", 0))
+    task_prefix = str(getattr(domain_cfg, "target_task_prefix", f"{domain_name}_target_task_"))
+    configured_start = int(getattr(domain_cfg, "target_task_start_idx", 0))
+    configured_count = int(getattr(domain_cfg, "target_task_count", 20))
+    task_start = configured_start
     if domain_name == "crafter":
         # Since 1-5 already collected and 6-20 were newly generated
         task_start = max(task_start, 6)
-    task_count = 21 - task_start # to cover up to 20
-    
-    tasks = [f"{task_prefix}{i}" for i in range(task_start, task_start + task_count)]
+    task_end = configured_start + configured_count
+
+    tasks = [f"{task_prefix}{i}" for i in range(task_start, task_end)]
     target_tasks_folder = str(getattr(domain_cfg, "target_tasks_folder", f"{PROJECT_ROOT}/trainer/data/{domain_name}/target_tasks/"))
     os.makedirs(target_tasks_folder, exist_ok=True)
+
+    level_domain_folder = "bipedal_walker" if domain_name == "bipedalwalker" else domain_name
+    default_target_level_folder = "target_task" if domain_name == "minigrid" else "target_tasks"
+    target_level_folder = str(
+        getattr(domain_cfg, "target_level_folder", default_target_level_folder)
+    )
+    target_level_dir = os.path.join(
+        PROJECT_ROOT, "trainer", "level", level_domain_folder, target_level_folder
+    )
+    missing_layouts = [
+        os.path.join(target_level_dir, f"{task}.txt")
+        for task in tasks
+        if not os.path.isfile(os.path.join(target_level_dir, f"{task}.txt"))
+    ]
+    if missing_layouts:
+        raise FileNotFoundError(
+            "Target collection cannot start because layout files are missing: "
+            + ", ".join(missing_layouts[:10])
+        )
+
+    print(
+        f"[Collection Config] domain={domain_name} | tasks={tasks[0]}..{tasks[-1]} "
+        f"({len(tasks)}) | layouts={target_level_dir}"
+    )
     
     for task in tasks:
         print(f"\n[Collection] Processing Target Task: {task}")
         
         with open_dict(cfg):
-            # Force uniform collection mode and increase the step budget for larger maps.
+            # Collect an explicit, fixed transition budget from many short
+            # random-start rollouts. This makes the meaning of "30,000" exact
+            # and avoids stopping after only a few long episodes.
+            target_transitions = 30000
             cfg.env.collect.data_type = "uniform"
-            cfg.env.collect.max_steps = 1000
             cfg.env.collect.uniform_reset_steps = 50
-            cfg.env.collect.maximum_dataset_size = 30000
+            cfg.env.collect.episodes = math.ceil(
+                target_transitions / int(cfg.env.collect.uniform_reset_steps)
+            )
+            cfg.env.collect.mini_dataset_size = target_transitions
+            cfg.env.collect.maximum_dataset_size = target_transitions
+            # Target validation should cover local transitions throughout the
+            # large map instead of always starting from the layout's fixed S.
+            # CustomMiniGridEnv treats S as an empty tile and samples uniformly
+            # from all empty cells on every reset; direction remains random.
+            cfg.env.collect.replace_start_with_empty = True
             
-            # Set paths dynamically including subfolders
-            # Use 'bipedal_walker' for the level folder even if domain name is 'bipedalwalker'
-            level_folder = "bipedal_walker" if domain_name == "bipedalwalker" else domain_name
-            cfg.env.env_path = os.path.join(PROJECT_ROOT, f"trainer/level/{level_folder}/target_tasks/{task}.txt")
+            # Resolve the checked domain-specific target layout.
+            cfg.env.env_path = os.path.join(target_level_dir, f"{task}.txt")
+            # Persist the exact task/layout identity in NPZ metadata instead of
+            # falling back to an empty domain-level path.
+            cfg.domains[domain_name].task_name = task
+            cfg.domains[domain_name].layout_path = cfg.env.env_path
             
             # Use the configured suffix, defaulting to `_uniform.npz`.
             suffix = getattr(domain_cfg, "target_task_suffix", "_uniform.npz")
             cfg.env.collect.data_save_path = os.path.join(target_tasks_folder, f"{task}{suffix}")
             
-            # Enable env layout visualization
-            cfg.env.collect.save_env_visualize = True
+            # Keep collection headless; the resulting NPZ is the required artifact.
+            cfg.env.collect.save_env_visualize = False
             # Set visualization paths dynamically based on domain
             domain_suffix = "bipedal" if domain_name == "bipedalwalker" else domain_name
-            cfg.env.collect.env_visualize_save_path = os.path.join(PROJECT_ROOT, "trainer/logs/env_visualization/target", domain_suffix)
+            cfg.env.collect.env_visualize_save_path = str(
+                VISUALIZATIONS_ROOT / "environments" / "target" / domain_suffix
+            )
             cfg.env.collect.env_visualize_filename = f"{task}_uniform_env.png"
             
-            # Coverage visualization
+            # Save only the collected-position coverage heatmap. Environment
+            # screenshots and the other training visualizations stay disabled.
             cfg.env.collect.save_coverage_visualize = True
-            cfg.env.collect.visualize_save_path = os.path.join(PROJECT_ROOT, "trainer/logs/dataset_visualization/target", domain_suffix)
+            cfg.env.collect.visualize_save_path = str(
+                VISUALIZATIONS_ROOT / "datasets" / "target" / domain_suffix
+            )
             cfg.env.collect.visualize_filename = f"{task}_uniform_coverage.png"
         
         # Call the actual data collection logic
         data_collect(cfg)
+        saved = np.load(str(cfg.env.collect.data_save_path), allow_pickle=True)
+        records = np.asarray(saved["f"], dtype=object).reshape(-1)
+        missing_current = []
+        missing_next = []
+        inventory_changes = 0
+        for index, value in enumerate(records):
+            if isinstance(value, np.ndarray) and value.size == 1:
+                value = value.item()
+            record = value if isinstance(value, dict) else {}
+            if "current_carrying_token" not in record:
+                missing_current.append(index)
+            if "next_carrying_token" not in record:
+                missing_next.append(index)
+            if (
+                "current_carrying_token" in record
+                and "next_carrying_token" in record
+                and int(record["current_carrying_token"])
+                != int(record["next_carrying_token"])
+            ):
+                inventory_changes += 1
+        if missing_current or missing_next:
+            raise ValueError(
+                f"Collected dataset {cfg.env.collect.data_save_path} has invalid "
+                "MiniGrid inventory metadata: "
+                f"missing_current={missing_current[:10]}, "
+                f"missing_next={missing_next[:10]}"
+            )
+        observations = np.asarray(saved["a"])
+        positions = set()
+        for observation in observations:
+            hits = np.argwhere(observation[0] == 10)
+            if len(hits):
+                positions.add(tuple(map(int, hits[0])))
+        with open(str(cfg.env.env_path), "r", encoding="utf-8") as layout_file:
+            layout_rows = layout_file.read().split("\n\n", 1)[0].splitlines()
+        empty_positions = {
+            (row_index, column_index)
+            for row_index, row in enumerate(layout_rows)
+            for column_index, cell in enumerate(row)
+            if cell in {"E", "S"}
+        }
+        empty_position_count = len(empty_positions)
+        visited_empty_positions = positions.intersection(empty_positions)
+        position_coverage = (
+            len(visited_empty_positions) / empty_position_count
+            if empty_position_count else 0.0
+        )
         print(f"[Done] Saved UNIFORM dataset to {cfg.env.collect.data_save_path}")
+        print(
+            f"[Verified] {len(records)} transitions | "
+            f"inventory_changes={inventory_changes} | "
+            f"empty-position coverage={len(visited_empty_positions)}/{empty_position_count} "
+            f"({position_coverage:.1%})"
+        )
 
 def run_experiment_session(mode="minitask", all_results=None):
     """
@@ -397,7 +497,9 @@ def run_experiment_session(mode="minitask", all_results=None):
             metrics["target_val_val_ce_loss"] = target_metrics_dict.get("val/ce_loss", 0.0)
         all_results.append(metrics)
         
-        csv_out_path = os.path.join(PROJECT_ROOT, "trainer/logs/cl_comparison_results.csv")
+        log_dir = Path(getattr(cfg, "cl_log_dir", RESULTS_ROOT / "continual_learning"))
+        log_dir.mkdir(parents=True, exist_ok=True)
+        csv_out_path = str(log_dir / "cl_comparison_results.csv")
         _append_result_row(csv_out_path, metrics)
         
         if domain_name == "bipedalwalker":

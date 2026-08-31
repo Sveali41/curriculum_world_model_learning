@@ -6,7 +6,8 @@ defaults:
   - _self_
 
 # --- Control Switch (Unified across all baselines) ---
-domain: 'crafter'              # 'crafter' or 'minigrid' or 'bipedalwalker'
+domain: 'minigrid'              # 'crafter' or 'minigrid' or 'bipedalwalker'
+target_baseline_log_dir: ${paths.results}/target_baseline/
 
 # --- Domain-Specific Specifications for Sequential Phase Training ---
 domains:
@@ -31,8 +32,8 @@ domains:
     train_suffix: "_test_random.npz"
     val_suffix: "_test_uniform.npz"
     grid_shape: [3, 0, 0]
-    obs_norm: [11, 6, 3]
-    action_norm: 7
+    obs_norm: [10, 5, 3]
+    action_norm: 6
     start_idx: 0
     target_dataset_size: 7000
     data_type: discrete
@@ -57,3 +58,4 @@ attention_model:
   continue_learning: true      # Ensure EWC is active
   ewc_ratio: 0.9              # bipedal:0.9 | crafter and minigrid: 0.9
   replay_frac: 0.7            # bipedal:0.7 | crafter and minigrid: 3
+  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/target_attention_world_model_${domain}_${ablation.type}_seed${seed}.ckpt

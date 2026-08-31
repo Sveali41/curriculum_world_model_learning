@@ -1,9 +1,12 @@
 import gc
 import os
 import random
+import copy
 import numpy as np
 import torch
+from omegaconf import open_dict
 from modelBased.common.utils import TRAINER_PATH
+from modelBased.common.artifacts import dataset_metadata
 from domain.minigrid.minigrid_support import extract_unique_patches, generate_minitasks_until_covered
 from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
 from modelBased.data.data_collect import visualize_agent_coverage, visualize_saved_dataset
@@ -11,6 +14,34 @@ from modelBased.common.support import Support
 from minigrid.wrappers import FullyObsWrapper
 import csv
 from modelBased.world_model import AttentionWM_training
+from trainer.common.paths import VISUALIZATIONS_ROOT
+
+
+MINIGRID_VAL_LOSS_FIELDS = (
+    "object_nll",
+    "color_nll",
+    "state_nll",
+    "inventory_nll",
+)
+
+
+def minigrid_changed_fraction(samples):
+    """Return the fraction of transitions with any observed state change."""
+    if not samples or "obs" not in samples or "obs_next" not in samples:
+        return 0.0, 0
+    obs = np.asarray(samples["obs"])
+    nxt = np.asarray(samples["obs_next"])
+    if obs.shape != nxt.shape or obs.ndim < 2 or len(obs) == 0:
+        return 0.0, 0
+    axes = tuple(range(1, obs.ndim))
+    changed = np.any(obs != nxt, axis=axes)
+    if samples.get("inv") is not None and samples.get("inv_next") is not None:
+        inv = np.asarray(samples["inv"])
+        inv_next = np.asarray(samples["inv_next"])
+        if inv.shape == inv_next.shape and len(inv) == len(changed):
+            changed = changed | np.any(inv != inv_next, axis=tuple(range(1, inv.ndim)))
+    count = int(changed.sum())
+    return float(count / len(changed)), count
 
 
 
@@ -222,7 +253,13 @@ def collect_data_general(
 
     cfg.env.collect.data_save_path = str(save_path)
     
-    vis_dir = Path(getattr(cfg.env.collect, "visualize_save_path", str(TRAINER_PATH / "logs" / "dataset_visualization")))
+    vis_dir = Path(
+        getattr(
+            cfg.env.collect,
+            "visualize_save_path",
+            str(VISUALIZATIONS_ROOT / "datasets"),
+        )
+    )
     os.makedirs(vis_dir, exist_ok=True)
     cfg.env.collect.visualize_save_path = str(vis_dir)
     
@@ -385,16 +422,66 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
     Returns: (avg_mse_loss, avg_weighted_loss)
     """
 
-    prev_freeze_weight = cfg.attention_model.freeze_weight
-    prev_keep_cell_loss = cfg.attention_model.keep_cell_loss
-    prev_data_dir = cfg.attention_model.data_dir
+    # Target archives intentionally carry a task/layout identity that differs
+    # from the generator's active environment. Validate with an isolated config
+    # aligned to that NPZ, leaving the live MAC/generator config untouched.
+    validation_cfg = copy.deepcopy(cfg)
+    validation_path = os.path.join(data_save_dir, target_file)
+    metadata = dataset_metadata(validation_path)
+    with open_dict(validation_cfg):
+        validation_cfg.attention_model.freeze_weight = True
+        validation_cfg.attention_model.keep_cell_loss = bool(
+            getattr(
+                validation_cfg.attention_model,
+                "target_validation_keep_cell_loss",
+                False,
+            )
+        )
+        validation_cfg.attention_model.data_dir = validation_path
+        # Target datasets are never used for fitting in this call. Evaluate a
+        # small, fixed random subset of the complete target archive to keep the
+        # repeated 20-task sweep affordable without introducing per-iteration
+        # resampling noise.
+        validation_cfg.attention_model.max_validation_samples = int(
+            getattr(
+                validation_cfg.attention_model,
+                "target_validation_max_samples",
+                1000,
+            )
+        )
+        validation_cfg.attention_model.validation_sample_from_full_dataset = True
+        validation_cfg.attention_model.validation_subset_seed = int(
+            getattr(
+                validation_cfg.attention_model,
+                "target_validation_seed",
+                0,
+            )
+        )
+        validation_cfg.attention_model.batch_size = int(
+            getattr(
+                validation_cfg.attention_model,
+                "target_validation_batch_size",
+                256,
+            )
+        )
 
-    cfg.attention_model.freeze_weight = True
-    # Optional switch: default off for lightweight target validation.
-    cfg.attention_model.keep_cell_loss = bool(
-        getattr(cfg.attention_model, "target_validation_keep_cell_loss", False)
-    )
-    cfg.attention_model.data_dir = os.path.join(data_save_dir, target_file)
+        if metadata is not None:
+            selected_domain = str(getattr(validation_cfg, "domain", ""))
+            metadata_domain = str(metadata.get("domain", ""))
+            if metadata_domain != selected_domain:
+                raise RuntimeError(
+                    f"Target dataset domain {metadata_domain!r} does not match "
+                    f"the active domain {selected_domain!r}: {validation_path}"
+                )
+            domain_cfg = validation_cfg.domains[selected_domain]
+            domain_cfg.task_name = str(metadata.get("task_name", ""))
+            domain_cfg.layout_path = str(
+                metadata.get("layout_path", metadata.get("env_path", ""))
+            )
+            validation_cfg.env.env_path = domain_cfg.layout_path
+            validation_cfg.env.collect.replace_start_with_empty = bool(
+                metadata.get("collection_replace_start_with_empty", False)
+            )
 
     losses = []
     inv_losses = []
@@ -403,41 +490,62 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
     contact_bces = []
     is_bipedal = (getattr(cfg.attention_model, "env_type", "") == "bipedalwalker")
     is_crafter = (getattr(cfg.attention_model, "env_type", "") == "crafter")
+    is_minigrid = (getattr(cfg.attention_model, "env_type", "") == "minigrid")
+    minigrid_field_losses = {name: [] for name in MINIGRID_VAL_LOSS_FIELDS}
+    minigrid_focal_losses = []
+    minigrid_changed_focal_losses = []
+    minigrid_false_set_rates = []
+    minigrid_changed_counts = []
 
-    try:
-        for v in range(VALID_TIMES):
-            # train_api in validation mode returns a dict where "avg_val_loss" holds the Lightning metrics
-            val_res, _, model = AttentionWM_training.train_api(cfg, net, old_params, None)
-            
-            actual_val_out = val_res.get("avg_val_loss", {})
-            
-            if isinstance(actual_val_out, list) and len(actual_val_out) > 0:
-                 metrics = actual_val_out[0]
-            elif isinstance(actual_val_out, dict):
-                 metrics = actual_val_out
-            else:
-                 metrics = {}
+    for v in range(VALID_TIMES):
+        # train_api in validation mode returns a dict where "avg_val_loss" holds the Lightning metrics
+        val_res, _, model = AttentionWM_training.train_api(
+            validation_cfg, net, old_params, None
+        )
 
-            # Map Crafter-specific classification CE metrics
-            main_loss = float(metrics.get('avg_val_loss_wm', metrics.get('best_loss', 0.0)))
-            t_loss = float(metrics.get('val/terrain_loss', metrics.get('val/ce_loss', main_loss)))
-            i_loss = float(metrics.get('val/inventory_loss', metrics.get('val/inv_loss', 0.0)))
-            contact_acc = float(metrics.get('val/contact_acc', 0.0))
-            contact_bce = float(metrics.get('val/contact_bce', 0.0))
-            
-            losses.append(main_loss)
-            terrain_losses.append(t_loss)
-            inv_losses.append(i_loss)
-            contact_accs.append(contact_acc)
-            contact_bces.append(contact_bce)
+        actual_val_out = val_res.get("avg_val_loss", {})
 
-            del model
-            torch.cuda.empty_cache()
-            gc.collect()
-    finally:
-        cfg.attention_model.freeze_weight = prev_freeze_weight
-        cfg.attention_model.keep_cell_loss = prev_keep_cell_loss
-        cfg.attention_model.data_dir = prev_data_dir
+        if isinstance(actual_val_out, list) and len(actual_val_out) > 0:
+             metrics = actual_val_out[0]
+        elif isinstance(actual_val_out, dict):
+             metrics = actual_val_out
+        else:
+             metrics = {}
+
+        # Map Crafter-specific classification CE metrics
+        # Current categorical MiniGrid WM reports the unified validation
+        # objective as ``val/observation_loss``. Keep legacy names as
+        # fallbacks, but do not silently convert a valid validation pass
+        # into 0.0 when the metric schema changes.
+        main_loss = float(
+            metrics.get(
+                'val/natural_ce' if is_minigrid else 'avg_val_loss_wm',
+                metrics.get('val/observation_loss', metrics.get('best_loss', 0.0)),
+            )
+        )
+        t_loss = float(metrics.get('val/terrain_loss', metrics.get('val/ce_loss', main_loss)))
+        i_loss = float(metrics.get('val/inventory_loss', metrics.get('val/inv_loss', 0.0)))
+        contact_acc = float(metrics.get('val/contact_acc', 0.0))
+        contact_bce = float(metrics.get('val/contact_bce', 0.0))
+
+        losses.append(main_loss)
+        terrain_losses.append(t_loss)
+        inv_losses.append(i_loss)
+        contact_accs.append(contact_acc)
+        contact_bces.append(contact_bce)
+        if is_minigrid:
+            minigrid_focal_losses.append(float(metrics.get("val/observation_loss", 0.0)))
+            minigrid_changed_focal_losses.append(float(metrics.get("val/changed_focal_loss", 0.0)))
+            minigrid_false_set_rates.append(float(metrics.get("val/false_set_rate", 0.0)))
+            minigrid_changed_counts.append(float(metrics.get("val/changed_count", 0.0)))
+            for name in MINIGRID_VAL_LOSS_FIELDS:
+                metric_name = f"val/{name}"
+                if metric_name in metrics:
+                    minigrid_field_losses[name].append(float(metrics[metric_name]))
+
+        del model
+        torch.cuda.empty_cache()
+        gc.collect()
 
     result = {
         'avg_val_loss_wm': float(np.mean(losses)),
@@ -448,6 +556,13 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
     if is_bipedal:
         result['contact_acc'] = float(np.mean(contact_accs))
         result['contact_bce'] = float(np.mean(contact_bces))
+    if is_minigrid:
+        result['focal_loss'] = float(np.mean(minigrid_focal_losses)) if minigrid_focal_losses else 0.0
+        result['changed_focal_loss'] = float(np.mean(minigrid_changed_focal_losses)) if minigrid_changed_focal_losses else 0.0
+        result['false_set_rate'] = float(np.mean(minigrid_false_set_rates)) if minigrid_false_set_rates else 0.0
+        result['changed_count'] = float(np.mean(minigrid_changed_counts)) if minigrid_changed_counts else 0.0
+        for name, values in minigrid_field_losses.items():
+            result[name] = float(np.mean(values)) if values else float("nan")
     return result
 
 
@@ -475,6 +590,11 @@ def validate_on_all_targets(
     terrain_losses = []
     contact_accs = []
     contact_bces = []
+    minigrid_field_losses = {name: [] for name in MINIGRID_VAL_LOSS_FIELDS}
+    minigrid_focal_losses = []
+    minigrid_changed_focal_losses = []
+    minigrid_false_set_rates = []
+    minigrid_changed_counts = []
     per_target = {}
     valid_count = 0
     is_bipedal = (getattr(cfg.attention_model, "env_type", "") == "bipedalwalker")
@@ -511,8 +631,21 @@ def validate_on_all_targets(
             inv_losses.append(inv_val)
             contact_accs.append(c_acc)
             contact_bces.append(c_bce)
+            for name in MINIGRID_VAL_LOSS_FIELDS:
+                value = float(res.get(name, float("nan")))
+                if np.isfinite(value):
+                    minigrid_field_losses[name].append(value)
+            if not is_bipedal and not is_crafter:
+                minigrid_focal_losses.append(float(res.get("focal_loss", 0.0)))
+                minigrid_changed_focal_losses.append(float(res.get("changed_focal_loss", 0.0)))
+                minigrid_false_set_rates.append(float(res.get("false_set_rate", 0.0)))
+                minigrid_changed_counts.append(float(res.get("changed_count", 0.0)))
             per_target[task_base] = {
                 "avg_val_loss_wm": l_val,
+                "focal_loss": float(res.get("focal_loss", 0.0)),
+                "changed_focal_loss": float(res.get("changed_focal_loss", 0.0)),
+                "false_set_rate": float(res.get("false_set_rate", 0.0)),
+                "changed_count": float(res.get("changed_count", 0.0)),
                 "terrain_loss": ce_or_terrain,
                 "inventory_loss": inv_val,
                 "contact_acc": c_acc,
@@ -537,6 +670,12 @@ def validate_on_all_targets(
     else:
         result["terrain_loss"] = float(np.mean(terrain_losses)) if valid_count > 0 else 0.0
         result["inventory_loss"] = float(np.mean(inv_losses)) if valid_count > 0 else 0.0
+        for name, values in minigrid_field_losses.items():
+            result[name] = float(np.mean(values)) if values else float("nan")
+        result["focal_loss"] = float(np.mean(minigrid_focal_losses)) if minigrid_focal_losses else 0.0
+        result["changed_focal_loss"] = float(np.mean(minigrid_changed_focal_losses)) if minigrid_changed_focal_losses else 0.0
+        result["false_set_rate"] = float(np.mean(minigrid_false_set_rates)) if minigrid_false_set_rates else 0.0
+        result["changed_count"] = float(np.mean(minigrid_changed_counts)) if minigrid_changed_counts else 0.0
     return result
 
 
@@ -632,6 +771,7 @@ def extract_loss_map_over_validations(
     cfg.attention_model.data_dir = data_dir
 
     sum_map = None
+    sum_coverage_map = None
     loss_list = []
     terrain_loss_list = []
     inv_loss_list = []
@@ -655,6 +795,17 @@ def extract_loss_map_over_validations(
             else:
                 sum_map += loss_map
 
+            if env_type == "minigrid":
+                coverage_map = getattr(model, "coverage_map_result", None)
+                if coverage_map is None:
+                    raise RuntimeError(
+                        "MiniGrid cell-loss extraction did not produce a coverage map"
+                    )
+                if sum_coverage_map is None:
+                    sum_coverage_map = np.array(coverage_map, dtype=np.float32)
+                else:
+                    sum_coverage_map += coverage_map
+
             # train_api returns a dict with "avg_val_loss" containing the actual lightning output
             # e.g., result["avg_val_loss"] = [{'avg_val_loss_wm': 1.2, 'val/terrain_loss': 0.8...}]
             actual_val_out = val_result.get("avg_val_loss", {})
@@ -668,7 +819,15 @@ def extract_loss_map_over_validations(
                  metrics = {}
             
             # Primary metrics: Classification cross-entropy
-            total_l = float(metrics.get('avg_val_loss_wm', metrics.get('best_loss', 0.0)))
+            # Same compatibility rule for generator-side validation/error-map
+            # extraction. The current categorical model exposes
+            # ``val/observation_loss``.
+            total_l = float(
+                metrics.get(
+                    'val/focal_loss',
+                    metrics.get('val/observation_loss', metrics.get('best_loss', 0.0)),
+                )
+            )
             t_l = float(metrics.get('val/terrain_loss', metrics.get('val/ce_loss', total_l)))
             i_l = float(metrics.get('val/inventory_loss', metrics.get('val/inv_loss', 0.0)))
             c_acc = float(metrics.get('val/contact_acc', 0.0))
@@ -731,6 +890,12 @@ def extract_loss_map_over_validations(
             token_error_vector = np.zeros(10, dtype=np.float32)
         return {"terrain": avg_loss_map, "inventory": token_error_vector}, loss_list, contact_acc_list, contact_bce_list
     
+    if env_type == "minigrid":
+        avg_coverage_map = sum_coverage_map / valid_times
+        return {
+            "terrain": avg_loss_map,
+            "coverage": avg_coverage_map,
+        }, loss_list, [], []
     return avg_loss_map, loss_list, [], []
 
 def convert_trajectories_to_batch(trajectories):

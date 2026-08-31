@@ -34,6 +34,7 @@ class GeneratorPPO:
         top_k_features=16,
         ablation_type="none",
         env_type="minigrid",
+        spatial_dpp_sigma=1.5,
 
     ):
         self.gamma = gamma
@@ -45,11 +46,17 @@ class GeneratorPPO:
         self.entropy_anneal_iters = max(0, int(entropy_anneal_iters))
         self.buffer_window_rounds = max(1, int(buffer_window_rounds))
         self.context_dim = context_dim
-        self.env_type = env_type
+        self.env_type = str(env_type).lower()
         # self.ratio = ratio # removed
         self.top_k_features = top_k_features
-        self.is_bipedal = (env_type == "bipedalwalker")
-        self.policy_context_dim = context_dim if self.is_bipedal else context_dim * 2
+        self.spatial_dpp_sigma = float(spatial_dpp_sigma)
+        self.is_bipedal = (self.env_type == "bipedalwalker")
+        self.is_minigrid = (self.env_type == "minigrid")
+        self.policy_context_dim = (
+            context_dim
+            if self.is_bipedal or self.is_minigrid
+            else context_dim * 2
+        )
 
         # history encoder
         
@@ -69,6 +76,7 @@ class GeneratorPPO:
             context_dim=self.policy_context_dim,
             ablation_type=ablation_type,
             env_type=env_type,
+            spatial_dpp_sigma=spatial_dpp_sigma,
         ).to(device)
 
         self.policy_old = MapEditorActorCritic(
@@ -76,6 +84,7 @@ class GeneratorPPO:
             context_dim=self.policy_context_dim,
             ablation_type=ablation_type,
             env_type=env_type,
+            spatial_dpp_sigma=spatial_dpp_sigma,
         ).to(device)
 
         self.policy_old.load_state_dict(self.policy.state_dict())
@@ -98,6 +107,11 @@ class GeneratorPPO:
             {"params": self.policy.stats_actor.parameters(), "lr": lr_actor},
             {"params": self.policy.critic.parameters(), "lr": lr_critic},
         ]
+        if self.policy.history_fusion is not None:
+            optim_params.extend([
+                {"params": self.policy.history_fusion.parameters(), "lr": lr_actor},
+                {"params": self.policy.history_type_actor.parameters(), "lr": lr_actor},
+            ])
 
         self.optimizer = optim.Adam(optim_params)
 
@@ -139,17 +153,22 @@ class GeneratorPPO:
     # ------------------------------------------------------------------
     # Context
     # ------------------------------------------------------------------
-    def _compute_global_context_dual(self, prev_map, terrain_heat, stats_heat, top_k_features=16):
+    def _compute_global_context_dual(self, prev_map, terrain_heat, stats_heat, top_k_features=None):
         """
         Aggregate spatial failure features and inventory failure features.
-        For Crafter/MiniGrid we keep both:
+        Crafter keeps both:
         - local per-sample history context
         - global batch summary context
+
+        MiniGrid keeps only its per-sample semantic context. Broadcasting a
+        batch-wise max makes every generated map chase the same dominant
+        pattern and is unnecessary once absolute coordinates are removed.
         """
+        top_k_features = self.top_k_features if top_k_features is None else int(top_k_features)
         # Use the HistoryEncoder to extract per-sample failure features.
         ctx = self.encoder(prev_map, terrain_heat, stats_heat) # [B, context_dim]
 
-        if self.is_bipedal:
+        if self.is_bipedal or self.is_minigrid:
             return F.normalize(ctx, p=2, dim=1)
         
         local_ctx = F.normalize(ctx, p=2, dim=1)
@@ -185,7 +204,8 @@ class GeneratorPPO:
                 H, W = base_map.size(2), base_map.size(3)
                 # pm: prev_map, pht: prev_heat_terrain, phs: prev_heat_stats
                 pm = torch.zeros((1, 3, H, W), device=device)
-                pht = torch.zeros((1, 1, H, W), device=device)
+                feedback_channels = 2 if self.env_type == "minigrid" else 1
+                pht = torch.zeros((1, feedback_channels, H, W), device=device)
                 phs = None if self.env_type == "minigrid" else torch.zeros(
                     (1, 26 if self.env_type == "bipedalwalker" else 16), device=device
                 )
@@ -229,7 +249,10 @@ class GeneratorPPO:
         if prev_data is None:
             B, _, H, W = curr_map.shape
             self.buffer["prev_map"].append(torch.zeros((B, 3, H, W)))
-            self.buffer["prev_heat"].append(torch.zeros((B, 1, H, W)))
+            feedback_channels = 2 if self.env_type == "minigrid" else 1
+            self.buffer["prev_heat"].append(
+                torch.zeros((B, feedback_channels, H, W))
+            )
             stats_dim = 26 if self.env_type == "bipedalwalker" else 16
             self.buffer["stats_heat"].append(torch.zeros((B, stats_dim)))
         else:
@@ -284,6 +307,10 @@ class GeneratorPPO:
             if self.current_round_count > 0:
                 self.round_lengths.append(self.current_round_count)
                 self.current_round_count = 0
+            # PPO is on-policy. Drop rounds outside the configured window
+            # before computing this update, rather than training on one extra
+            # stale round and trimming it only afterward.
+            self._trim_buffer_to_recent_rounds()
 
             # --- Step 1: Basic data preparation and normalization ---
             rewards = torch.tensor(self.buffer["reward"], device=device)
@@ -322,7 +349,7 @@ class GeneratorPPO:
 
             # Gather HistoryEncoder inputs.
             prev_map = torch.cat(self.buffer["prev_map"]).to(device)
-            prev_heat_terrain = torch.cat(self.buffer["prev_heat"]).to(device) # [B, 1, H, W]
+            prev_heat_terrain = torch.cat(self.buffer["prev_heat"]).to(device)
             prev_heat_stats = torch.cat(self.buffer["stats_heat"]).to(device)     # [B, 16]
 
             # --- Step 2: Advantage normalization ---
@@ -400,9 +427,9 @@ class GeneratorPPO:
                 last_loss = total_loss.item()
 
             # --- Step 5: State synchronization and cleanup ---
-            # Synchronize the old policy and trim the rollout buffer.
+            # Synchronize the old policy. The rollout window was trimmed before
+            # optimization so every sample used here belongs to that window.
             self.policy_old.load_state_dict(self.policy.state_dict())
-            self._trim_buffer_to_recent_rounds()
             
             # Return entropy for monitoring.
             return last_loss, entropy.mean().item()

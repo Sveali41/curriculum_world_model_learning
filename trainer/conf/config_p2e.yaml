@@ -46,4 +46,7 @@ generator_agent:
   agent_type: 'p2e'            # Identify baseline mode
 
 # Logger settings
-p2e_log_dir: ${oc.env:TRAINER_PATH}/logs/results_p2e/
+p2e_log_dir: ${paths.results}/p2e/
+
+attention_model:
+  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/p2e_attention_world_model_${domain}_${ablation.type}_seed${seed}.ckpt

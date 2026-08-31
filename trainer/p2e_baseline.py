@@ -18,6 +18,7 @@ from modelBased.common.utils import TRAINER_PATH
 from modelBased.world_model.AttentionWM import AttentionWorldModel
 from modelBased.world_model import AttentionWM_training
 from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
+from modelBased.common.artifacts import align_world_model_artifact_path
 from modelBased.policy_training.PPO import PPO
 from modelBased.common.support import Support
 from domain.minigrid import minigrid_support as minigrid_utils
@@ -25,17 +26,9 @@ from domain.minigrid.minigrid_support import ColRowCanl_to_CanlRowCol
 from trainer.common.utils import (
     set_seed, validate_on_all_targets
 )
+from trainer.common.paths import RESULTS_ROOT, VISUALIZATIONS_ROOT
 from modelBased.data.data_collect import visualize_agent_coverage
-
-# MiniGrid target/random datasets only use a 5-action subset.
-# We keep PPO/ensemble in this local 5-action space and map to env ids at rollout time.
-MINIGRID_P2E_LOCAL_TO_ENV = {
-    0: 0,  # left
-    1: 1,  # right
-    2: 2,  # forward
-    3: 3,  # pickup
-    4: 5,  # toggle
-}
+from domain.minigrid.action_codec import MODEL_ACTION_COUNT
 
 # ==============================================================================
 # 1. P2E Core: Independent Ensemble Predictor Module
@@ -48,8 +41,7 @@ class P2E_Ensemble(torch.nn.Module):
         super().__init__()
         self.cfg = cfg
         self.embed_dim = cfg.attention_model.embed_dim
-        # Keep MiniGrid aligned with the 5-action subset used by target/random datasets.
-        self.action_dim = 5 if cfg.domain == "minigrid" else int(cfg.attention_model.action_norm_values)
+        self.action_dim = MODEL_ACTION_COUNT if cfg.domain == "minigrid" else int(cfg.attention_model.action_norm_values)
         self.is_continuous = (cfg.domain == "bipedalwalker")
         
         # Multiple MLP heads with different initializations
@@ -167,7 +159,9 @@ class P2E_Explorer_Policy:
     def _map_policy_action_to_env(self, action_idx):
         if self.domain != "minigrid":
             return action_idx
-        return MINIGRID_P2E_LOCAL_TO_ENV[int(action_idx)]
+        # ``run_env`` owns compact->native conversion for every MiniGrid
+        # policy. Returning native IDs here would convert the action twice.
+        return int(action_idx)
 
     def _prepare_wm_obs(self, obs_image):
         """
@@ -274,7 +268,7 @@ def p2e_baseline_experiment(cfg: DictConfig):
             return
         if not bool(getattr(cfg.env.collect, "save_coverage_visualize", False)):
             return
-        coverage_dir = TRAINER_PATH / "logs" / "dataset_visualization" / "p2e" / domain
+        coverage_dir = VISUALIZATIONS_ROOT / "datasets" / "p2e" / domain
         coverage_dir.mkdir(parents=True, exist_ok=True)
         save_path = coverage_dir / f"{phase_name}_coverage.png"
         try:
@@ -321,6 +315,7 @@ def p2e_baseline_experiment(cfg: DictConfig):
         cfg.attention_model.action_norm_values = d_cfg.action_norm
         cfg.attention_model.validation_metric = d_cfg.validation_metric
         cfg.attention_model.data_type = d_cfg.data_type
+    align_world_model_artifact_path(cfg)
     
     print(f"\n[P2E Baseline] Domain: {domain.upper()} | Seed: {seed}")
     default_n = int(cfg.p2e.transitions_per_collection)
@@ -342,10 +337,12 @@ def p2e_baseline_experiment(cfg: DictConfig):
     mask_suffix = f"_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
     
     # Paths & Logger
-    summary_csv_path = (
-        f"trainer/logs/p2e_baseline_{domain}{mask_suffix}_n{transitions_per_collection}_m{updates_per_target}_summary.csv"
+    log_dir = Path(getattr(cfg, "p2e_log_dir", RESULTS_ROOT / "p2e"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    summary_csv_path = str(
+        log_dir
+        / f"p2e_baseline_{domain}{mask_suffix}_n{transitions_per_collection}_m{updates_per_target}_summary.csv"
     )
-    os.makedirs("trainer/logs", exist_ok=True)
     if domain == "minigrid":
         summary_header = [
             "seed", "Iter", "P2E_Mean_Reward", "P2E_Ensemble_Loss",
@@ -376,7 +373,7 @@ def p2e_baseline_experiment(cfg: DictConfig):
     wm_instance = AttentionWorldModel(cfg.attention_model).to(device)
     p2e_ensemble = P2E_Ensemble(cfg, num_models=cfg.p2e.num_models).to(device)
     
-    ppo_action_dim = 5 if domain == "minigrid" else cfg.attention_model.action_norm_values
+    ppo_action_dim = MODEL_ACTION_COUNT if domain == "minigrid" else cfg.attention_model.action_norm_values
     ppo_model = PPO(
         state_dim=cfg.attention_model.embed_dim, 
         action_dim=ppo_action_dim,

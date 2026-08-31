@@ -10,16 +10,14 @@ class HistoryEncoder(nn.Module):
     History encoder that maps past state grids, error heatmaps, and
     auxiliary features into a global context vector for the generator.
 
-    Design:
-    1. Embed object, color, and state IDs.
-    2. Extract spatial features with a CNN backbone.
-    3. Use adaptive max pooling to capture the most salient local features.
-    4. Project the combined representation into the global context space.
+    MiniGrid history is encoded as a translation-invariant semantic failure
+    pattern. Other domains keep their existing coordinate-aware path.
     '''
 
     def __init__(self, context_dim=64, emb_dim=16, env_type="minigrid"):
         super().__init__()
         self.env_type = env_type
+        self.spatial_feedback_channels = 2 if self.env_type == "minigrid" else 1
 
         if self.env_type == "bipedalwalker":
             self.layout_emb = nn.Embedding(10, emb_dim)
@@ -69,8 +67,12 @@ class HistoryEncoder(nn.Module):
         self.emb_color = nn.Embedding(max_color_id + 1, emb_dim)
         self.emb_cell_state = nn.Embedding(max_cell_state_id + 1, emb_dim)
 
-        # 2. Channel count: embeddings + heatmap + CoordConv channels
-        in_channels = emb_dim * 3 + 1 + 2
+        # MiniGrid keeps prediction error and spatial coverage separate and
+        # deliberately omits absolute coordinates. The next generated map is
+        # a fresh random layout, so a previous failure coordinate has no stable
+        # meaning across rounds.
+        coord_channels = 0 if self.env_type == "minigrid" else 2
+        in_channels = emb_dim * 3 + self.spatial_feedback_channels + coord_channels
 
         # 3. CNN Backbone
         self.net = nn.Sequential(
@@ -85,12 +87,18 @@ class HistoryEncoder(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # 4. Adaptive max pooling emphasizes the most salient local failures.
+        # Non-MiniGrid domains retain the legacy coordinate-aware max pooling.
         self.pool = nn.AdaptiveMaxPool2d((1, 1))
 
-        # 5. Output projection with fused inventory error features.
+        if self.env_type == "minigrid":
+            # error-weighted mean + max local pattern, coverage ratio, and
+            # mean error over observed cells
+            projection_input = 64 * 2 + 2
+        else:
+            projection_input = 64 + 16
+
         self.fc = nn.Sequential(
-            nn.Linear(64 + 16, 128),
+            nn.Linear(projection_input, 128),
             nn.LayerNorm(128),
             nn.ReLU(inplace=True),
             nn.Linear(128, context_dim),
@@ -106,10 +114,18 @@ class HistoryEncoder(nn.Module):
     def forward(self, state_grid, error_heatmap, stats_error=None):
         """
         state_grid: [B, 3, H, W]
-        error_heatmap: [B, 1, H, W]
+        error_heatmap: [B, 2, H, W] for MiniGrid (loss, coverage), otherwise
+            [B, 1, H, W]
         stats_error: [B, 16] (Inventory errors)
         """
         B, _, H, W = state_grid.shape
+
+        if error_heatmap.size(1) != self.spatial_feedback_channels:
+            raise ValueError(
+                f"{self.env_type} history expects "
+                f"{self.spatial_feedback_channels} spatial feedback channel(s), "
+                f"got {error_heatmap.size(1)}"
+            )
 
         if self.env_type == "bipedalwalker":
             # For BipedalWalker, the active layout replaces the usual spatial heatmap.
@@ -133,21 +149,43 @@ class HistoryEncoder(nn.Module):
         feat_col = self.emb_color(state_grid[:, 1].long()).permute(0, 3, 1, 2)
         feat_sta = self.emb_cell_state(state_grid[:, 2].long()).permute(0, 3, 1, 2)
 
-        # 2. Concatenate spatial features
+        # 2. Concatenate spatial features. MiniGrid intentionally has no
+        # absolute coordinate channels; the convolution still preserves local
+        # relative object/color/state combinations.
         x = torch.cat([feat_obj, feat_col, feat_sta, error_heatmap], dim=1)
-        x = self._add_coords(x)
+        if self.env_type != "minigrid":
+            x = self._add_coords(x)
 
-        # 3. Extract CNN features and pool
-        x = self.net(x)
-        spatial_features = self.pool(x).flatten(1) # [B, 64]
+        features = self.net(x)
+
+        if self.env_type == "minigrid":
+            error = error_heatmap[:, 0:1].clamp_min(0.0)
+            coverage = error_heatmap[:, 1:2].clamp(0.0, 1.0)
+            hardness = error * coverage
+
+            weights = hardness / (
+                hardness.sum(dim=(2, 3), keepdim=True) + 1e-6
+            )
+            relative_hardness = hardness / (
+                hardness.amax(dim=(2, 3), keepdim=True) + 1e-6
+            )
+            hard_mean = (features * weights).sum(dim=(2, 3))
+            hard_max = (features * relative_hardness).flatten(2).amax(dim=2)
+            coverage_ratio = coverage.mean(dim=(2, 3))
+            mean_error = hardness.sum(dim=(2, 3)) / (
+                coverage.sum(dim=(2, 3)) + 1e-6
+            )
+            semantic_features = torch.cat(
+                [hard_mean, hard_max, coverage_ratio, mean_error], dim=1
+            )
+            return self.fc(semantic_features)
+
+        spatial_features = self.pool(features).flatten(1)
 
         # 4. Fuse inventory-error features
         if stats_error is None:
             stats_error = torch.zeros(B, 16, device=state_grid.device)
         
-        # Concat spatial fail patterns + stats fail patterns
-        combined = torch.cat([spatial_features, stats_error], dim=1) # [B, 80]
+        combined = torch.cat([spatial_features, stats_error], dim=1)
 
-        # 5. Project into the global context space
-        context = self.fc(combined) # [B, context_dim]
-        return context
+        return self.fc(combined)

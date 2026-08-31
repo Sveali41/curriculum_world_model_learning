@@ -1,7 +1,30 @@
 import sys
 import os
 ROOT_DIR =os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(ROOT_DIR)
+WM_ROOT = os.path.join(ROOT_DIR, "wm")
+if WM_ROOT not in sys.path:
+    sys.path.insert(0, WM_ROOT)
+if ROOT_DIR not in sys.path:
+    sys.path.insert(1, ROOT_DIR)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(ROOT_DIR, ".env"), override=False)
+except ImportError:
+    pass
+
+os.environ.setdefault("PROJECT_ROOT", ROOT_DIR)
+os.environ.setdefault("WM_ROOT", WM_ROOT)
+os.environ.setdefault("ENV_PATH", os.path.join(ROOT_DIR, "level"))
+os.environ.setdefault("WORLD_MODEL_PATH", os.path.join(WM_ROOT, "modelBased"))
+os.environ.setdefault(
+    "TRAIN_DATASET_PATH",
+    os.path.join(WM_ROOT, "modelBased", "data", "train_world_model"),
+)
+os.environ.setdefault("MODEL_FPATH", os.path.join(WM_ROOT, "modelBased", "models"))
+os.environ.setdefault("GENERATOR_PATH", os.path.join(ROOT_DIR, "generator"))
+os.environ.setdefault("TRAINER_PATH", os.path.join(ROOT_DIR, "trainer"))
+
 import hydra
 from omegaconf import DictConfig, open_dict
 from pathlib import Path
@@ -16,85 +39,42 @@ from modelBased.common.utils import TRAINER_PATH
 from modelBased.world_model import AttentionWM_training
 from modelBased.world_model.AttentionWM import AttentionWorldModel
 from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
+from modelBased.continue_learning.reservoir_buffer import ReservoirReplayBuffer
+from modelBased.common.artifacts import align_world_model_artifact_path
 
 from generator.generator_interface import GeneratorInterface
+from trainer.common.paths import RESULTS_ROOT
 from trainer.common.utils import (
+    MINIGRID_VAL_LOSS_FIELDS,
     set_seed,
     validate_on_target_task,
     save_validation_csv,
     convert_trajectories_to_batch,
+    minigrid_changed_fraction,
 )
 
 
-def filter_balanced_batch(new_batch, fisher_buffer, ratio=0.5, elements_ratio=0.5):
-    """
-    Filter the current batch using a balanced strategy (similar to Fisher Buffer).
-    Prioritizes samples with key/door/lava based on elements_ratio.
-    """
-    if new_batch is None:
-        return None
-
+def _ensure_csv_header_compatible(csv_path: Path, expected_columns):
+    """Start a fresh file when a previous experiment used another schema."""
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return False
+    expected_header = ",".join(expected_columns)
     try:
-        obs_raw = new_batch['obs']
-        total_len = len(obs_raw)
-        total_quota = int(total_len * ratio)
-        
-        # If quota is valid, perform filtering
-        if total_quota > 0 and total_len > 0:
-            # Convert to tensor for mask calculation
-            obs_tensor = torch.tensor(obs_raw) if not isinstance(obs_raw, torch.Tensor) else obs_raw
-            if obs_tensor.device.type != 'cpu': 
-                    obs_tensor = obs_tensor.cpu()
-                    
-            # Reuse helper from buffer instance
-            near_elements_mask = fisher_buffer.get_agent_near_elements_mask(obs_tensor)
-            near_indices_all = torch.where(near_elements_mask)[0].cpu().numpy()
-            
-            # Quota for special elements
-            elements_quota = int(total_quota * elements_ratio)
-            
-            # Select Elements
-            elements_selected = []
-            if len(near_indices_all) > 0 and elements_quota > 0:
-                pick_n = min(elements_quota, len(near_indices_all))
-                elements_selected = np.random.choice(near_indices_all, pick_n, replace=False).tolist()
-                
-            # Select Random (Rest)
-            remaining_quota = total_quota - len(elements_selected)
-            total_indices = list(range(total_len))
-            non_elements_pool = [i for i in total_indices if i not in elements_selected]
-            
-            if len(non_elements_pool) >= remaining_quota:
-                    random_selected = np.random.choice(non_elements_pool, remaining_quota, replace=False).tolist()
-            else:
-                    random_selected = non_elements_pool 
-                    
-            # Combine
-            all_selected_indices = elements_selected + random_selected
-            np.random.shuffle(all_selected_indices)
-            
-            print(f"[Data Filter] Original: {total_len}, Filtered: {len(all_selected_indices)} "
-                    f"(Ratio: {ratio}, Elements: {len(elements_selected)})")
-            
-            # Helper to slice
-            def slice_batch(batch, inds):
-                sliced = {}
-                for k, v in batch.items():
-                    if isinstance(v, (np.ndarray, list)):
-                            sliced[k] = np.array(v)[inds]
-                    elif torch.is_tensor(v):
-                            sliced[k] = v[inds]
-                    else:
-                            sliced[k] = v 
-                return sliced
-                
-            filtered_batch = slice_batch(new_batch, all_selected_indices)
-            return filtered_batch
-            
-    except Exception as e:
-        print(f"[Warning] Data filtering failed: {e}. Returning original batch.")
-    
-    return new_batch
+        with open(csv_path, "r", encoding="utf-8") as handle:
+            current_header = handle.readline().strip()
+    except OSError:
+        current_header = ""
+    if current_header == expected_header:
+        return True
+
+    backup_path = Path(f"{csv_path}.legacy_backup")
+    suffix = 1
+    while backup_path.exists():
+        backup_path = Path(f"{csv_path}.legacy_backup{suffix}")
+        suffix += 1
+    os.replace(csv_path, backup_path)
+    print(f"[Logger] CSV schema changed; old file backed up to {backup_path}")
+    return False
 
 
 def _safe_int_cfg(value, default=0, name="value"):
@@ -167,6 +147,7 @@ def _apply_domain_collection_budget(cfg: DictConfig, env_type: str):
     config_name="config_mac",
 )
 def adversarial_ued_training(cfg: DictConfig):
+    align_world_model_artifact_path(cfg)
     """
     UED Adversarial Training Loop.
     Integrates Generator (PPO), World Model (AttentionWM), and Continual Learning (Fisher Buffer).
@@ -182,7 +163,7 @@ def adversarial_ued_training(cfg: DictConfig):
     import csv
 
     # Logging and data paths
-    log_dir = TRAINER_PATH / "logs" / "results"
+    log_dir = Path(getattr(cfg, "mac_results_dir", RESULTS_ROOT / "mac"))
     os.makedirs(log_dir, exist_ok=True)
     csv_path = log_dir / "ued_adversarial_log.csv"
     # Suffix used for ablation-specific CSV files
@@ -199,7 +180,13 @@ def adversarial_ued_training(cfg: DictConfig):
     env_type = getattr(cfg.attention_model, "env_type", "minigrid")
     mask_suffix = f"_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
 
-    summary_csv_path = log_dir / f"{env_type}_ued_results{mask_suffix}{ablation_suffix}{metric_suffix}.csv"
+    if env_type == "minigrid":
+        summary_csv_path = log_dir / (
+            f"minigrid_ued_results_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
+            f"_focal_reservoir_sa{ablation_suffix}.csv"
+        )
+    else:
+        summary_csv_path = log_dir / f"{env_type}_ued_results{mask_suffix}{ablation_suffix}{metric_suffix}.csv"
     if ablation_suffix or metric_suffix or env_type != "crafter":
         print(f"[Log] CSV Path Adjusted: {summary_csv_path}")
 
@@ -231,42 +218,45 @@ def adversarial_ued_training(cfg: DictConfig):
             except: pass
 
     # === Initialize the summary CSV ===
-    # Multi-seed runs should append into one shared CSV.
-    file_exists = os.path.exists(summary_csv_path)
-    file_non_empty = file_exists and os.path.getsize(summary_csv_path) > 0
+    # MiniGrid's latent/transition diagnostics are part of its new schema.
     is_bipedal = (env_type == "bipedalwalker")
     is_minigrid = (env_type == "minigrid")
-    if not file_non_empty:
+    if is_bipedal:
+        csv_header = [
+            "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
+            "gen_val_contact_acc", "gen_val_contact_bce", "gen_val_avg_val_loss_wm",
+            "target_val_contact_acc", "target_val_contact_bce", "target_val_avg_val_loss_wm",
+            "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
+        ]
+    elif is_minigrid:
+        csv_header = [
+            "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
+            "gen_val_avg_val_loss_wm", "target_val_avg_val_loss_wm",
+            "target_val_valid_count",
+            "target_val_focal_loss", "target_val_changed_focal_loss",
+            "target_val_false_set_rate", "target_val_changed_count",
+            "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
+            "Replay_Changed_Fraction", "Batch_Changed_Count",
+            "Map_Novelty", "State_Action_Novelty", "Latent_Batch_LogDet",
+            "Mean_Object_Pair_Distance", "Mean_Nearest_Object_Distance",
+            "Selected_Edit_Pair_Distance", "Reward_WM_Loss", "Reward_Map_Novelty",
+            "Reward_State_Action_Novelty", "Reward_Reach", "Reward_Distance",
+            "Reward_Solvable", "Reward_Bias",
+        ]
+    else:
+        csv_header = [
+            "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
+            "gen_val_val_inv_loss", "gen_val_val_ce_loss", "gen_val_avg_val_loss_wm",
+            "target_val_val_inv_loss", "target_val_val_ce_loss", "target_val_avg_val_loss_wm",
+            "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len", "Inv_Change_Ratio",
+        ]
+
+    file_exists = _ensure_csv_header_compatible(summary_csv_path, csv_header)
+    if not file_exists:
         with open(summary_csv_path, mode='w', newline='') as f:
             writer = csv.writer(f)
-            if is_bipedal:
-                writer.writerow([
-                    "Seed", "Iter",
-                    "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
-                    "gen_val_contact_acc", "gen_val_contact_bce", "gen_val_avg_val_loss_wm",
-                    "target_val_contact_acc", "target_val_contact_bce", "target_val_avg_val_loss_wm",
-                    "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len"
-                ])
-                print(f"[Logger] Experiment summary initialized with 16 columns at {summary_csv_path}")
-            else:
-                if is_minigrid:
-                    csv_header = [
-                        "Seed", "Iter",
-                        "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
-                        "gen_val_avg_val_loss_wm", "target_val_avg_val_loss_wm",
-                        "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len"
-                    ]
-                else:
-                    csv_header = [
-                        "Seed", "Iter",
-                        "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
-                        "gen_val_val_inv_loss", "gen_val_val_ce_loss", "gen_val_avg_val_loss_wm",
-                        "target_val_val_inv_loss", "target_val_val_ce_loss", "target_val_avg_val_loss_wm",
-                        "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
-                        "Inv_Change_Ratio"
-                    ]
-                writer.writerow(csv_header)
-                print(f"[Logger] Experiment summary initialized at {summary_csv_path}")
+            writer.writerow(csv_header)
+            print(f"[Logger] Experiment summary initialized with {len(csv_header)} columns at {summary_csv_path}")
     else:
         print(f"[Logger] Reusing existing summary CSV: {summary_csv_path}")
     print(f"[Logger] Experiment summary will be saved to {summary_csv_path}")
@@ -295,10 +285,16 @@ def adversarial_ued_training(cfg: DictConfig):
     )
 
     # === C. Initialize the Fisher replay buffer ===
-    fisher_buffer = FisherReplayBuffer(
-        max_size=cfg.attention_model.fisher_buffer_size,
-        contact_positive_ratio=float(getattr(cfg.domains[cfg.domain], "contact_positive_ratio", 0.5))
-    )
+    if str(cfg.domain) == "minigrid":
+        fisher_buffer = ReservoirReplayBuffer(
+            max_size=cfg.attention_model.fisher_buffer_size,
+            seed=int(getattr(cfg, "seed", 0)),
+        )
+    else:
+        fisher_buffer = FisherReplayBuffer(
+            max_size=cfg.attention_model.fisher_buffer_size,
+            contact_positive_ratio=float(getattr(cfg.domains[cfg.domain], "contact_positive_ratio", 0.5)),
+        )
 
     # === D. Training state variables ===
     old_params, fisher = None, None
@@ -372,6 +368,7 @@ def adversarial_ued_training(cfg: DictConfig):
         div_reset_interval = int(getattr(cfg.generator_agent, "div_reset_interval", 0))
         if (
             warmup_cleanup_done
+            and env_type != "minigrid"
             and div_reset_interval > 0
             and (iteration - warmup_iterations) > 0
             and (iteration - warmup_iterations) % div_reset_interval == 0
@@ -547,6 +544,15 @@ def adversarial_ued_training(cfg: DictConfig):
                 old_params,
                 fisher,
                 replay_data=replay_data,
+                # The canonical WM artifact is a full Lightning checkpoint,
+                # so it can restore Adam, scheduler and global_step in the
+                # next MAC iteration. The first update has no checkpoint yet.
+                fit_ckpt_path=(
+                    str(ckpt_path)
+                    if bool(getattr(cfg.attention_model, "resume_optimizer", False))
+                    and os.path.isfile(str(ckpt_path))
+                    else None
+                ),
             )
             # Update `old_params` for the next iteration.
             old_params = train_res.get("old_params")
@@ -605,11 +611,14 @@ def adversarial_ued_training(cfg: DictConfig):
         # We do this AFTER training so that 'replay_data' (used in training) 
         # strictly contains PAST data, while 'curr_data' contains CURRENT data.
         if buffer_input is not None and not is_warmup_for_wm:
-             fisher_buffer.add_from_batch(
-                buffer_input,
-                current_sample_ratio=cfg.attention_model.current_sample_ratio,
-                fisher_buffer_elements_ratio=cfg.attention_model.fisher_buffer_elements_ratio,
-            )
+             if str(cfg.domain) == "minigrid":
+                 fisher_buffer.add_from_batch(buffer_input)
+             else:
+                 fisher_buffer.add_from_batch(
+                    buffer_input,
+                    current_sample_ratio=cfg.attention_model.current_sample_ratio,
+                    fisher_buffer_elements_ratio=cfg.attention_model.fisher_buffer_elements_ratio,
+                )
              print(
                 f"[Buffer] Archived {new_data_size} transitions. "
                 f"Buffer Size: {len(fisher_buffer)}"
@@ -623,6 +632,14 @@ def adversarial_ued_training(cfg: DictConfig):
         target_mean_loss = 0.0
         target_max_loss = 0.0
         target_std_loss = 0.0
+        target_val_valid_count = 0
+        target_val_field_losses = {
+            name: float("nan") for name in MINIGRID_VAL_LOSS_FIELDS
+        }
+        target_val_focal_loss = 0.0
+        target_val_changed_focal_loss = 0.0
+        target_val_false_set_rate = 0.0
+        target_val_changed_count = 0.0
         # Validation policy:
         # 1. Skip validation during early warmup to save time.
         # 2. Validate every step afterward to track progress.
@@ -638,6 +655,13 @@ def adversarial_ued_training(cfg: DictConfig):
             target_avg_losses = []
             target_contact_accs = []
             target_contact_bces = []
+            target_field_loss_values = {
+                name: [] for name in MINIGRID_VAL_LOSS_FIELDS
+            }
+            target_focal_losses = []
+            target_changed_focal_losses = []
+            target_false_set_rates = []
+            target_changed_counts = []
             
             # Temporarily switch to validation mode.
             old_freeze = cfg.attention_model.freeze_weight
@@ -663,6 +687,15 @@ def adversarial_ued_training(cfg: DictConfig):
                 
                 if res_dict:
                     target_avg_losses.append(res_dict['avg_val_loss_wm'])
+                    if is_minigrid:
+                        target_focal_losses.append(float(res_dict.get("focal_loss", 0.0)))
+                        target_changed_focal_losses.append(float(res_dict.get("changed_focal_loss", 0.0)))
+                        target_false_set_rates.append(float(res_dict.get("false_set_rate", 0.0)))
+                        target_changed_counts.append(float(res_dict.get("changed_count", 0.0)))
+                        for name in MINIGRID_VAL_LOSS_FIELDS:
+                            value = float(res_dict.get(name, float("nan")))
+                            if np.isfinite(value):
+                                target_field_loss_values[name].append(value)
                     if is_bipedal:
                         target_contact_accs.append(res_dict.get('contact_acc', 0.0))
                         target_contact_bces.append(res_dict.get('contact_bce', 0.0))
@@ -676,6 +709,7 @@ def adversarial_ued_training(cfg: DictConfig):
 
             # Aggregate target-task metrics.
             if target_avg_losses:
+                target_val_valid_count = len(target_avg_losses)
                 target_val_avg_val_loss_wm = float(np.mean(target_avg_losses))
                 if is_bipedal:
                     target_val_contact_acc = float(np.mean(target_contact_accs)) if target_contact_accs else 0.0
@@ -686,7 +720,26 @@ def adversarial_ued_training(cfg: DictConfig):
                     target_val_val_inv_loss = float(np.mean(target_inv_losses))
                     print(f"[Metrics] Combined Target Loss -> Total: {target_val_avg_val_loss_wm:.4f} | Terrain: {target_val_val_ce_loss:.4f}")
                 else:
-                    print(f"[Metrics] Combined Target Loss -> Total: {target_val_avg_val_loss_wm:.4f}")
+                    target_val_focal_loss = float(np.mean(target_focal_losses)) if target_focal_losses else 0.0
+                    target_val_changed_focal_loss = float(np.mean(target_changed_focal_losses)) if target_changed_focal_losses else 0.0
+                    target_val_false_set_rate = float(np.mean(target_false_set_rates)) if target_false_set_rates else 0.0
+                    target_val_changed_count = float(np.mean(target_changed_counts)) if target_changed_counts else 0.0
+                    target_val_field_losses = {
+                        name: (
+                            float(np.mean(target_field_loss_values[name]))
+                            if target_field_loss_values[name]
+                            else float("nan")
+                        )
+                        for name in MINIGRID_VAL_LOSS_FIELDS
+                    }
+                    component_summary = " | ".join(
+                        f"{name}: {value:.6f}"
+                        for name, value in target_val_field_losses.items()
+                    )
+                    print(
+                        f"[Metrics] Combined Target Loss -> Total: "
+                        f"{target_val_avg_val_loss_wm:.6f} | {component_summary}"
+                    )
             else:
                 target_val_avg_val_loss_wm = 0.0
                 if is_bipedal:
@@ -736,6 +789,10 @@ def adversarial_ued_training(cfg: DictConfig):
                         }
                     else:
                         if is_minigrid:
+                            mg_metrics = getattr(gen_interface, "last_minigrid_metrics", {})
+                            replay_metrics = fisher_buffer.export_dict() if len(fisher_buffer) else None
+                            replay_changed_fraction, _ = minigrid_changed_fraction(replay_metrics)
+                            _, batch_changed_count = minigrid_changed_fraction(buffer_input)
                             row_data = {
                                 "Seed": seed,
                                 "Iter": iteration + 1,
@@ -745,10 +802,30 @@ def adversarial_ued_training(cfg: DictConfig):
                                 "Gen_Div_Reward": f"{gen_div_reward_val:.4f}",
                                 "gen_val_avg_val_loss_wm": f"{gen_val_avg_val_loss_wm:.6f}",
                                 "target_val_avg_val_loss_wm": f"{target_val_avg_val_loss_wm:.6f}",
+                                "target_val_valid_count": target_val_valid_count,
+                                "target_val_focal_loss": f"{target_val_focal_loss:.6f}",
+                                "target_val_changed_focal_loss": f"{target_val_changed_focal_loss:.6f}",
+                                "target_val_false_set_rate": f"{target_val_false_set_rate:.6f}",
+                                "target_val_changed_count": f"{target_val_changed_count:.2f}",
                                 "New_Data_Size": new_data_size,
                                 "Buffer_Size": len(fisher_buffer),
                                 "Solvable_Count": f"{gen_solvable_count}",
-                                "Avg_Path_Len": f"{gen_avg_bfs:.2f}"
+                                "Avg_Path_Len": f"{gen_avg_bfs:.2f}",
+                                "Replay_Changed_Fraction": f"{replay_changed_fraction:.6f}",
+                                "Batch_Changed_Count": batch_changed_count,
+                                "Map_Novelty": f"{mg_metrics.get('Map_Novelty', 0.0):.6f}",
+                                "State_Action_Novelty": f"{mg_metrics.get('State_Action_Novelty', 0.0):.6f}",
+                                "Latent_Batch_LogDet": f"{mg_metrics.get('Latent_Batch_LogDet', 0.0):.6f}",
+                                "Mean_Object_Pair_Distance": f"{mg_metrics.get('Mean_Object_Pair_Distance', 0.0):.6f}",
+                                "Mean_Nearest_Object_Distance": f"{mg_metrics.get('Mean_Nearest_Object_Distance', 0.0):.6f}",
+                                "Selected_Edit_Pair_Distance": f"{mg_metrics.get('Selected_Edit_Pair_Distance', 0.0):.6f}",
+                                "Reward_WM_Loss": f"{mg_metrics.get('Reward_WM_Loss', 0.0):.6f}",
+                                "Reward_Map_Novelty": f"{mg_metrics.get('Reward_Map_Novelty', 0.0):.6f}",
+                                "Reward_State_Action_Novelty": f"{mg_metrics.get('Reward_State_Action_Novelty', 0.0):.6f}",
+                                "Reward_Reach": f"{mg_metrics.get('Reward_Reach', 0.0):.6f}",
+                                "Reward_Distance": f"{mg_metrics.get('Reward_Distance', 0.0):.6f}",
+                                "Reward_Solvable": f"{mg_metrics.get('Reward_Solvable', 0.0):.6f}",
+                                "Reward_Bias": f"{mg_metrics.get('Reward_Bias', 0.0):.6f}",
                             }
                         else:
                             row_data = {

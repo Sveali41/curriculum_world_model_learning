@@ -7,6 +7,7 @@ defaults:
 
 # --- Control Switch (Unified across all baselines) ---
 domain: 'minigrid'              # 'crafter' or 'minigrid' or 'bipedalwalker'
+cl_log_dir: ${paths.results}/continual_learning/
 
 # --- Domain-Specific Specifications for Sequential Phase Training ---
 domains:
@@ -29,7 +30,7 @@ domains:
     val_suffix: "_test_uniform.npz"
     grid_shape: [3, 0, 0]
     obs_norm: [10, 5, 3]
-    action_norm: 7
+    action_norm: 6
     start_idx: 0
 
   bipedalwalker:
@@ -47,6 +48,7 @@ domains:
 # Override core params for CL stability
 seed: 0
 attention_model:
+  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/cl_attention_world_model_${domain}_${ablation.type}_seed${seed}.ckpt
   n_epochs: 15
   batch_size: 256
   continue_learning: true      # Ensure EWC is active

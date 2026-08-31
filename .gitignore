@@ -4,6 +4,8 @@ outputs/
 .env
 .codex/
 .vscode/
+.pytest_cache/
+.agents/
 
 # Ignore Python bytecode files
 __pycache__/

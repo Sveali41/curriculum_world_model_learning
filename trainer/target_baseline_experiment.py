@@ -10,7 +10,27 @@ from pathlib import Path
 
 # Add project root to path
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(ROOT_DIR)
+WM_ROOT = os.path.join(ROOT_DIR, "wm")
+sys.path.insert(0, ROOT_DIR)
+sys.path.insert(0, WM_ROOT)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(ROOT_DIR, ".env"), override=False)
+except ImportError:
+    pass
+
+os.environ.setdefault("PROJECT_ROOT", ROOT_DIR)
+os.environ.setdefault("WM_ROOT", WM_ROOT)
+os.environ.setdefault("ENV_PATH", os.path.join(ROOT_DIR, "level"))
+os.environ.setdefault("WORLD_MODEL_PATH", os.path.join(WM_ROOT, "modelBased"))
+os.environ.setdefault(
+    "TRAIN_DATASET_PATH",
+    os.path.join(WM_ROOT, "modelBased", "data", "train_world_model"),
+)
+os.environ.setdefault("MODEL_FPATH", os.path.join(WM_ROOT, "modelBased", "models"))
+os.environ.setdefault("GENERATOR_PATH", os.path.join(ROOT_DIR, "generator"))
+os.environ.setdefault("TRAINER_PATH", os.path.join(ROOT_DIR, "trainer"))
 
 from modelBased.common.support import Support
 from modelBased.world_model import AttentionWM_training
@@ -18,7 +38,9 @@ from trainer.common.utils import collect_data_general
 from modelBased.world_model.AttentionWM import AttentionWorldModel
 from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
 from modelBased.common.utils import TRAINER_PATH
+from modelBased.common.artifacts import align_world_model_artifact_path
 from trainer.common.utils import set_seed, validate_on_all_targets
+from trainer.common.paths import RESULTS_ROOT, VISUALIZATIONS_ROOT
 
 
 
@@ -150,6 +172,7 @@ def run_target_baseline_experiment(cfg: DictConfig):
     Unified Baseline Script: Trains World Model directly on Target Tasks data.
     Supports both Crafter (10 tasks) and MiniGrid (20 tasks).
     """
+    align_world_model_artifact_path(cfg)
     # 1. Setup & Environment
     seed = getattr(cfg, "seed", 0)
     set_seed(seed)
@@ -180,7 +203,9 @@ def run_target_baseline_experiment(cfg: DictConfig):
     cumulative_data_size = 0
     fisher_target_shape = None  # (H, W) for MiniGrid replay shape harmonization
     
-    log_dir = TRAINER_PATH / "logs" / "results_target_baseline"
+    log_dir = Path(
+        getattr(cfg, "target_baseline_log_dir", RESULTS_ROOT / "target_baseline")
+    )
     os.makedirs(log_dir, exist_ok=True)
     
     is_bipedal = (domain_name == "bipedalwalker")
@@ -244,8 +269,8 @@ def run_target_baseline_experiment(cfg: DictConfig):
                     "data_type": getattr(cfg.env.collect, "data_type", "random") if hasattr(cfg, "env") and hasattr(cfg.env, "collect") else "random",
                     "data_folder": str(d_cfg.data_path),
                     "data_save_path": "",
-                    "visualize_save_path": os.path.join(str(TRAINER_PATH), "logs", "dataset_visualization", "target", "bipedal" if is_bipedal else domain_name),
-                    "env_visualize_save_path": os.path.join(str(TRAINER_PATH), "logs", "env_visualization", "target", "bipedal" if is_bipedal else domain_name),
+                    "visualize_save_path": str(VISUALIZATIONS_ROOT / "datasets" / "target" / ("bipedal" if is_bipedal else domain_name)),
+                    "env_visualize_save_path": str(VISUALIZATIONS_ROOT / "environments" / "target" / ("bipedal" if is_bipedal else domain_name)),
                     "visualize_filename": f"{current_task}_random_coverage{'_seed'+str(seed) if not is_bipedal else ''}.png",
                     "env_visualize_filename": f"{current_task}_random_env{'_seed'+str(seed) if not is_bipedal else ''}.png",
                     "save_coverage_visualize": save_coverage_visualize,
@@ -297,7 +322,14 @@ def run_target_baseline_experiment(cfg: DictConfig):
             
             start_i = sub_idx * sub_step_size
             end_i = min((sub_idx + 1) * sub_step_size, total_len)
-            sub_data = {k: full_data[k][start_i:end_i] for k in data_keys}
+            # NPZ files may contain scalar metadata fields alongside batched
+            # transition arrays; only sample-aligned arrays can be sliced.
+            sub_data = {
+                k: full_data[k][start_i:end_i]
+                if np.asarray(full_data[k]).ndim > 0
+                else full_data[k]
+                for k in data_keys
+            }
             current_data_size = end_i - start_i
             cumulative_data_size += current_data_size
 

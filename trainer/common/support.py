@@ -2,6 +2,7 @@
 from trainer.common.utils import set_seed
 from modelBased.data.data_collect import collect_data_general, visualize_saved_dataset
 from modelBased.common.utils import TRAINER_PATH
+from trainer.common.paths import VISUALIZATIONS_ROOT
 import os
 
 
@@ -19,7 +20,7 @@ def collect_data_for_txt(cfg):
     file_name = os.path.splitext(env_text_file_name)[0]
     explore_type = cfg.env.collect.data_type  # 'random' or 'uniform'
     cfg.env.collect.data_save_path = TRAINER_PATH / 'data' / f'{file_name}_test_{explore_type}.npz'
-    cfg.env.collect.visualize_save_path = TRAINER_PATH / 'logs' / 'dataset_visualization'
+    cfg.env.collect.visualize_save_path = VISUALIZATIONS_ROOT / 'datasets'
     cfg.env.collect.visualize_filename = f"{file_name}_{explore_type}.png"
 
     collect_data_general(
@@ -45,7 +46,7 @@ def visualize_CL_dataset(cfg):
     file_name = os.path.splitext(env_text_file_name)[0]
     explore_type = cfg.env.collect.data_type  # 'random' or 'uniform'
     cfg.env.collect.data_save_path = os.path.join(data_save_dir, f'{file_name}_test_{explore_type}.npz')
-    cfg.env.collect.visualize_save_path = TRAINER_PATH / 'logs' / 'dataset_visualization'
+    cfg.env.collect.visualize_save_path = VISUALIZATIONS_ROOT / 'datasets'
     cfg.env.collect.visualize_filename = f"{file_name}_{explore_type}.png"
 
     data_path = cfg.env.collect.data_save_path

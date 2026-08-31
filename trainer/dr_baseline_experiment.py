@@ -12,15 +12,42 @@ import glob
 
 # Add project root
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(ROOT_DIR)
+WM_ROOT = os.path.join(ROOT_DIR, "wm")
+sys.path.insert(0, ROOT_DIR)
+sys.path.insert(0, WM_ROOT)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(ROOT_DIR, ".env"), override=False)
+except ImportError:
+    pass
+
+os.environ.setdefault("PROJECT_ROOT", ROOT_DIR)
+os.environ.setdefault("WM_ROOT", WM_ROOT)
+os.environ.setdefault("ENV_PATH", os.path.join(ROOT_DIR, "level"))
+os.environ.setdefault("WORLD_MODEL_PATH", os.path.join(WM_ROOT, "modelBased"))
+os.environ.setdefault(
+    "TRAIN_DATASET_PATH",
+    os.path.join(WM_ROOT, "modelBased", "data", "train_world_model"),
+)
+os.environ.setdefault("MODEL_FPATH", os.path.join(WM_ROOT, "modelBased", "models"))
+os.environ.setdefault("GENERATOR_PATH", os.path.join(ROOT_DIR, "generator"))
+os.environ.setdefault("TRAINER_PATH", os.path.join(ROOT_DIR, "trainer"))
 
 from modelBased.common.utils import TRAINER_PATH
 from modelBased.world_model.AttentionWM import AttentionWorldModel
 from modelBased.world_model import AttentionWM_training
 from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
+from modelBased.continue_learning.reservoir_buffer import ReservoirReplayBuffer
+from modelBased.common.artifacts import align_world_model_artifact_path
 from generator.generator_interface import GeneratorInterface
 from trainer.common.utils import (
-    set_seed, validate_on_target_task, validate_on_all_targets, convert_trajectories_to_batch
+    MINIGRID_VAL_LOSS_FIELDS,
+    set_seed,
+    validate_on_target_task,
+    validate_on_all_targets,
+    convert_trajectories_to_batch,
+    minigrid_changed_fraction,
 )
 
 
@@ -121,6 +148,7 @@ def _ensure_csv_header_compatible(csv_path: Path, expected_columns):
 
 @hydra.main(version_base=None, config_path="conf", config_name="config_dr")
 def run_dr_baseline_experiment(cfg: DictConfig):
+    align_world_model_artifact_path(cfg)
     """
     Unified DR Baseline Experiment: Random maps -> Random actions -> Train WM.
     Periodically validates on the fixed Target Tasks (20 for MiniGrid, 20 for Crafter).
@@ -168,8 +196,16 @@ def run_dr_baseline_experiment(cfg: DictConfig):
 
     # DR usually generates random maps via GeneratorInterface (agent_type='random')
     generator = GeneratorInterface(wm, device, cfg, agent_type='random')
-    fisher_buffer = FisherReplayBuffer(max_size=cfg.attention_model.fisher_buffer_size, contact_positive_ratio=float(getattr(cfg.domains[cfg.domain], "contact_positive_ratio", 0.5))
-)
+    if str(cfg.domain) == "minigrid":
+        fisher_buffer = ReservoirReplayBuffer(
+            max_size=cfg.attention_model.fisher_buffer_size,
+            seed=int(getattr(cfg, "seed", 0)),
+        )
+    else:
+        fisher_buffer = FisherReplayBuffer(
+            max_size=cfg.attention_model.fisher_buffer_size,
+            contact_positive_ratio=float(getattr(cfg.domains[cfg.domain], "contact_positive_ratio", 0.5)),
+        )
     
     log_dir = Path(cfg.dr_log_dir)
     os.makedirs(log_dir, exist_ok=True)
@@ -180,7 +216,13 @@ def run_dr_baseline_experiment(cfg: DictConfig):
     cfg.env.collect.data_folder = str(temp_data_dir) + "/"
 
     mask_suffix = f"_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
-    summary_csv_path = log_dir / f"dr_summary_{domain_name}{mask_suffix}.csv"
+    if is_minigrid:
+        summary_csv_path = log_dir / (
+            f"dr_summary_minigrid_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
+            "_focal_reservoir.csv"
+        )
+    else:
+        summary_csv_path = log_dir / f"dr_summary_{domain_name}{mask_suffix}.csv"
     file_exists = False
 
     old_params, fisher = None, None
@@ -188,7 +230,16 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         csv_columns = [
             "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
             "gen_val_avg_val_loss_wm", "target_val_avg_val_loss_wm",
+            "target_val_valid_count",
+            "target_val_focal_loss", "target_val_changed_focal_loss",
+            "target_val_false_set_rate", "target_val_changed_count",
             "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
+            "Replay_Changed_Fraction", "Batch_Changed_Count",
+            "Map_Novelty", "State_Action_Novelty", "Latent_Batch_LogDet",
+            "Mean_Object_Pair_Distance", "Mean_Nearest_Object_Distance",
+            "Selected_Edit_Pair_Distance", "Reward_WM_Loss", "Reward_Map_Novelty",
+            "Reward_State_Action_Novelty", "Reward_Reach", "Reward_Distance",
+            "Reward_Solvable", "Reward_Bias",
         ]
     elif not is_bipedal: # Crafter or others
         csv_columns = [
@@ -369,6 +420,14 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             default=0,
             name="generator_agent.warmup_iterations",
         )
+        target_val_field_losses = {
+            name: float("nan") for name in MINIGRID_VAL_LOSS_FIELDS
+        }
+        target_val_focal_loss = 0.0
+        target_val_changed_focal_loss = 0.0
+        target_val_false_set_rate = 0.0
+        target_val_changed_count = 0.0
+        target_val_valid_count = 0
         if iteration >= (warmup_iters - 1):
             print(f"  [Validation] Running zero-shot test on all {val_n_phases} targets...")
             task_indices = range(val_start_idx, val_start_idx + val_n_phases)
@@ -384,6 +443,7 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             )
 
             if val_summary["valid_count"] > 0:
+                target_val_valid_count = int(val_summary["valid_count"])
                 target_val_avg_val_loss_wm = val_summary["avg_val_loss_wm"]
                 if is_bipedal:
                     target_val_contact_acc = val_summary.get("contact_acc", 0.0)
@@ -396,7 +456,26 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                     target_val_val_inv_loss = val_summary.get("inventory_loss", 0.0)
                     target_val_contact_acc = 0.0
                     target_val_contact_bce = 0.0
-                    print(f"    -> Results: Avg Loss = {target_val_avg_val_loss_wm:.5f}")
+                    if is_minigrid:
+                        target_val_focal_loss = float(val_summary.get("focal_loss", 0.0))
+                        target_val_changed_focal_loss = float(val_summary.get("changed_focal_loss", 0.0))
+                        target_val_false_set_rate = float(val_summary.get("false_set_rate", 0.0))
+                        target_val_changed_count = float(val_summary.get("changed_count", 0.0))
+                        target_val_field_losses = {
+                            name: float(val_summary.get(name, float("nan")))
+                            for name in MINIGRID_VAL_LOSS_FIELDS
+                        }
+                        component_summary = " | ".join(
+                            f"{name}: {value:.6f}"
+                            for name, value in target_val_field_losses.items()
+                        )
+                        print(
+                            f"    -> Results: Avg Loss = "
+                            f"{target_val_avg_val_loss_wm:.6f} | "
+                            f"{component_summary}"
+                        )
+                    else:
+                        print(f"    -> Results: Avg Loss = {target_val_avg_val_loss_wm:.5f}")
             else:
                 target_val_avg_val_loss_wm = 0.0
                 target_val_val_ce_loss = 0.0
@@ -411,20 +490,47 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             target_val_contact_bce = 0.0
 
         # D. Buffer Archiving
-        fisher_buffer.add_from_batch(
-            new_batch, 
-            current_sample_ratio=cfg.attention_model.current_sample_ratio,
-            fisher_buffer_elements_ratio=cfg.attention_model.fisher_buffer_elements_ratio
-        )
+        if str(cfg.domain) == "minigrid":
+            fisher_buffer.add_from_batch(new_batch)
+        else:
+            fisher_buffer.add_from_batch(
+                new_batch,
+                current_sample_ratio=cfg.attention_model.current_sample_ratio,
+                fisher_buffer_elements_ratio=cfg.attention_model.fisher_buffer_elements_ratio,
+            )
         print(f"  [Buffer] Archived {current_transitions} transitions. Buffer Size: {len(fisher_buffer)}")
         if is_minigrid:
+            replay_data_after = fisher_buffer.export_dict() if len(fisher_buffer) else None
+            replay_changed_fraction, _ = minigrid_changed_fraction(replay_data_after)
+            _, batch_changed_count = minigrid_changed_fraction(new_batch)
+            mg_metrics = getattr(generator, "last_minigrid_metrics", {})
             row_data = {
                 "Seed": seed, "Iter": iteration + 1, "Gen_Mean_Reward": 0.0, "Gen_Loss": 0.0,
                 "Gen_Entropy": 0.0, "Gen_Div_Reward": gen_div_reward,
                 "gen_val_avg_val_loss_wm": gen_val_avg_val_loss_wm,
                 "target_val_avg_val_loss_wm": target_val_avg_val_loss_wm,
+                "target_val_valid_count": target_val_valid_count,
+                "target_val_focal_loss": target_val_focal_loss,
+                "target_val_changed_focal_loss": target_val_changed_focal_loss,
+                "target_val_false_set_rate": target_val_false_set_rate,
+                "target_val_changed_count": target_val_changed_count,
                 "New_Data_Size": current_transitions, "Buffer_Size": len(fisher_buffer),
                 "Solvable_Count": solvable_count, "Avg_Path_Len": avg_path_len,
+                "Replay_Changed_Fraction": replay_changed_fraction,
+                "Batch_Changed_Count": batch_changed_count,
+                "Map_Novelty": mg_metrics.get("Map_Novelty", 0.0),
+                "State_Action_Novelty": mg_metrics.get("State_Action_Novelty", 0.0),
+                "Latent_Batch_LogDet": mg_metrics.get("Latent_Batch_LogDet", 0.0),
+                "Mean_Object_Pair_Distance": mg_metrics.get("Mean_Object_Pair_Distance", 0.0),
+                "Mean_Nearest_Object_Distance": mg_metrics.get("Mean_Nearest_Object_Distance", 0.0),
+                "Selected_Edit_Pair_Distance": mg_metrics.get("Selected_Edit_Pair_Distance", 0.0),
+                "Reward_WM_Loss": mg_metrics.get("Reward_WM_Loss", 0.0),
+                "Reward_Map_Novelty": mg_metrics.get("Reward_Map_Novelty", 0.0),
+                "Reward_State_Action_Novelty": mg_metrics.get("Reward_State_Action_Novelty", 0.0),
+                "Reward_Reach": mg_metrics.get("Reward_Reach", 0.0),
+                "Reward_Distance": mg_metrics.get("Reward_Distance", 0.0),
+                "Reward_Solvable": mg_metrics.get("Reward_Solvable", 0.0),
+                "Reward_Bias": mg_metrics.get("Reward_Bias", 0.0),
             }
         elif is_bipedal:
             row_data = {
