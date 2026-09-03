@@ -255,6 +255,13 @@ def collect_data():
             
             # Use the configured suffix, defaulting to `_uniform.npz`.
             suffix = getattr(domain_cfg, "target_task_suffix", "_uniform.npz")
+            interaction_fraction = float(
+                getattr(cfg.env.collect, "minigrid_interaction_fraction", 0.0)
+            )
+            if domain_name == "minigrid" and interaction_fraction > 0:
+                suffix_path = Path(str(suffix))
+                if not suffix_path.stem.endswith("_mixed"):
+                    suffix = f"{suffix_path.stem}_mixed{suffix_path.suffix}"
             cfg.env.collect.data_save_path = os.path.join(target_tasks_folder, f"{task}{suffix}")
             
             # Keep collection headless; the resulting NPZ is the required artifact.

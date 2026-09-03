@@ -165,7 +165,13 @@ def run_dr_baseline_experiment(cfg: DictConfig):
     val_task_prefix = str(getattr(d_cfg, "val_task_prefix", getattr(d_cfg, "target_task_prefix", "target_task")))
     val_data_path = str(getattr(d_cfg, "val_data_path", getattr(d_cfg, "target_tasks_folder", "")))
     val_suffix = str(getattr(d_cfg, "val_suffix", getattr(d_cfg, "target_task_suffix", "_uniform.npz")))
-    val_start_idx = int(getattr(d_cfg, "start_idx", getattr(d_cfg, "target_task_start_idx", 0)))
+    val_start_idx = int(
+        getattr(
+            d_cfg,
+            "val_start_idx",
+            getattr(d_cfg, "start_idx", getattr(d_cfg, "target_task_start_idx", 0)),
+        )
+    )
     
     print(f"\n{'='*80}")
     print(f"### [DR BASEMENT START] Domain: {domain_name.upper()} | Seed: {seed}")
@@ -184,12 +190,32 @@ def run_dr_baseline_experiment(cfg: DictConfig):
     # Optionally start from a clean checkpoint state.
     ckpt_path = cfg.attention_model.model_save_path
     force_fresh_start = bool(getattr(cfg, "force_fresh_start", False))
+    uses_minigrid_rmax = (
+        domain_name == "minigrid"
+        and str(d_cfg.exploration_policy).lower() == "rmax"
+    )
+    if (
+        force_fresh_start
+        and uses_minigrid_rmax
+        and bool(getattr(d_cfg.rmax_like, "resume", False))
+    ):
+        raise ValueError(
+            "force_fresh_start=true is incompatible with "
+            "domains.minigrid.rmax_like.resume=true"
+        )
     if force_fresh_start:
-        if os.path.exists(ckpt_path):
-            os.remove(ckpt_path)
-            print(f"[Fresh Start] Deleted existing checkpoint: {ckpt_path}")
-        else:
-            print(f"[Fresh Start] No checkpoint found to delete at: {ckpt_path}")
+        checkpoint_paths = [ckpt_path]
+        if uses_minigrid_rmax:
+            checkpoint_paths.append(d_cfg.rmax_like.checkpoint_path)
+        for checkpoint_path in checkpoint_paths:
+            if os.path.exists(checkpoint_path):
+                os.remove(checkpoint_path)
+                print(f"[Fresh Start] Deleted existing checkpoint: {checkpoint_path}")
+            else:
+                print(
+                    "[Fresh Start] No checkpoint found to delete at: "
+                    f"{checkpoint_path}"
+                )
 
     # 1. Initialization
     wm = AttentionWorldModel(cfg.attention_model).to(device)
@@ -235,11 +261,14 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             "target_val_false_set_rate", "target_val_changed_count",
             "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
             "Replay_Changed_Fraction", "Batch_Changed_Count",
-            "Map_Novelty", "State_Action_Novelty", "Latent_Batch_LogDet",
+            "Map_Novelty", "Combination_Novelty", "Random_Feature_Novelty",
+            "Pre_Changed_Focal_Loss", "Post_Changed_Focal_Loss", "Learning_Progress",
+            "Difficulty_Rank", "Learning_Progress_Rank", "Novelty_Rank", "Batch_Nearest_Hamming",
+            "Archive_Nearest_Hamming", "Novelty_Distance_Std", "Latent_Batch_LogDet",
             "Mean_Object_Pair_Distance", "Mean_Nearest_Object_Distance",
-            "Selected_Edit_Pair_Distance", "Reward_WM_Loss", "Reward_Map_Novelty",
-            "Reward_State_Action_Novelty", "Reward_Reach", "Reward_Distance",
-            "Reward_Solvable", "Reward_Bias",
+            "Selected_Edit_Pair_Distance", "Mean_Edit_Rate", "Unique_Goal_Positions",
+            "Reward_Learning_Progress", "Reward_Combination_Novelty",
+            "Reward_Random_Feature_Novelty", "Final_Generator_Reward",
         ]
     elif not is_bipedal: # Crafter or others
         csv_columns = [
@@ -413,6 +442,11 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                     wm.load_state_dict(old_params.state_dict())
             generator.sync_world_model(wm.state_dict())
 
+        # Keep DR's held-out LP diagnostics aligned with MAC. DR has no PPO
+        # update, but the reward components remain comparable.
+        if is_minigrid:
+            generator.finalize_minigrid_rewards()
+
             
         # C. Validation on Target Tasks (aligned with MAC: validate every iter after warmup)
         warmup_iters = _safe_int_cfg(
@@ -519,18 +553,27 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                 "Replay_Changed_Fraction": replay_changed_fraction,
                 "Batch_Changed_Count": batch_changed_count,
                 "Map_Novelty": mg_metrics.get("Map_Novelty", 0.0),
-                "State_Action_Novelty": mg_metrics.get("State_Action_Novelty", 0.0),
+                "Combination_Novelty": mg_metrics.get("Combination_Novelty", 0.0),
+                "Random_Feature_Novelty": mg_metrics.get("Random_Feature_Novelty", 0.0),
+                "Pre_Changed_Focal_Loss": mg_metrics.get("Pre_Changed_Focal_Loss", 0.0),
+                "Post_Changed_Focal_Loss": mg_metrics.get("Post_Changed_Focal_Loss", 0.0),
+                "Learning_Progress": mg_metrics.get("Learning_Progress", 0.0),
+                "Difficulty_Rank": mg_metrics.get("Difficulty_Rank", 0.0),
+                "Learning_Progress_Rank": mg_metrics.get("Learning_Progress_Rank", 0.0),
+                "Novelty_Rank": mg_metrics.get("Novelty_Rank", 0.0),
+                "Batch_Nearest_Hamming": mg_metrics.get("Batch_Nearest_Hamming", 0.0),
+                "Archive_Nearest_Hamming": mg_metrics.get("Archive_Nearest_Hamming", 0.0),
+                "Novelty_Distance_Std": mg_metrics.get("Novelty_Distance_Std", 0.0),
                 "Latent_Batch_LogDet": mg_metrics.get("Latent_Batch_LogDet", 0.0),
                 "Mean_Object_Pair_Distance": mg_metrics.get("Mean_Object_Pair_Distance", 0.0),
                 "Mean_Nearest_Object_Distance": mg_metrics.get("Mean_Nearest_Object_Distance", 0.0),
                 "Selected_Edit_Pair_Distance": mg_metrics.get("Selected_Edit_Pair_Distance", 0.0),
-                "Reward_WM_Loss": mg_metrics.get("Reward_WM_Loss", 0.0),
-                "Reward_Map_Novelty": mg_metrics.get("Reward_Map_Novelty", 0.0),
-                "Reward_State_Action_Novelty": mg_metrics.get("Reward_State_Action_Novelty", 0.0),
-                "Reward_Reach": mg_metrics.get("Reward_Reach", 0.0),
-                "Reward_Distance": mg_metrics.get("Reward_Distance", 0.0),
-                "Reward_Solvable": mg_metrics.get("Reward_Solvable", 0.0),
-                "Reward_Bias": mg_metrics.get("Reward_Bias", 0.0),
+                "Mean_Edit_Rate": mg_metrics.get("Mean_Edit_Rate", 0.0),
+                "Unique_Goal_Positions": mg_metrics.get("Unique_Goal_Positions", 0),
+                "Reward_Learning_Progress": mg_metrics.get("Reward_Learning_Progress", 0.0),
+                "Reward_Combination_Novelty": mg_metrics.get("Reward_Combination_Novelty", 0.0),
+                "Reward_Random_Feature_Novelty": mg_metrics.get("Reward_Random_Feature_Novelty", 0.0),
+                "Final_Generator_Reward": mg_metrics.get("Final_Generator_Reward", 0.0),
             }
         elif is_bipedal:
             row_data = {

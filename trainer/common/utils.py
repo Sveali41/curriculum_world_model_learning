@@ -12,6 +12,7 @@ from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
 from modelBased.data.data_collect import visualize_agent_coverage, visualize_saved_dataset
 from modelBased.common.support import Support
 from minigrid.wrappers import FullyObsWrapper
+from minigrid.core.constants import IDX_TO_COLOR
 import csv
 from modelBased.world_model import AttentionWM_training
 from trainer.common.paths import VISUALIZATIONS_ROOT
@@ -155,7 +156,11 @@ def collect_data_general(
     save_name: str,
     max_steps: int = 10000,
     maximum_dataset_size: int = None,
-    recollect_data: bool = False
+    recollect_data: bool = False,
+    initial_carrying_token: int = None,
+    policy=None,
+    intrinsic_reward_fn=None,
+    store_intrinsic_reward: bool = True,
 ):
     """
     General environment data-collection function.
@@ -165,6 +170,7 @@ def collect_data_general(
         - tuple(layout_str, color_str): minitask strings
     
     save_name: file prefix to save data, e.g. "lava_minitask"
+    initial_carrying_token: MiniGrid only; 0 is empty and 1..6 are key colours.
     """
     if maximum_dataset_size is not None:
         cfg.env.collect.maximum_dataset_size = maximum_dataset_size
@@ -237,6 +243,19 @@ def collect_data_general(
              raise ValueError("For BipedalWalker UED, env_source must be a .txt path or a layout string.")
         raise ValueError("env_source must be a .txt filepath or (layout_str, color_str) tuple")
 
+    if not is_crafter and not is_bipedal and initial_carrying_token is not None:
+        initial_carrying_token = int(initial_carrying_token)
+        if not 0 <= initial_carrying_token <= len(IDX_TO_COLOR):
+            raise ValueError(
+                "MiniGrid initial_carrying_token must be 0 for empty or a "
+                f"colour token in 1..{len(IDX_TO_COLOR)}"
+            )
+        env.unwrapped.initial_carrying_key_color = (
+            None
+            if initial_carrying_token == 0
+            else IDX_TO_COLOR[initial_carrying_token - 1]
+        )
+
     if is_bipedal and hasattr(env, "layout_str"):
         cfg.env.collect.current_layout_str = env.layout_str
 
@@ -283,6 +302,9 @@ def collect_data_general(
         save_img=cfg.env.get('save_visualized_img', False),
         log_name=f"collect_{save_name}",
         max_steps=None,  # already set in env
+        policy=policy,
+        intrinsic_reward_fn=intrinsic_reward_fn,
+        store_intrinsic_reward=store_intrinsic_reward,
     )
 
     print("Data collection complete!")

@@ -27,7 +27,9 @@ domains:
     task_prefix: "target_task"
     data_path: ${oc.env:TRAINER_PATH}/data/minigrid/target_tasks/
     train_suffix: "_test_random.npz"
-    val_suffix: "_test_uniform.npz"
+    val_data_path: ${oc.env:TRAINER_PATH}/data/minigrid/target_tasks_locked_mixed/
+    val_task_prefix: "target_task_locked"
+    val_suffix: "_test_uniform_mixed.npz"
     grid_shape: [3, 0, 0]
     obs_norm: [10, 5, 3]
     action_norm: 6

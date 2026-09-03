@@ -41,6 +41,7 @@ from modelBased.world_model.AttentionWM import AttentionWorldModel
 from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
 from modelBased.continue_learning.reservoir_buffer import ReservoirReplayBuffer
 from modelBased.common.artifacts import align_world_model_artifact_path
+from modelBased.exploration.minigrid_corpus import MiniGridCorpusWriter
 
 from generator.generator_interface import GeneratorInterface
 from trainer.common.paths import RESULTS_ROOT
@@ -209,8 +210,14 @@ def adversarial_ued_training(cfg: DictConfig):
     # [TARGET DATA] Domain-specific fixed target datasets
     target_data_dir = data_save_dir
     domain_cfg = cfg.domains[env_type] if hasattr(cfg, "domains") and env_type in cfg.domains else None
-    if domain_cfg is not None and hasattr(domain_cfg, "target_tasks_folder"):
-        target_data_dir = Path(domain_cfg.target_tasks_folder)
+    if domain_cfg is not None:
+        target_data_dir = Path(
+            getattr(
+                domain_cfg,
+                "val_data_path",
+                getattr(domain_cfg, "target_tasks_folder", target_data_dir),
+            )
+        )
     # Remove stale temporary files from previous runs.
     for f in os.listdir(temp_data_dir):
         if f.endswith(".npz"): 
@@ -237,11 +244,14 @@ def adversarial_ued_training(cfg: DictConfig):
             "target_val_false_set_rate", "target_val_changed_count",
             "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
             "Replay_Changed_Fraction", "Batch_Changed_Count",
-            "Map_Novelty", "State_Action_Novelty", "Latent_Batch_LogDet",
+            "Map_Novelty", "Combination_Novelty", "Random_Feature_Novelty",
+            "Pre_Changed_Focal_Loss", "Post_Changed_Focal_Loss", "Learning_Progress",
+            "Difficulty_Rank", "Learning_Progress_Rank", "Novelty_Rank", "Batch_Nearest_Hamming",
+            "Archive_Nearest_Hamming", "Novelty_Distance_Std", "Latent_Batch_LogDet",
             "Mean_Object_Pair_Distance", "Mean_Nearest_Object_Distance",
-            "Selected_Edit_Pair_Distance", "Reward_WM_Loss", "Reward_Map_Novelty",
-            "Reward_State_Action_Novelty", "Reward_Reach", "Reward_Distance",
-            "Reward_Solvable", "Reward_Bias",
+            "Selected_Edit_Pair_Distance", "Mean_Edit_Rate", "Unique_Goal_Positions",
+            "Reward_Learning_Progress", "Reward_Combination_Novelty",
+            "Reward_Random_Feature_Novelty", "Final_Generator_Reward",
         ]
     else:
         csv_header = [
@@ -266,12 +276,29 @@ def adversarial_ued_training(cfg: DictConfig):
 
     # Optionally start from a clean checkpoint state.
     ckpt_path = cfg.attention_model.model_save_path
+    if (
+        getattr(cfg, "force_fresh_start", False)
+        and is_minigrid
+        and str(domain_cfg.exploration_policy).lower() == "rmax"
+        and bool(getattr(domain_cfg.rmax_like, "resume", False))
+    ):
+        raise ValueError(
+            "force_fresh_start=true is incompatible with "
+            "domains.minigrid.rmax_like.resume=true"
+        )
     if getattr(cfg, "force_fresh_start", False):
-        if os.path.exists(ckpt_path):
-            os.remove(ckpt_path)
-            print(f"[Fresh Start] Deleted existing checkpoint: {ckpt_path}")
-        else:
-            print(f"[Fresh Start] No checkpoint found to delete at: {ckpt_path}")
+        checkpoint_paths = [ckpt_path]
+        if is_minigrid and str(domain_cfg.exploration_policy).lower() == "rmax":
+            checkpoint_paths.append(domain_cfg.rmax_like.checkpoint_path)
+        for checkpoint_path in checkpoint_paths:
+            if os.path.exists(checkpoint_path):
+                os.remove(checkpoint_path)
+                print(f"[Fresh Start] Deleted existing checkpoint: {checkpoint_path}")
+            else:
+                print(
+                    "[Fresh Start] No checkpoint found to delete at: "
+                    f"{checkpoint_path}"
+                )
 
     # === A. Initialize the world model ===
     wm_instance = AttentionWorldModel(cfg.attention_model).to(device)
@@ -316,6 +343,37 @@ def adversarial_ued_training(cfg: DictConfig):
         print(f"[System] No existing checkpoint found at {ckpt_path}. Starting from scratch.")
 
     total_iterations = cfg.generator_agent.total_iterations
+    corpus_writer = None
+    if is_minigrid:
+        explorer_ab_cfg = getattr(domain_cfg, "explorer_ab", None)
+        corpus_path = getattr(explorer_ab_cfg, "corpus_export_path", None)
+        if corpus_path:
+            if str(domain_cfg.exploration_policy).lower() != "random":
+                raise ValueError(
+                    "MAC explorer corpus export requires "
+                    "domains.minigrid.exploration_policy=random"
+                )
+            expected_size = int(explorer_ab_cfg.expected_corpus_size)
+            actual_size = int(total_iterations) * int(cfg.generator_agent.batch_size)
+            if actual_size != expected_size:
+                raise ValueError(
+                    f"corpus export expects {expected_size} maps, but "
+                    f"iterations × batch size is {actual_size}"
+                )
+            corpus_writer = MiniGridCorpusWriter(
+                corpus_path,
+                expected_size,
+                generation_seed=int(seed),
+                generation_metadata={
+                    "mac_iterations": int(total_iterations),
+                    "generator_batch_size": int(cfg.generator_agent.batch_size),
+                    "wm_epochs_per_iteration": int(cfg.attention_model.n_epochs),
+                    "transitions_per_generated_map": int(
+                        cfg.env.collect.maximum_dataset_size
+                    ),
+                },
+            )
+            print(f"[Explorer A/B] Will export frozen corpus to {corpus_writer.path}")
     warmup_iterations = _safe_int_cfg(
         getattr(cfg.generator_agent, "warmup_iterations", 0),
         default=0,
@@ -325,11 +383,38 @@ def adversarial_ued_training(cfg: DictConfig):
     warmup_cleanup_done = False
 
     # === E. Validation set definition (fixed target tasks) ===
-    if domain_cfg is not None and hasattr(domain_cfg, "target_task_prefix"):
-        task_prefix = str(domain_cfg.target_task_prefix)
-        task_suffix = str(getattr(domain_cfg, "target_task_suffix", "_uniform.npz"))
-        task_start = int(getattr(domain_cfg, "target_task_start_idx", 0))
-        task_count = int(getattr(domain_cfg, "target_task_count", 0))
+    if domain_cfg is not None and (
+        hasattr(domain_cfg, "val_task_prefix")
+        or hasattr(domain_cfg, "target_task_prefix")
+    ):
+        task_prefix = str(
+            getattr(
+                domain_cfg,
+                "val_task_prefix",
+                getattr(domain_cfg, "target_task_prefix", ""),
+            )
+        )
+        task_suffix = str(
+            getattr(
+                domain_cfg,
+                "val_suffix",
+                getattr(domain_cfg, "target_task_suffix", "_uniform.npz"),
+            )
+        )
+        task_start = int(
+            getattr(
+                domain_cfg,
+                "val_start_idx",
+                getattr(domain_cfg, "target_task_start_idx", 0),
+            )
+        )
+        task_count = int(
+            getattr(
+                domain_cfg,
+                "val_n_phases",
+                getattr(domain_cfg, "target_task_count", 0),
+            )
+        )
         target_tasks = [f"{task_prefix}{i}" for i in range(task_start, task_start + task_count)]
         target_files = [f"{task_name}{task_suffix}" for task_name in target_tasks]
         print(f"[Config] Target tasks folder: {target_data_dir}")
@@ -389,6 +474,11 @@ def adversarial_ued_training(cfg: DictConfig):
 
         # Generator step returns the metric bundle used by training and logging.
         step_res = gen_interface.step(old_params=old_params, iteration=iteration)
+        if corpus_writer is not None:
+            generated_batch = gen_interface.last_generated_minigrid_batch
+            if generated_batch is None:
+                raise RuntimeError("generator did not expose its MiniGrid batch")
+            corpus_writer.append_batch(**generated_batch)
         gen_val_avg_val_loss_wm = step_res[2]
         gen_val_aux_metric = step_res[3]
         gen_val_val_inv_loss = step_res[4]
@@ -451,22 +541,11 @@ def adversarial_ued_training(cfg: DictConfig):
             # Buffer updates happen after training to avoid double counting.
 
 
-        # --------------------------------------------------------
-        # Step 3: Update the generator (PPO)
-        # --------------------------------------------------------
-        # The generator trains from iteration 0.
-        if True:
-            # The generator update also returns entropy for monitoring.
-            gen_loss, gen_entropy, gen_mean_reward = gen_interface.update(iteration=iteration)
-
-            if gen_loss is not None:
-                print(
-                    f"[Generator] Policy Updated. Loss: {gen_loss:.4f} | Entropy: {gen_entropy:.4f}"
-                )
-            else:
-                print("[Generator] Policy Updated. Loss: NaN (Skipped due to instability)")
-                gen_loss = 0.0 
-                gen_entropy = 0.0
+        # PPO remains delayed until after WM training so MiniGrid can measure
+        # held-out pre/post learning progress for this generated layout batch.
+        gen_loss = 0.0
+        gen_entropy = 0.0
+        gen_mean_reward = 0.0
 
         # --------------------------------------------------------
         # Step 4: Update the world model
@@ -603,6 +682,21 @@ def adversarial_ued_training(cfg: DictConfig):
 
             print(
                 "[System] World Model updated, reloaded, and synced to Generator."
+            )
+
+        # Evaluate held-out post-loss and apply LP + diversity before PPO.
+        if is_minigrid:
+            gen_interface.finalize_minigrid_rewards()
+            gen_loss, gen_entropy, gen_mean_reward = gen_interface.update(iteration=iteration)
+            print(
+                f"[Generator] Policy Updated. Loss: {gen_loss:.4f} | "
+                f"Entropy: {gen_entropy:.4f} | Mean reward: {gen_mean_reward:.4f}"
+            )
+        else:
+            gen_loss, gen_entropy, gen_mean_reward = gen_interface.update(iteration=iteration)
+            print(
+                f"[Generator] Policy Updated. Loss: {gen_loss:.4f} | "
+                f"Entropy: {gen_entropy:.4f} | Mean reward: {gen_mean_reward:.4f}"
             )
 
         # --------------------------------------------------------
@@ -814,18 +908,27 @@ def adversarial_ued_training(cfg: DictConfig):
                                 "Replay_Changed_Fraction": f"{replay_changed_fraction:.6f}",
                                 "Batch_Changed_Count": batch_changed_count,
                                 "Map_Novelty": f"{mg_metrics.get('Map_Novelty', 0.0):.6f}",
-                                "State_Action_Novelty": f"{mg_metrics.get('State_Action_Novelty', 0.0):.6f}",
+                                "Combination_Novelty": f"{mg_metrics.get('Combination_Novelty', 0.0):.6f}",
+                                "Random_Feature_Novelty": f"{mg_metrics.get('Random_Feature_Novelty', 0.0):.6f}",
+                                "Pre_Changed_Focal_Loss": f"{mg_metrics.get('Pre_Changed_Focal_Loss', 0.0):.6f}",
+                                "Post_Changed_Focal_Loss": f"{mg_metrics.get('Post_Changed_Focal_Loss', 0.0):.6f}",
+                                "Learning_Progress": f"{mg_metrics.get('Learning_Progress', 0.0):.6f}",
+                                "Difficulty_Rank": f"{mg_metrics.get('Difficulty_Rank', 0.0):.6f}",
+                                "Learning_Progress_Rank": f"{mg_metrics.get('Learning_Progress_Rank', 0.0):.6f}",
+                                "Novelty_Rank": f"{mg_metrics.get('Novelty_Rank', 0.0):.6f}",
+                                "Batch_Nearest_Hamming": f"{mg_metrics.get('Batch_Nearest_Hamming', 0.0):.6f}",
+                                "Archive_Nearest_Hamming": f"{mg_metrics.get('Archive_Nearest_Hamming', 0.0):.6f}",
+                                "Novelty_Distance_Std": f"{mg_metrics.get('Novelty_Distance_Std', 0.0):.6f}",
                                 "Latent_Batch_LogDet": f"{mg_metrics.get('Latent_Batch_LogDet', 0.0):.6f}",
                                 "Mean_Object_Pair_Distance": f"{mg_metrics.get('Mean_Object_Pair_Distance', 0.0):.6f}",
                                 "Mean_Nearest_Object_Distance": f"{mg_metrics.get('Mean_Nearest_Object_Distance', 0.0):.6f}",
                                 "Selected_Edit_Pair_Distance": f"{mg_metrics.get('Selected_Edit_Pair_Distance', 0.0):.6f}",
-                                "Reward_WM_Loss": f"{mg_metrics.get('Reward_WM_Loss', 0.0):.6f}",
-                                "Reward_Map_Novelty": f"{mg_metrics.get('Reward_Map_Novelty', 0.0):.6f}",
-                                "Reward_State_Action_Novelty": f"{mg_metrics.get('Reward_State_Action_Novelty', 0.0):.6f}",
-                                "Reward_Reach": f"{mg_metrics.get('Reward_Reach', 0.0):.6f}",
-                                "Reward_Distance": f"{mg_metrics.get('Reward_Distance', 0.0):.6f}",
-                                "Reward_Solvable": f"{mg_metrics.get('Reward_Solvable', 0.0):.6f}",
-                                "Reward_Bias": f"{mg_metrics.get('Reward_Bias', 0.0):.6f}",
+                                "Mean_Edit_Rate": f"{mg_metrics.get('Mean_Edit_Rate', 0.0):.6f}",
+                                "Unique_Goal_Positions": mg_metrics.get("Unique_Goal_Positions", 0),
+                                "Reward_Learning_Progress": f"{mg_metrics.get('Reward_Learning_Progress', 0.0):.6f}",
+                                "Reward_Combination_Novelty": f"{mg_metrics.get('Reward_Combination_Novelty', 0.0):.6f}",
+                                "Reward_Random_Feature_Novelty": f"{mg_metrics.get('Reward_Random_Feature_Novelty', 0.0):.6f}",
+                                "Final_Generator_Reward": f"{mg_metrics.get('Final_Generator_Reward', 0.0):.6f}",
                             }
                         else:
                             row_data = {
@@ -870,6 +973,9 @@ def adversarial_ued_training(cfg: DictConfig):
                     print(f"[Warning] Could not delete {f}: {e}")
             print(f"[Cleanup] Done.")
 
+    if corpus_writer is not None:
+        corpus_path = corpus_writer.finalize()
+        print(f"[Explorer A/B] Frozen {corpus_writer.expected_size} maps at {corpus_path}")
     print(">>> UED Adversarial Training Finished.")
 
 

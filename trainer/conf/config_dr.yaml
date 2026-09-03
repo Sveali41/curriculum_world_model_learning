@@ -23,5 +23,14 @@ dr_temp_data_dir: ${domains.${domain}.mini_tasks_temp_root}dr/
 attention_model:
   model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/dr_attention_world_model_${domain}_${ablation.type}_seed${seed}.ckpt
 
+domains:
+  minigrid:
+    rmax_like:
+      checkpoint_path: ${oc.env:MODEL_FPATH}/Policy/dr_intrinsic_explorer_minigrid_spatial_ride_v6_seed${seed}.pt
+
+env:
+  collect:
+    env_visualize_save_path: ${domains.${domain}.env_visualize_folder}dr/${ablation.type}/seed${seed}/
+
 seed: 1
 force_fresh_start: true         # Set to true to delete old model and start from scratch

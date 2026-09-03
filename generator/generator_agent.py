@@ -34,7 +34,9 @@ class GeneratorPPO:
         top_k_features=16,
         ablation_type="none",
         env_type="minigrid",
-        spatial_dpp_sigma=1.5,
+        initial_edit_ratio=0.3,
+        initial_inventory_edit_ratio=0.0,
+        edit_action_group_sizes=None,
 
     ):
         self.gamma = gamma
@@ -49,7 +51,6 @@ class GeneratorPPO:
         self.env_type = str(env_type).lower()
         # self.ratio = ratio # removed
         self.top_k_features = top_k_features
-        self.spatial_dpp_sigma = float(spatial_dpp_sigma)
         self.is_bipedal = (self.env_type == "bipedalwalker")
         self.is_minigrid = (self.env_type == "minigrid")
         self.policy_context_dim = (
@@ -62,8 +63,18 @@ class GeneratorPPO:
         
 
         # === Networks ===
-        if ablation_type == "no_history":
-            self.encoder = None  # No history encoder needed for this ablation
+        if self.is_minigrid:
+            # Construct the encoder for every MiniGrid ablation so removing
+            # history does not shift the RNG stream used to initialize the
+            # shared actor/critic. The no-history run then drops the encoder.
+            encoder = HistoryEncoder(
+                context_dim=context_dim,
+                emb_dim=his_emb_dim,
+                env_type=env_type,
+            ).to(device)
+            self.encoder = None if ablation_type == "no_history" else encoder
+        elif ablation_type == "no_history":
+            self.encoder = None
         else:
             self.encoder = HistoryEncoder(
                 context_dim=context_dim,
@@ -71,20 +82,29 @@ class GeneratorPPO:
                 env_type=env_type,
             ).to(device)
 
+        policy_ablation_type = (
+            "none" if self.is_minigrid and ablation_type == "no_history"
+            else ablation_type
+        )
+
         self.policy = MapEditorActorCritic(
             num_actions=num_actions,
             context_dim=self.policy_context_dim,
-            ablation_type=ablation_type,
+            ablation_type=policy_ablation_type,
             env_type=env_type,
-            spatial_dpp_sigma=spatial_dpp_sigma,
+            initial_edit_ratio=initial_edit_ratio,
+            initial_inventory_edit_ratio=initial_inventory_edit_ratio,
+            edit_action_group_sizes=edit_action_group_sizes,
         ).to(device)
 
         self.policy_old = MapEditorActorCritic(
             num_actions=num_actions,
             context_dim=self.policy_context_dim,
-            ablation_type=ablation_type,
+            ablation_type=policy_ablation_type,
             env_type=env_type,
-            spatial_dpp_sigma=spatial_dpp_sigma,
+            initial_edit_ratio=initial_edit_ratio,
+            initial_inventory_edit_ratio=initial_inventory_edit_ratio,
+            edit_action_group_sizes=edit_action_group_sizes,
         ).to(device)
 
         self.policy_old.load_state_dict(self.policy.state_dict())
@@ -105,6 +125,7 @@ class GeneratorPPO:
             {"params": self.policy.emb_state.parameters(), "lr": lr_actor},
             {"params": self.policy.actor.parameters(), "lr": lr_actor},
             {"params": self.policy.stats_actor.parameters(), "lr": lr_actor},
+            {"params": self.policy.inventory_actor.parameters(), "lr": lr_actor},
             {"params": self.policy.critic.parameters(), "lr": lr_critic},
         ]
         if self.policy.history_fusion is not None:
@@ -130,6 +151,7 @@ class GeneratorPPO:
             "value": [],
             "reward": [],
             "topk_mask": [],
+            "location_order": [],
             "stats_topk_mask": [],
             "stats_heat": [],     # Inventory error history [1, 16]
         }
@@ -224,18 +246,28 @@ class GeneratorPPO:
             if phs is not None and phs.size(0) == 1 and B > 1:
                 phs = phs.repeat(B, 1)
 
-        action, stats_act, map_logp, stats_logp, value, topk_mask, topk_stats_mask = self.policy_old.act(
+        (
+            action, stats_act, map_logp, location_logp, stats_logp, value,
+            topk_mask, location_order, topk_stats_mask,
+        ) = self.policy_old.act(
             base_map, ctx, mask, max_edits_layout, max_stats_edit_ratio=max_edits_stats, stats_heat=phs
         )
 
-        # map_logp is [B, H, W], stats_logp is [B] (already summed in network)
-        total_logprob = map_logp.sum(dim=(1, 2)) + stats_logp
-        return action, stats_act, total_logprob, value, topk_mask, topk_stats_mask, global_ctx
+        # The fixed-budget MiniGrid action has two learned factors: the
+        # ordered location set and the categorical type at each location.
+        total_logprob = map_logp.sum(dim=(1, 2)) + location_logp + stats_logp
+        return (
+            action, stats_act, total_logprob, value, topk_mask,
+            location_order, topk_stats_mask, global_ctx,
+        )
 
     # ------------------------------------------------------------------
     # Buffer
     # ------------------------------------------------------------------
-    def save_buffer(self, curr_map, prev_data, mask, action, stats_action, logprob, value, reward, topk_mask, stats_topk_mask):
+    def save_buffer(
+        self, curr_map, prev_data, mask, action, stats_action, logprob, value,
+        reward, topk_mask, location_order, stats_topk_mask,
+    ):
         self.buffer["curr_map"].append(curr_map.cpu())
         self.buffer["mask"].append(mask.cpu())
         self.buffer["action"].append(action.cpu())
@@ -244,6 +276,7 @@ class GeneratorPPO:
         self.buffer["value"].append(value.cpu())
         self.buffer["reward"].append(float(reward))
         self.buffer["topk_mask"].append(topk_mask.cpu())
+        self.buffer["location_order"].append(location_order.cpu())
         self.buffer["stats_topk_mask"].append(stats_topk_mask.cpu())
 
         if prev_data is None:
@@ -345,6 +378,7 @@ class GeneratorPPO:
             old_logprob = torch.cat(self.buffer["logprob"]).to(device)
             old_value = torch.cat(self.buffer["value"]).to(device).squeeze()
             topk_mask = torch.cat(self.buffer["topk_mask"]).to(device)
+            location_order = torch.cat(self.buffer["location_order"]).to(device)
             stats_topk_mask = torch.cat(self.buffer["stats_topk_mask"]).to(device)
 
             # Gather HistoryEncoder inputs.
@@ -376,18 +410,19 @@ class GeneratorPPO:
                     eval_stats_heat = prev_heat_stats
 
                 # action_tuple: (terrain_action, stats_action)
-                logp_terrain, logp_stats, value, entropy = self.policy.evaluate(
+                logp_terrain, logp_location, logp_stats, value, entropy = self.policy.evaluate(
                     curr_map,
                     ctx,
                     (action, stats_action),
                     mask,
                     target_topk_mask=topk_mask,
+                    target_location_order=location_order,
                     target_stats_topk_mask=stats_topk_mask,
                     stats_heat=eval_stats_heat,
                 )
 
                 # Joint LogProb
-                total_logp = logp_terrain.sum(dim=(1, 2)) + logp_stats
+                total_logp = logp_terrain.sum(dim=(1, 2)) + logp_location + logp_stats
                 value = value.squeeze()
 
                 ratio = torch.exp(total_logp - old_logprob.detach())

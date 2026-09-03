@@ -235,6 +235,14 @@ def run_target_baseline_experiment(cfg: DictConfig):
     n_phases = d_cfg.n_phases
     task_indices = range(d_cfg.start_idx, d_cfg.start_idx + n_phases)
     task_names = [f"{d_cfg.task_prefix}{i}" for i in task_indices]
+    val_task_prefix = str(getattr(d_cfg, "val_task_prefix", d_cfg.task_prefix))
+    val_start_idx = int(getattr(d_cfg, "val_start_idx", d_cfg.start_idx))
+    val_n_phases = int(getattr(d_cfg, "val_n_phases", n_phases))
+    val_task_names = [
+        f"{val_task_prefix}{i}"
+        for i in range(val_start_idx, val_start_idx + val_n_phases)
+    ]
+    val_data_path = str(getattr(d_cfg, "val_data_path", d_cfg.data_path))
     target_dataset_size = getattr(d_cfg, "target_dataset_size", 20000)
     force_recollect_per_task = True
 
@@ -399,8 +407,8 @@ def run_target_baseline_experiment(cfg: DictConfig):
                 val_summary = validate_on_all_targets(
                     cfg,
                     net,
-                    d_cfg.data_path,
-                    task_names,
+                    val_data_path,
+                    val_task_names,
                     d_cfg.val_suffix,
                     phase_name=f"target_iter_{i+1}",
                     VALID_TIMES=1,

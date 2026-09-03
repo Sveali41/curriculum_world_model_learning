@@ -3,17 +3,15 @@ import numpy as np
 import torch.nn.functional as F
 import os
 import random
+import math
 from collections import deque
 
 from generator.generator_agent import GeneratorPPO
 from generator.random_generator_agent import RandomGeneratorAgent
 from generator.reward_system import DiversityModule, check_solvability
-from generator.minigrid_env_designer import PCGSeeder as MinigridPCGSeeder, task_placer as minigrid_task_placer
-from domain.minigrid import minigrid_support as minigrid_utils
 from generator.crafter_env_designer import CrafterPCGSeeder, CRAFTER_ACTION_MAP, CRAFTER_OBJ_MAP
 from generator.bipedal_env_designer import BipedalPCGSeeder, ACTION_TABLE_BIPEDAL
-from minigrid.core.constants import OBJECT_TO_IDX, COLOR_TO_IDX
-from modelBased.data.datamodule import WMRLDataset
+from minigrid.core.constants import COLOR_TO_IDX, OBJECT_TO_IDX, STATE_TO_IDX
 from modelBased.common.support import Support
 from trainer.common.utils import extract_loss_map_over_validations, collect_data_general
 
@@ -29,9 +27,31 @@ ACTION_TABLE_MINIGRID = {
     8: ("door", "green"),
     9: ("wall", None),
     10: ("lava", None),
-    11: ("empty", None),
-    12: ("goal", None),
 }
+
+LOCKED_DOOR_ACTIONS_MINIGRID = {
+    11: ("door", "yellow", STATE_TO_IDX["locked"]),
+    12: ("door", "red", STATE_TO_IDX["locked"]),
+    13: ("door", "blue", STATE_TO_IDX["locked"]),
+    14: ("door", "green", STATE_TO_IDX["locked"]),
+}
+
+# MiniGrid has one carried-object slot. These generator actions map to the
+# colour-aware WM inventory tokens (empty=0, colour index + 1).
+MINIGRID_INVENTORY_ACTION_TO_TOKEN = np.asarray([
+    0,
+    COLOR_TO_IDX["yellow"] + 1,
+    COLOR_TO_IDX["red"] + 1,
+    COLOR_TO_IDX["blue"] + 1,
+    COLOR_TO_IDX["green"] + 1,
+], dtype=np.int64)
+
+
+def minigrid_action_table(enable_locked_doors):
+    table = dict(ACTION_TABLE_MINIGRID)
+    if enable_locked_doors:
+        table.update(LOCKED_DOOR_ACTIONS_MINIGRID)
+    return table
 
 class GeneratorInterface:
     def __init__(self, world_model, device, cfg, agent_type='ppo'):
@@ -52,6 +72,22 @@ class GeneratorInterface:
         self.is_crafter = (getattr(cfg.attention_model, "env_type", "") == "crafter")
         self.is_bipedal = (getattr(cfg.attention_model, "env_type", "") == "bipedalwalker")
         self.is_minigrid = not self.is_crafter and not self.is_bipedal
+        minigrid_domain_cfg = getattr(getattr(cfg, "domains", None), "minigrid", None)
+        self.minigrid_rmax_explorer = None
+        if self.is_minigrid:
+            exploration_policy = str(
+                getattr(minigrid_domain_cfg, "exploration_policy", "random")
+            ).lower()
+            if exploration_policy not in {"random", "rmax"}:
+                raise ValueError(
+                    "domains.minigrid.exploration_policy must be 'random' or 'rmax'"
+                )
+            if exploration_policy == "rmax":
+                from modelBased.exploration.minigrid_rmax import MiniGridRMaxExplorer
+
+                self.minigrid_rmax_explorer = MiniGridRMaxExplorer(cfg)
+                if bool(getattr(minigrid_domain_cfg.rmax_like, "resume", False)):
+                    self.minigrid_rmax_explorer.load_checkpoint()
 
         if self.is_crafter:
             # Crafter: use custom seeder, actions, and map sizes
@@ -83,17 +119,41 @@ class GeneratorInterface:
             self.seeder = BipedalPCGSeeder(width=self.map_width)
             self.ACTION_TABLE = ACTION_TABLE_BIPEDAL
         else:
-            # MiniGrid: use standard seeder
+            # MiniGrid environments are built from a canonical empty canvas so
+            # the generated layout is attributable to the policy action.
             self.map_height = hparams.map_height
             self.map_width = hparams.map_width
-            self.seeder = MinigridPCGSeeder(height=self.map_height, width=self.map_width)
-            self.ACTION_TABLE = ACTION_TABLE_MINIGRID
+            self.ACTION_TABLE = minigrid_action_table(
+                bool(getattr(minigrid_domain_cfg, "locked_doors", False))
+            )
             # Keep start/goal fixed from base map, editor edits around them.
             self.minigrid_anchor_start = True
             self.minigrid_goal_fallback = False
 
+        edit_group_sizes = None
+        if self.is_minigrid:
+            group_counts = {}
+            for action_id, action_value in self.ACTION_TABLE.items():
+                if action_id == 0:
+                    continue
+                family = action_value[0] if isinstance(action_value, tuple) else action_value
+                group_counts[family] = group_counts.get(family, 0) + 1
+            edit_group_sizes = [
+                group_counts[self.ACTION_TABLE[action_id][0]]
+                for action_id in range(1, len(self.ACTION_TABLE))
+            ]
+
         if agent_type == 'random':
-            self.ppo = RandomGeneratorAgent(num_actions=len(self.ACTION_TABLE), device=device)
+            self.ppo = RandomGeneratorAgent(
+                num_actions=len(self.ACTION_TABLE),
+                device=device,
+                edit_action_group_sizes=edit_group_sizes,
+                env_type=(
+                    "bipedalwalker" if self.is_bipedal
+                    else "crafter" if self.is_crafter
+                    else "minigrid"
+                ),
+            )
         else:
             ppo_cfg = getattr(cfg, "PPO", None)
             self.ppo = GeneratorPPO(
@@ -113,18 +173,57 @@ class GeneratorInterface:
                 entropy_coef_end=float(getattr(ppo_cfg, "entropy_coef_end", getattr(ppo_cfg, "entropy_coef", 0.05))) if ppo_cfg is not None else 0.05,
                 entropy_anneal_iters=int(getattr(ppo_cfg, "entropy_anneal_iters", 0)) if ppo_cfg is not None else 0,
                 buffer_window_rounds=int(getattr(ppo_cfg, "buffer_window_rounds", 1)) if ppo_cfg is not None else 1,
-                spatial_dpp_sigma=float(getattr(hparams, "spatial_dpp_sigma", 1.5)),
+                initial_edit_ratio=float(hparams.max_edits_layout),
+                initial_inventory_edit_ratio=float(hparams.max_edits_inventory),
+                edit_action_group_sizes=edit_group_sizes,
             )
         
         self.div_k = hparams.div_k
-        self.diversity = None if self.is_minigrid else DiversityModule(
-            self.map_height,
-            self.map_width,
-            self.div_k,
-            env_type=('crafter' if self.is_crafter else 'bipedalwalker'),
+        minigrid_reward_cfg = self._get_minigrid_reward_cfg()
+        self.diversity_mode = str(
+            getattr(minigrid_reward_cfg, "diversity_mode", "action_hamming")
+        ).lower()
+        valid_diversity_modes = {"random_feature_knn", "action_hamming"}
+        if self.is_minigrid and self.diversity_mode not in valid_diversity_modes:
+            raise ValueError(
+                "domains.minigrid.reward.diversity_mode must be one of "
+                f"{sorted(valid_diversity_modes)}, got {self.diversity_mode!r}"
+            )
+        env_type = (
+            "crafter" if self.is_crafter
+            else "bipedalwalker" if self.is_bipedal
+            else "minigrid"
         )
+        use_random_feature_diversity = (
+            not self.is_minigrid or self.diversity_mode == "random_feature_knn"
+        )
+        self.diversity = None
+        if use_random_feature_diversity:
+            diversity_kwargs = {
+                "input_h": self.map_height,
+                "input_w": self.map_width,
+                "k": self.div_k,
+                "max_archive_size": int(getattr(hparams, "map_archive_size", 1000)),
+                "device": self.device,
+                "env_type": env_type,
+            }
+            if self.is_minigrid:
+                cuda_devices = []
+                diversity_device = torch.device(self.device)
+                if diversity_device.type == "cuda":
+                    cuda_devices = [
+                        diversity_device.index
+                        if diversity_device.index is not None
+                        else torch.cuda.current_device()
+                    ]
+                # Keep the fixed random encoder from shifting PPO's sampling
+                # stream, so same-seed diversity ablations are paired.
+                with torch.random.fork_rng(devices=cuda_devices):
+                    self.diversity = DiversityModule(**diversity_kwargs)
+            else:
+                self.diversity = DiversityModule(**diversity_kwargs)
         self.map_archive = [] if self.is_minigrid else None
-        self.state_action_archive = [] if self.is_minigrid else None
+        self.combination_archive = [] if self.is_minigrid else None
         self.map_archive_size = int(getattr(hparams, "map_archive_size", 1000))
         self.map_knn_k = max(1, int(getattr(hparams, "map_knn_k", 10)))
         self.map_batch_archive_mix = float(
@@ -133,17 +232,14 @@ class GeneratorInterface:
         self.latent_kernel_temperature = max(
             float(getattr(hparams, "latent_kernel_temperature", 0.2)), 1e-6
         )
-        self.state_action_archive_size = int(
-            getattr(hparams, "state_action_archive_size", 10000)
+        self.combination_archive_size = int(
+            getattr(hparams, "combination_archive_size", 1000)
         )
-        self.state_action_knn_k = max(
-            1, int(getattr(hparams, "state_action_knn_k", 10))
+        self.combination_knn_k = max(
+            1, int(getattr(hparams, "combination_knn_k", 10))
         )
-        self.state_action_novelty_samples = max(
-            1, int(getattr(hparams, "state_action_novelty_samples", 128))
-        )
-        self.state_action_batch_archive_mix = float(np.clip(
-            getattr(hparams, "state_action_batch_archive_mix", 0.5), 0.0, 1.0
+        self.combination_batch_archive_mix = float(np.clip(
+            getattr(hparams, "combination_batch_archive_mix", 0.5), 0.0, 1.0
         ))
         self.max_edits_layout = hparams.max_edits_layout
         self.max_edits_inventory = hparams.max_edits_inventory
@@ -162,9 +258,17 @@ class GeneratorInterface:
         self.prev_data = None
         self.crafter_reward_cfg = self._get_crafter_reward_cfg()
         self.bipedal_reward_cfg = self._get_bipedal_reward_cfg()
-        self.minigrid_reward_cfg = self._get_minigrid_reward_cfg()
-        self._minigrid_loss_ema = None
+        self.minigrid_reward_cfg = minigrid_reward_cfg
+        minigrid_domain_cfg = getattr(getattr(cfg, "domains", None), "minigrid", None)
+        lp_probe_budget = int(
+            getattr(minigrid_domain_cfg, "learning_progress_probe_budget", 1000)
+        )
+        self.minigrid_lp_probe_size = max(
+            1, int(math.ceil(lp_probe_budget / max(self.batch_size, 1)))
+        )
         self.last_minigrid_metrics = {}
+        self.last_generated_minigrid_batch = None
+        self._pending_minigrid_round = None
         self.bipedal_history_len = int(self._get_bipedal_history_len())
         self.bipedal_history = deque(maxlen=self.bipedal_history_len)
         self._last_bipedal_memory = (
@@ -225,10 +329,7 @@ class GeneratorInterface:
         a diagnostic and a zero diversity reward instead of an unrecoverable
         device-side assertion.
         """
-        if self.is_minigrid:
-            # MiniGrid uses the predictive-latent and transition archives
-            # below.  It deliberately does not instantiate the legacy random
-            # CNN diversity module.
+        if self.diversity is None:
             return 0.0
         if not self.is_crafter and not self.is_bipedal:
             if torch.is_tensor(map_tensor):
@@ -283,9 +384,11 @@ class GeneratorInterface:
         stats_actions = None if stats_actions is None else np.asarray(stats_actions)
         base_stats = np.asarray(base_stats)
         edit_mask = mask.detach().cpu().numpy() if torch.is_tensor(mask) else np.asarray(mask)
-        maps_obj, maps_color, maps_stats = [], [], []
+        maps_obj, maps_color, maps_state, maps_stats = [], [], [], []
         for i in range(len(base_ids)):
-            obj, color = self._apply_action(base_ids[i], actions[i], mask=edit_mask[i, 0])
+            obj, color, state = self._apply_action(
+                base_ids[i], actions[i], mask=edit_mask[i, 0]
+            )
             stats = base_stats[i].copy()
             current_stats = stats_actions[i] if stats_actions is not None else None
             if self.is_crafter and getattr(self.cfg.generator_agent, "random_stats_actions", False):
@@ -295,10 +398,31 @@ class GeneratorInterface:
                     if value == 1:
                         slot = k_idx % 16
                         stats[slot] += 1 if k_idx < 16 else 5
+            elif self.is_minigrid and current_stats is not None:
+                inventory_action = int(np.asarray(current_stats).reshape(-1)[0])
+                if not 0 <= inventory_action < len(MINIGRID_INVENTORY_ACTION_TO_TOKEN):
+                    raise ValueError(
+                        f"Invalid MiniGrid inventory action {inventory_action}; expected 0..4"
+                    )
+                stats[0] = MINIGRID_INVENTORY_ACTION_TO_TOKEN[inventory_action]
             maps_obj.append(obj)
             maps_color.append(color)
+            maps_state.append(state)
             maps_stats.append(stats)
-        return maps_obj, maps_color, maps_stats
+        return maps_obj, maps_color, maps_state, maps_stats
+
+    def _record_generated_minigrid_batch(
+        self, object_maps, color_maps, state_maps, stats_batch, iteration
+    ):
+        if not self.is_minigrid:
+            return
+        self.last_generated_minigrid_batch = {
+            "object_maps": np.stack(object_maps).astype(np.int64, copy=True),
+            "color_maps": np.stack(color_maps).astype(np.int64, copy=True),
+            "state_maps": np.stack(state_maps).astype(np.int64, copy=True),
+            "inventory_tokens": np.asarray(stats_batch, dtype=np.int64)[:, 0].copy(),
+            "iteration": int(iteration),
+        }
 
     @staticmethod
     def _object_distance_metrics(grid, excluded_ids):
@@ -330,8 +454,14 @@ class GeneratorInterface:
         return float(np.mean(values)) if values else 0.0
 
     def _record_minigrid_metrics(
-        self, final_maps, map_novelties, state_action_novelties, batch_logdet,
-        topk_action_mask=None, reward_components=None,
+        self, final_maps, map_novelties, combination_novelties, batch_logdet,
+        random_feature_novelties=None,
+        topk_action_mask=None, editable_mask=None, reward_components=None,
+        pre_changed_focal_losses=None, difficulty_ranks=None,
+        post_changed_focal_losses=None, learning_progress_values=None,
+        learning_progress_ranks=None,
+        novelty_ranks=None, batch_nearest_hamming=0.0,
+        archive_nearest_hamming=0.0, novelty_distance_std=0.0,
     ):
         if not self.is_minigrid:
             return
@@ -343,34 +473,87 @@ class GeneratorInterface:
             OBJECT_TO_IDX.get("floor", 2),
         }
         object_metrics = [self._object_distance_metrics(grid, excluded) for grid in final_maps]
+        goal_positions = {
+            tuple(position)
+            for grid in final_maps
+            for position in np.argwhere(np.asarray(grid) == self.OBJ_GOAL)
+        }
         component_means = {}
         if reward_components:
-            keys = ("wm_loss", "map_novelty", "state_action_novelty", "reach",
-                    "distance", "solvable", "bias")
+            keys = (
+                "learning_progress", "combination_novelty", "random_feature_novelty",
+                "reward_learning_progress", "reward_combination_novelty",
+                "reward_random_feature_novelty", "total",
+            )
             column_names = {
-                "wm_loss": "Reward_WM_Loss",
-                "map_novelty": "Reward_Map_Novelty",
-                "state_action_novelty": "Reward_State_Action_Novelty",
-                "reach": "Reward_Reach",
-                "distance": "Reward_Distance",
-                "solvable": "Reward_Solvable",
-                "bias": "Reward_Bias",
+                "learning_progress": "Learning_Progress",
+                "combination_novelty": "Combination_Novelty",
+                "random_feature_novelty": "Random_Feature_Novelty",
+                "reward_learning_progress": "Reward_Learning_Progress",
+                "reward_combination_novelty": "Reward_Combination_Novelty",
+                "reward_random_feature_novelty": "Reward_Random_Feature_Novelty",
+                "total": "Final_Generator_Reward",
             }
             component_means = {
                 column_names[key]: float(np.mean([item[key] for item in reward_components]))
                 for key in keys
             }
+        mean_edit_rate = 0.0
+        if topk_action_mask is not None and editable_mask is not None:
+            selected = torch.as_tensor(topk_action_mask).detach().cpu().bool()
+            editable = torch.as_tensor(editable_mask).detach().cpu().bool()
+            if editable.ndim == 4:
+                editable = editable[:, 0]
+            rates = selected.sum(dim=(1, 2)).float() / editable.sum(dim=(1, 2)).clamp_min(1).float()
+            mean_edit_rate = float(rates.mean())
         self.last_minigrid_metrics = {
             "Map_Novelty": float(np.mean(map_novelties)) if len(map_novelties) else 0.0,
-            "State_Action_Novelty": (
-                float(np.mean(state_action_novelties))
-                if state_action_novelties is not None and len(state_action_novelties) > 0
+            "Combination_Novelty": (
+                float(np.mean(combination_novelties))
+                if combination_novelties is not None and len(combination_novelties) > 0
                 else 0.0
             ),
+            "Random_Feature_Novelty": (
+                float(np.mean(random_feature_novelties))
+                if random_feature_novelties is not None and len(random_feature_novelties) > 0
+                else 0.0
+            ),
+            "Pre_Changed_Focal_Loss": (
+                float(np.mean(pre_changed_focal_losses))
+                if pre_changed_focal_losses is not None and len(pre_changed_focal_losses) > 0
+                else 0.0
+            ),
+            "Post_Changed_Focal_Loss": (
+                float(np.mean(post_changed_focal_losses))
+                if post_changed_focal_losses is not None and len(post_changed_focal_losses) > 0
+                else 0.0
+            ),
+            "Learning_Progress": (
+                float(np.mean(learning_progress_values))
+                if learning_progress_values is not None and len(learning_progress_values) > 0
+                else 0.0
+            ),
+            "Difficulty_Rank": (
+                float(np.mean(difficulty_ranks))
+                if difficulty_ranks is not None and len(difficulty_ranks) > 0 else 0.0
+            ),
+            "Learning_Progress_Rank": (
+                float(np.mean(learning_progress_ranks))
+                if learning_progress_ranks is not None and len(learning_progress_ranks) > 0 else 0.0
+            ),
+            "Novelty_Rank": (
+                float(np.mean(novelty_ranks))
+                if novelty_ranks is not None and len(novelty_ranks) > 0 else 0.0
+            ),
+            "Batch_Nearest_Hamming": float(batch_nearest_hamming),
+            "Archive_Nearest_Hamming": float(archive_nearest_hamming),
+            "Novelty_Distance_Std": float(novelty_distance_std),
             "Latent_Batch_LogDet": float(batch_logdet),
             "Mean_Object_Pair_Distance": float(np.mean([m[0] for m in object_metrics])) if object_metrics else 0.0,
             "Mean_Nearest_Object_Distance": float(np.mean([m[1] for m in object_metrics])) if object_metrics else 0.0,
             "Selected_Edit_Pair_Distance": self._selected_edit_pair_distance(topk_action_mask) if topk_action_mask is not None else 0.0,
+            "Mean_Edit_Rate": mean_edit_rate,
+            "Unique_Goal_Positions": len(goal_positions),
             **component_means,
         }
 
@@ -407,8 +590,9 @@ class GeneratorInterface:
             self.diversity.archive.clear()
         if self.is_minigrid:
             self.map_archive.clear()
-            self.state_action_archive.clear()
+            self.combination_archive.clear()
             self.last_minigrid_metrics = {}
+            self._pending_minigrid_round = None
         self.elite_buffer.clear()
         self.prev_data = None
 
@@ -495,189 +679,316 @@ class GeneratorInterface:
         batch_logdet = float(logdet) if float(sign) > 0 else -float("inf")
         return novelty.astype(np.float32), batch_logdet
 
-    def _minigrid_state_action_pairs(self, trajectory):
-        """Return sampled agent-centred raw (local state, action, inventory) pairs."""
-        if not self.is_minigrid or not trajectory:
-            return None
-        obs = trajectory.get("obs")
-        actions = trajectory.get("act")
-        if torch.is_tensor(obs):
-            obs = obs.detach().cpu().numpy()
-        if torch.is_tensor(actions):
-            actions = actions.detach().cpu().numpy()
-        obs = np.asarray(obs)
-        actions = np.asarray(actions).reshape(-1)
-        if obs.ndim != 4 or len(obs) == 0:
-            return None
-        if obs.shape[-1] == 3:
-            obs = np.moveaxis(obs, -1, 1)
-        if obs.shape[1] != 3 or len(actions) != len(obs):
-            return None
-
-        inventory = trajectory.get("inv")
-        if torch.is_tensor(inventory):
-            inventory = inventory.detach().cpu().numpy()
-        if inventory is None:
-            try:
-                inventory, _ = WMRLDataset._minigrid_inventory_from_info(
-                    trajectory.get("info"), trajectory.get("done")
-                )
-            except (TypeError, ValueError):
-                inventory = None
-        if inventory is None:
-            inventory = np.zeros(len(obs), dtype=np.int64)
-        inventory = np.asarray(inventory).reshape(-1)
-        if len(inventory) != len(obs):
-            inventory = np.zeros(len(obs), dtype=np.int64)
-
-        positions = minigrid_utils.get_agent_position(obs, player_id=10)
-        local = minigrid_utils.extract_masked_state(
-            torch.as_tensor(obs, device=self.device), self.wm.mask_size, positions
-        ).detach().cpu().numpy()
-        count = min(len(obs), self.state_action_novelty_samples)
-        indices = np.linspace(0, len(obs) - 1, count, dtype=np.int64)
-        return {
-            "local": np.asarray(local)[indices].copy(),
-            "action": actions[indices].astype(np.int64, copy=True),
-            "inventory": inventory[indices].astype(np.int64, copy=True),
-        }
-
-    def _encode_state_action_pairs(self, pairs):
-        if not pairs or len(pairs["action"]) == 0:
-            return torch.empty((0, 1), device=self.device)
-        return F.normalize(self.wm.encode_state_action_features(
-            torch.as_tensor(pairs["local"], device=self.device),
-            torch.as_tensor(pairs["action"], device=self.device),
-            torch.as_tensor(pairs["inventory"], device=self.device),
-        ), p=2, dim=1)
-
     @staticmethod
-    def _set_cosine_chamfer(left, right):
-        if left.numel() == 0 or right.numel() == 0:
-            return 0.0
-        distance = ((1.0 - left @ right.t()) / 2.0).clamp(0.0, 1.0)
-        return float(0.5 * (distance.min(dim=1).values.mean() + distance.min(dim=0).values.mean()))
-
-    def _minigrid_state_action_novelty_batch(self, pair_batches):
-        """Score all environments first, then update the raw FIFO archive."""
-        if not self.is_minigrid:
-            return np.zeros(len(pair_batches), dtype=np.float32), pair_batches
-        embeddings = [self._encode_state_action_pairs(pairs) for pairs in pair_batches]
-        archive_embeddings = None
-        if self.state_action_archive:
-            archive_pairs = {
-                "local": np.stack([item[0] for item in self.state_action_archive]),
-                "action": np.asarray([item[1] for item in self.state_action_archive]),
-                "inventory": np.asarray([item[2] for item in self.state_action_archive]),
-            }
-            archive_embeddings = self._encode_state_action_pairs(archive_pairs)
-        scores = np.zeros(len(embeddings), dtype=np.float32)
-        for i, current in enumerate(embeddings):
-            if current.numel() == 0:
-                continue
-            other_distances = [
-                self._set_cosine_chamfer(current, other)
-                for j, other in enumerate(embeddings) if i != j and other.numel() > 0
-            ]
-            batch_score = float(np.mean(sorted(other_distances)[:self.state_action_knn_k])) if other_distances else 0.0
-            archive_score = 0.0
-            if archive_embeddings is not None and archive_embeddings.numel() > 0:
-                similarity = (current @ archive_embeddings.t()).clamp(-1.0, 1.0)
-                k = min(self.state_action_knn_k, similarity.size(1))
-                archive_score = float(((1.0 - similarity.topk(k, dim=1).values) / 2.0).clamp(0.0, 1.0).mean())
-            scores[i] = np.clip(
-                self.state_action_batch_archive_mix * batch_score
-                + (1.0 - self.state_action_batch_archive_mix) * archive_score,
-                0.0, 1.0,
-            )
-
-        for pairs in pair_batches:
-            if pairs:
-                self.state_action_archive.extend(zip(
-                    pairs["local"], pairs["action"].tolist(), pairs["inventory"].tolist()
-                ))
-        if len(self.state_action_archive) > self.state_action_archive_size:
-            del self.state_action_archive[:-self.state_action_archive_size]
-        return scores, pair_batches
-
-    def _apply_state_action_reward_correction(self, novelties, reward_components):
-        """Apply batch-scored novelty after all rollouts have been observed."""
-        if not self.is_minigrid or self.ablation_type == "no_diversity":
-            return
-        weight = float(getattr(self.minigrid_reward_cfg, "state_action_novelty", 3.0))
-        if not reward_components:
-            return
-        deltas = []
-        for index, component in enumerate(reward_components):
-            score = float(novelties[index]) if index < len(novelties) else 0.0
-            new_value = weight * float(np.clip(score, 0.0, 1.0))
-            delta = new_value - float(component.get("state_action_novelty", 0.0))
-            component["state_action_novelty"] = new_value
-            component["total"] += delta
-            deltas.append(delta)
-        rewards = getattr(self.ppo, "buffer", {}).get("reward", [])
-        if len(rewards) >= len(deltas):
-            start = len(rewards) - len(deltas)
-            for offset, delta in enumerate(deltas):
-                rewards[start + offset] += delta
-
-    def _minigrid_reward_components(
-        self,
-        raw_loss,
-        solved,
-        is_warmup,
-        map_novelty=0.0,
-        state_action_novelty=0.0,
-        minigrid_reach_ratio=0.0,
-        minigrid_norm_dist=0.0,
+    def _masked_hamming_distance(
+        action_a, editable_a, action_b, editable_b,
+        inventory_a=None, inventory_b=None,
     ):
-        reward_cfg = self.minigrid_reward_cfg
-        w_loss = float(getattr(reward_cfg, "loss", 3.0))
-        # Map novelty is retained as a diagnostic; state-action novelty is the
-        # only learned diversity reward for MiniGrid.
-        w_map = 0.0
-        w_state_action = float(getattr(reward_cfg, "state_action_novelty", 3.0))
-        w_reach = float(getattr(reward_cfg, "reach", 2.0))
-        w_dist = float(getattr(reward_cfg, "dist", 2.0))
-        w_solvable = float(getattr(reward_cfg, "solvable", 2.0))
-        bias = float(getattr(reward_cfg, "bias", 0.0))
-        loss_transform = str(getattr(reward_cfg, "loss_transform", "identity")).lower()
-        nonnegative_loss = max(float(raw_loss), 0.0)
-        if loss_transform == "log1p":
-            difficulty = float(
-                np.log1p(float(getattr(reward_cfg, "loss_scale", 1.0)) * nonnegative_loss)
+        """Compare map edits and, when supplied, the one-slot inventory edit."""
+        action_a = np.asarray(action_a)
+        action_b = np.asarray(action_b)
+        valid = np.asarray(editable_a, dtype=bool) & np.asarray(editable_b, dtype=bool)
+        if not np.any(valid):
+            map_mismatches = 0
+            compared = 0
+        else:
+            map_mismatches = int(np.count_nonzero(action_a[valid] != action_b[valid]))
+            compared = int(np.count_nonzero(valid))
+        if inventory_a is not None and inventory_b is not None:
+            map_mismatches += int(
+                int(np.asarray(inventory_a).reshape(-1)[0])
+                != int(np.asarray(inventory_b).reshape(-1)[0])
             )
-        elif loss_transform == "relative_log1p":
-            ema_beta = float(getattr(reward_cfg, "loss_ema_beta", 0.95))
-            baseline = max(float(self._minigrid_loss_ema or nonnegative_loss), 1e-8)
-            relative = min(
-                nonnegative_loss / baseline,
-                float(getattr(reward_cfg, "loss_relative_clip", 10.0)),
-            )
-            difficulty = float(np.log1p(relative))
-            self._minigrid_loss_ema = (
-                ema_beta * baseline + (1.0 - ema_beta) * nonnegative_loss
+            compared += 1
+        return float(map_mismatches / compared) if compared else 0.0
+
+    def _minigrid_combination_novelty_batch(
+        self, action_matrices, editable_masks, inventory_actions=None
+    ):
+        """Score categorical action matrices before appending them to the FIFO archive."""
+        if not self.is_minigrid:
+            return np.zeros(len(action_matrices), dtype=np.float32), 0.0, 0.0, 0.0
+
+        batch_distances = [[] for _ in action_matrices]
+        for i in range(len(action_matrices)):
+            for j in range(i + 1, len(action_matrices)):
+                distance = self._masked_hamming_distance(
+                    action_matrices[i], editable_masks[i],
+                    action_matrices[j], editable_masks[j],
+                    None if inventory_actions is None else inventory_actions[i],
+                    None if inventory_actions is None else inventory_actions[j],
+                )
+                batch_distances[i].append(distance)
+                batch_distances[j].append(distance)
+
+        batch_nearest = np.asarray([
+            float(np.mean(sorted(distances)[:self.combination_knn_k]))
+            if distances else 0.0
+            for distances in batch_distances
+        ], dtype=np.float32)
+
+        archive_nearest = np.zeros(len(action_matrices), dtype=np.float32)
+        all_archive_distances = []
+        if self.combination_archive:
+            for i, (action, editable) in enumerate(zip(action_matrices, editable_masks)):
+                distances = [
+                    self._masked_hamming_distance(
+                        action,
+                        editable,
+                        item["action"],
+                        item["editable"],
+                        None if inventory_actions is None else inventory_actions[i],
+                        item.get("inventory"),
+                    )
+                    for item in self.combination_archive
+                ]
+                all_archive_distances.extend(distances)
+                if distances:
+                    archive_nearest[i] = float(
+                        np.mean(sorted(distances)[:self.combination_knn_k])
+                    )
+
+        if self.combination_archive:
+            scores = (
+                self.combination_batch_archive_mix * batch_nearest
+                + (1.0 - self.combination_batch_archive_mix) * archive_nearest
             )
         else:
-            difficulty = nonnegative_loss
+            scores = batch_nearest
 
-        if self.ablation_type == "no_diversity":
-            map_novelty = 0.0
-            state_action_novelty = 0.0
-        components = {
-            "wm_loss": 0.0 if is_warmup else w_loss * difficulty,
-            "map_novelty": w_map * float(np.clip(map_novelty, 0.0, 1.0)),
-            "state_action_novelty": w_state_action * float(np.clip(state_action_novelty, 0.0, 1.0)),
-            "reach": w_reach * float(np.clip(minigrid_reach_ratio, 0.0, 1.0)),
-            "distance": w_dist * float(np.clip(minigrid_norm_dist, 0.0, 1.0)),
-            "solvable": w_solvable * (1.0 if solved else -1.0),
-            "bias": bias,
-        }
-        components["difficulty"] = difficulty
-        components["total"] = sum(
-            value for key, value in components.items() if key not in {"difficulty", "total"}
+        # Update only after every current sample has been scored.
+        for index, (action, editable) in enumerate(zip(action_matrices, editable_masks)):
+            self.combination_archive.append({
+                "action": np.asarray(action, dtype=np.int64).copy(),
+                "editable": np.asarray(editable, dtype=bool).copy(),
+                "inventory": (
+                    None
+                    if inventory_actions is None
+                    else int(np.asarray(inventory_actions[index]).reshape(-1)[0])
+                ),
+            })
+        if len(self.combination_archive) > self.combination_archive_size:
+            del self.combination_archive[:-self.combination_archive_size]
+
+        distance_values = [value for values in batch_distances for value in values]
+        return (
+            np.clip(scores, 0.0, 1.0).astype(np.float32),
+            float(np.mean(batch_nearest)) if len(batch_nearest) else 0.0,
+            float(np.mean(archive_nearest)) if self.combination_archive and all_archive_distances else 0.0,
+            float(np.std(distance_values)) if distance_values else 0.0,
         )
-        return components
+
+    @staticmethod
+    def _tie_aware_percentile_rank(values, valid_mask=None):
+        """Return average percentile ranks, with larger values ranked higher."""
+        values = np.asarray(values, dtype=np.float32).reshape(-1)
+        valid = np.ones(len(values), dtype=bool) if valid_mask is None else np.asarray(valid_mask, dtype=bool)
+        ranks = np.zeros(len(values), dtype=np.float32)
+        indices = np.flatnonzero(valid & np.isfinite(values))
+        if len(indices) <= 1:
+            return ranks
+        valid_values = values[indices]
+        for position, index in enumerate(indices):
+            value = valid_values[position]
+            less = np.sum(valid_values < value)
+            equal = np.sum(valid_values == value)
+            ranks[index] = (less + 0.5 * (equal - 1)) / float(len(indices) - 1)
+        return np.clip(ranks, 0.0, 1.0)
+
+    @staticmethod
+    def _minigrid_reward_components(
+        learning_progress,
+        combination_novelty,
+        random_feature_novelty=0.0,
+        diversity_mode="action_hamming",
+        learning_progress_weight=1.0,
+        diversity_weight=1.0,
+    ):
+        learning_progress = float(learning_progress)
+        combination_novelty = float(np.clip(combination_novelty, 0.0, 1.0))
+        random_feature_novelty = float(np.clip(random_feature_novelty, 0.0, 1.0))
+        learning_progress_weight = max(float(learning_progress_weight), 0.0)
+        diversity_weight = max(float(diversity_weight), 0.0)
+        reward_learning_progress = learning_progress_weight * learning_progress
+        if diversity_mode == "random_feature_knn":
+            reward_combination_novelty = 0.0
+            reward_random_feature_novelty = (
+                diversity_weight * random_feature_novelty
+            )
+        else:
+            reward_combination_novelty = (
+                diversity_weight * combination_novelty
+            )
+            reward_random_feature_novelty = 0.0
+        return {
+            "learning_progress": learning_progress,
+            "combination_novelty": combination_novelty,
+            "random_feature_novelty": random_feature_novelty,
+            "reward_learning_progress": reward_learning_progress,
+            "reward_combination_novelty": reward_combination_novelty,
+            "reward_random_feature_novelty": reward_random_feature_novelty,
+            "total": (
+                reward_learning_progress
+                + reward_combination_novelty
+                + reward_random_feature_novelty
+            ),
+        }
+
+    def _evaluate_minigrid_changed_focal_losses(self, trajectories, valid, phase):
+        """Evaluate changed-effect focal loss on held-out per-layout probes."""
+        losses = np.zeros(self.batch_size, dtype=np.float32)
+        for index, trajectory in enumerate(trajectories):
+            if not valid[index] or not trajectory:
+                continue
+            try:
+                losses[index] = float(
+                    self.wm.calc_minigrid_changed_focal_loss(trajectory)
+                )
+            except Exception as exc:
+                print(
+                    f"[GeneratorInterface] {phase} loss evaluation failed for env "
+                    f"{index}: {exc}"
+                )
+        return losses
+
+    def _evaluate_minigrid_post_update_probes(self, trajectories, valid):
+        """Evaluate post-update probe loss and spatial history feedback."""
+        losses = np.zeros(self.batch_size, dtype=np.float32)
+        error_maps = np.zeros(
+            (self.batch_size, self.map_height, self.map_width), dtype=np.float32
+        )
+        coverage_maps = np.zeros_like(error_maps)
+        for index, trajectory in enumerate(trajectories):
+            if not valid[index] or not trajectory:
+                continue
+            try:
+                metrics = self.wm.calc_minigrid_probe_metrics(
+                    trajectory, include_spatial=True
+                )
+                losses[index] = float(metrics["changed_focal_loss"])
+                error_maps[index] = np.asarray(
+                    metrics["error_map"], dtype=np.float32
+                )
+                coverage_maps[index] = np.asarray(
+                    metrics["coverage_map"], dtype=np.float32
+                )
+            except Exception as exc:
+                print(
+                    "[GeneratorInterface] Post-update probe evaluation failed for "
+                    f"env {index}: {exc}"
+                )
+        return losses, error_maps, coverage_maps
+
+    def _set_minigrid_post_update_history(
+        self, history_maps, error_maps, coverage_maps
+    ):
+        if self.agent_type == "random":
+            return
+        maps_tensor = torch.as_tensor(
+            np.asarray(history_maps), dtype=torch.float32, device=self.device
+        )
+        feedback = np.stack([error_maps, coverage_maps], axis=1)
+        feedback_tensor = torch.as_tensor(
+            feedback, dtype=torch.float32, device=self.device
+        )
+        self.prev_data = (maps_tensor, feedback_tensor)
+
+    def finalize_minigrid_rewards(self):
+        """Apply held-out learning progress plus diversity to the pending PPO round."""
+        pending = self._pending_minigrid_round
+        if not self.is_minigrid or pending is None:
+            return
+
+        valid = np.asarray(pending["valid"], dtype=bool)
+        pre_losses = np.asarray(pending["pre_changed_focal_losses"], dtype=np.float32)
+        post_losses, post_error_maps, post_coverage_maps = (
+            self._evaluate_minigrid_post_update_probes(
+                pending["probe_trajectories"], valid
+            )
+        )
+        self._set_minigrid_post_update_history(
+            pending["history_maps"], post_error_maps, post_coverage_maps
+        )
+        learning_progress = pre_losses - post_losses
+        difficulty_ranks = self._tie_aware_percentile_rank(pre_losses, valid)
+        learning_progress_ranks = self._tie_aware_percentile_rank(
+            learning_progress, valid
+        )
+        combination_values = np.asarray(
+            pending["combination_novelties"], dtype=np.float32
+        )
+        random_feature_values = np.asarray(
+            pending.get("random_feature_novelties", np.zeros(self.batch_size)),
+            dtype=np.float32,
+        )
+        diversity_mode = str(
+            getattr(self, "diversity_mode", "action_hamming")
+        ).lower()
+        learning_progress_weight = float(
+            getattr(self.minigrid_reward_cfg, "learning_progress", 1.0)
+        )
+        if diversity_mode == "random_feature_knn":
+            novelty_values = random_feature_values
+            diversity_weight = float(
+                getattr(self.minigrid_reward_cfg, "random_feature_knn", 1.0)
+            )
+        else:
+            novelty_values = combination_values
+            diversity_weight = float(
+                getattr(self.minigrid_reward_cfg, "combination_novelty", 1.0)
+            )
+        if self.ablation_type == "no_diversity" or diversity_weight <= 0.0:
+            novelty_ranks = np.zeros(self.batch_size, dtype=np.float32)
+            diversity_weight = 0.0
+        else:
+            novelty_ranks = self._tie_aware_percentile_rank(novelty_values, valid)
+
+        reward_components = []
+        rewards = []
+        for index in range(self.batch_size):
+            if not valid[index]:
+                reward_components.append({
+                    "learning_progress": float(learning_progress[index]),
+                    "combination_novelty": float(combination_values[index]),
+                    "random_feature_novelty": float(random_feature_values[index]),
+                    "reward_learning_progress": 0.0,
+                    "reward_combination_novelty": 0.0,
+                    "reward_random_feature_novelty": 0.0,
+                    "total": -5.0,
+                })
+                rewards.append(-5.0)
+                continue
+            component = self._minigrid_reward_components(
+                learning_progress[index], combination_values[index],
+                random_feature_novelty=random_feature_values[index],
+                diversity_mode=diversity_mode,
+                learning_progress_weight=learning_progress_weight,
+                diversity_weight=diversity_weight,
+            )
+            reward_components.append(component)
+            rewards.append(float(component["total"]))
+
+        buffer_rewards = getattr(self.ppo, "buffer", {}).get("reward", [])
+        if buffer_rewards and len(buffer_rewards) >= self.batch_size:
+            start = len(buffer_rewards) - self.batch_size
+            buffer_rewards[start:start + self.batch_size] = rewards
+
+        self._record_minigrid_metrics(
+            pending["final_maps"], pending["map_novelties"], combination_values,
+            pending["batch_logdet"],
+            random_feature_novelties=random_feature_values,
+            topk_action_mask=pending["topk_action_mask"],
+            editable_mask=pending["editable_mask"], reward_components=reward_components,
+            pre_changed_focal_losses=pre_losses, difficulty_ranks=difficulty_ranks,
+            post_changed_focal_losses=post_losses,
+            learning_progress_values=learning_progress,
+            learning_progress_ranks=learning_progress_ranks,
+            novelty_ranks=novelty_ranks,
+            batch_nearest_hamming=pending["batch_nearest_hamming"],
+            archive_nearest_hamming=pending["archive_nearest_hamming"],
+            novelty_distance_std=pending["novelty_distance_std"],
+        )
+        self._pending_minigrid_round = None
 
     def _normalize_base_map(self, grid):
         """
@@ -864,6 +1175,8 @@ class GeneratorInterface:
         self._last_bipedal_memory = self._build_bipedal_history_feature()
 
     def _default_stats(self):
+        if self.is_minigrid:
+            return np.zeros(1, dtype=np.int64)
         default_stats = np.zeros(16, dtype=np.float32)
         default_stats[0] = 9.0
         default_stats[1] = 9.0
@@ -871,13 +1184,50 @@ class GeneratorInterface:
         default_stats[3] = 9.0
         return default_stats
 
-    def _generate_random_base_batch(self):
+    def _minigrid_empty_base(self, iteration=0, env_index=0):
+        if not self.is_minigrid:
+            raise RuntimeError("Canonical empty base is only defined for MiniGrid")
+        if self.map_height < 4 or self.map_width < 4:
+            raise ValueError("MiniGrid canonical base requires height and width >= 4")
+
+        grid = np.full(
+            (self.map_height, self.map_width),
+            self.OBJ_EMPTY,
+            dtype=np.int64,
+        )
+        wall = OBJECT_TO_IDX["wall"]
+        grid[0, :] = wall
+        grid[-1, :] = wall
+        grid[:, 0] = wall
+        grid[:, -1] = wall
+        start = (1, 1)
+        grid[start] = self.OBJ_START
+
+        candidates = [
+            (row, col)
+            for row in range(1, self.map_height - 1)
+            for col in range(1, self.map_width - 1)
+            if (row, col) != start
+        ]
+        experiment_seed = int(getattr(getattr(self, "cfg", None), "seed", 0))
+        goal_rng = np.random.default_rng(np.random.SeedSequence((
+            experiment_seed,
+            int(iteration),
+            int(env_index),
+        )))
+        goal = candidates[int(goal_rng.integers(len(candidates)))]
+        grid[goal] = self.OBJ_GOAL
+        return grid
+
+    def _generate_random_base_batch(self, iteration=0):
         base_maps = []
         base_stats = []
-        for _ in range(self.batch_size):
+        for env_index in range(self.batch_size):
             if self.is_bipedal:
                 batch_grid, _ = self.seeder.generate(1)
                 grid = batch_grid[0]
+            elif self.is_minigrid:
+                grid = self._minigrid_empty_base(iteration, env_index)
             else:
                 grid = self.seeder.generate()
             norm_grid = self._normalize_base_map(grid)
@@ -887,14 +1237,14 @@ class GeneratorInterface:
         return base_maps, base_stats
 
     def _step_random(self, old_params, iteration=0):
-        base_maps, base_stats = self._generate_random_base_batch()
+        base_maps, base_stats = self._generate_random_base_batch(iteration)
         base_ids = torch.from_numpy(np.stack(base_maps)).to(self.device).long()
         B, H, W = base_ids.shape
         zeros = torch.zeros((B, H, W), device=self.device, dtype=torch.float32)
         curr_map = torch.stack([base_ids.float(), zeros, zeros], dim=1)
         mask = self._immutable_mask(base_ids)
 
-        actions, stats_actions, _, _, _, _, _ = self.ppo.select_action(
+        actions, stats_actions, _, _, topk_action_mask, _, _, _ = self.ppo.select_action(
             curr_map, None, mask, self.max_edits_layout, self.max_edits_inventory
         )
 
@@ -911,39 +1261,69 @@ class GeneratorInterface:
         actions_np = actions.detach().cpu().numpy()
         stats_actions_np = stats_actions.detach().cpu().numpy() if stats_actions is not None else None
         base_stats_np = np.stack(base_stats)
-        final_maps_obj, final_maps_color, final_stats_batch = self._materialize_candidates(
+        final_maps_obj, final_maps_color, final_maps_state, final_stats_batch = self._materialize_candidates(
             base_ids_np, actions_np, stats_actions_np, base_stats_np, mask
         )
-        map_novelties, batch_logdet = (
-            self._minigrid_map_novelty(
-                [np.stack([obj, color, np.zeros_like(obj)], axis=0)
-                 for obj, color in zip(final_maps_obj, final_maps_color)]
+        self._record_generated_minigrid_batch(
+            final_maps_obj, final_maps_color, final_maps_state,
+            final_stats_batch, iteration,
+        )
+        final_maps_3ch = [
+            np.stack([obj, color, state], axis=0)
+            for obj, color, state in zip(
+                final_maps_obj, final_maps_color, final_maps_state
             )
+        ]
+        map_novelties, batch_logdet = (
+            self._minigrid_map_novelty(final_maps_3ch)
             if self.is_minigrid else (np.zeros(self.batch_size, dtype=np.float32), 0.0)
         )
-        state_action_pending = []
-        state_action_novelties = []
-        reward_components = []
+        editable_masks_np = (mask[:, 0] < 0.5).detach().cpu().numpy()
+        combination_novelties, batch_nearest_hamming, archive_nearest_hamming, novelty_distance_std = (
+            self._minigrid_combination_novelty_batch(
+                actions_np, editable_masks_np, stats_actions_np
+            )
+            if self.is_minigrid else (np.zeros(self.batch_size, dtype=np.float32), 0.0, 0.0, 0.0)
+        )
+        random_feature_novelties = np.zeros(self.batch_size, dtype=np.float32)
+        valid_flags = []
+        round_trajectories = []
+        probe_trajectories = []
 
         for i in range(self.batch_size):
             final_map_obj = final_maps_obj[i]
             final_map_col = final_maps_color[i]
+            final_map_state = final_maps_state[i]
             final_stats = final_stats_batch[i]
 
-            final_map_2ch = np.stack([final_map_obj, final_map_col], axis=0)
+            final_map_3ch = final_maps_3ch[i]
             res_rollout = self._rollout_combined(
                 final_map_obj, final_stats, iteration, i, old_params=old_params,
-                color_np=final_map_col, evaluate_wm=not is_warmup,
+                color_np=final_map_col, state_np=final_map_state,
+                evaluate_wm=not is_warmup,
             )
             traj, errors, raw_loss_val, solved = res_rollout[0], res_rollout[1], res_rollout[2], res_rollout[3]
+            round_trajectories.append(traj)
+            if self.is_minigrid and traj and "obs" in traj:
+                probe_traj = self._rollout_combined(
+                    final_map_obj,
+                    final_stats,
+                    iteration,
+                    f"{i}_lp_probe",
+                    old_params=old_params,
+                    color_np=final_map_col,
+                    state_np=final_map_state,
+                    evaluate_wm=False,
+                    maximum_dataset_size=self.minigrid_lp_probe_size,
+                )[0]
+            else:
+                probe_traj = {}
+            probe_trajectories.append(probe_traj)
             errors = self._normalize_rollout_errors(errors)
 
             t_loss_batch = res_rollout[4] if len(res_rollout) > 4 else raw_loss_val
             i_loss_batch = res_rollout[5] if len(res_rollout) > 5 else 0.0
             inv_changed_slots = res_rollout[6] if len(res_rollout) > 6 else 0
-            state_action_pairs = self._minigrid_state_action_pairs(traj) if self.is_minigrid else None
-            state_action_novelties.append(0.0)
-            state_action_pending.append(state_action_pairs)
 
             if self.is_crafter:
                 is_connected, conn_stats = self.seeder.check_connectivity(final_map_obj)
@@ -964,34 +1344,33 @@ class GeneratorInterface:
                 if shortest_dist > 0:
                     solved_count += 1
 
-            is_connected_final = (
-                is_connected
-                if self.is_crafter
-                else (solved if self.is_bipedal else shortest_dist > 0)
-            )
-            mg_reach_ratio, mg_norm_dist = (0.0, 0.0)
-            if (not self.is_crafter) and (not self.is_bipedal):
-                mg_reach_ratio, mg_norm_dist = self._minigrid_path_metrics(final_map_obj)
-            r_div = float(map_novelties[i]) if self.is_minigrid else self._get_diversity_reward(final_map_2ch, inventory_vec=final_stats)
+            if self.is_minigrid:
+                if self.diversity_mode == "random_feature_knn":
+                    random_feature_novelties[i] = self._get_diversity_reward(
+                        final_map_3ch
+                    )
+                    r_div = float(random_feature_novelties[i])
+                else:
+                    r_div = float(combination_novelties[i])
+            else:
+                r_div = self._get_diversity_reward(
+                    final_map_3ch, inventory_vec=final_stats
+                )
             div_rewards.append(r_div)
             if self.is_minigrid:
-                components = self._minigrid_reward_components(
-                    raw_loss_val, is_connected_final, is_warmup, r_div,
-                    0.0, mg_reach_ratio, mg_norm_dist,
-                )
-                reward_components.append(components)
-                reward_clip = float(getattr(self.minigrid_reward_cfg, "clip", 60.0))
-                reward = float(np.clip(components["total"], -reward_clip, reward_clip))
+                reward = 0.0  # DR has no PPO update; diagnostics are finalized later.
             else:
                 reward = self._calculate_reward(
-                    raw_loss_val, r_div, is_connected_final, is_warmup,
+                    raw_loss_val, r_div, is_warmup,
                     inv_diversity=inv_changed_slots, ce_loss=t_loss_batch,
-                    inv_loss=i_loss_batch, minigrid_reach_ratio=mg_reach_ratio,
-                    minigrid_norm_dist=mg_norm_dist,
+                    inv_loss=i_loss_batch,
                 )
 
             if not traj or 'obs' not in traj:
                 reward = -5.0
+                valid_flags.append(False)
+            else:
+                valid_flags.append(True)
             raw_scalar_losses.append(raw_loss_val)
             raw_ce_losses.append(t_loss_batch)
             raw_inv_losses.append(i_loss_batch)
@@ -1005,12 +1384,37 @@ class GeneratorInterface:
         mean_inv_loss = np.mean(raw_inv_losses) if len(raw_inv_losses) > 0 else 0.0
         mean_div_reward = np.mean(div_rewards) if len(div_rewards) > 0 else 0.0
         if self.is_minigrid:
-            state_action_novelties, _ = self._minigrid_state_action_novelty_batch(state_action_pending)
-            self._apply_state_action_reward_correction(state_action_novelties, reward_components)
-            self._record_minigrid_metrics(
-                final_maps_obj, map_novelties, state_action_novelties, batch_logdet,
-                topk_action_mask=None, reward_components=reward_components,
+            probe_valid_flags = [
+                valid and bool(probe) and "obs" in probe
+                for valid, probe in zip(valid_flags, probe_trajectories)
+            ]
+            pre_changed_focal_losses = self._evaluate_minigrid_changed_focal_losses(
+                probe_trajectories, probe_valid_flags, phase="Pre-update probe"
             )
+            self._record_minigrid_metrics(
+                final_maps_obj, map_novelties, combination_novelties, batch_logdet,
+                random_feature_novelties=random_feature_novelties,
+                topk_action_mask=topk_action_mask, editable_mask=mask < 0.5,
+                batch_nearest_hamming=batch_nearest_hamming,
+                archive_nearest_hamming=archive_nearest_hamming,
+                novelty_distance_std=novelty_distance_std,
+            )
+            self._pending_minigrid_round = {
+                "probe_trajectories": probe_trajectories,
+                "valid": probe_valid_flags,
+                "pre_changed_focal_losses": pre_changed_focal_losses,
+                "final_maps": final_maps_obj,
+                "history_maps": final_maps_3ch,
+                "map_novelties": map_novelties,
+                "combination_novelties": combination_novelties,
+                "random_feature_novelties": random_feature_novelties,
+                "batch_logdet": batch_logdet,
+                "topk_action_mask": topk_action_mask,
+                "editable_mask": mask < 0.5,
+                "batch_nearest_hamming": batch_nearest_hamming,
+                "archive_nearest_hamming": archive_nearest_hamming,
+                "novelty_distance_std": novelty_distance_std,
+            }
 
         self.prev_data = None
         return None, None, mean_raw_loss, mean_ce_loss, mean_inv_loss, mean_div_reward, valid_trajs, solved_count, avg_bfs
@@ -1043,6 +1447,8 @@ class GeneratorInterface:
             if self.is_bipedal:
                 batch_grid, _ = self.seeder.generate(1)
                 grid = batch_grid[0]
+            elif self.is_minigrid:
+                grid = self._minigrid_empty_base(iteration, r_idx)
             else:
                 grid = self.seeder.generate()
 
@@ -1096,7 +1502,10 @@ class GeneratorInterface:
         curr_map = torch.stack([base_ids.float(), zeros, zeros], dim=1)
         mask = self._immutable_mask(base_ids)
 
-        actions, stats_actions, logp, values, topk_action_mask, topk_stats_action_mask, _ = self.ppo.select_action(
+        (
+            actions, stats_actions, logp, values, topk_action_mask,
+            location_order, topk_stats_action_mask, _,
+        ) = self.ppo.select_action(
             curr_map, ppo_input_context, mask, self.max_edits_layout, self.max_edits_inventory
         )
 
@@ -1115,39 +1524,68 @@ class GeneratorInterface:
         actions_np = actions.detach().cpu().numpy()
         stats_actions_np = stats_actions.detach().cpu().numpy() if stats_actions is not None else None
         base_stats_np = np.stack(base_stats)
-        final_maps_obj, final_maps_color, final_stats_batch = self._materialize_candidates(
+        final_maps_obj, final_maps_color, final_maps_state, final_stats_batch = self._materialize_candidates(
             base_ids_np, actions_np, stats_actions_np, base_stats_np, mask
         )
+        self._record_generated_minigrid_batch(
+            final_maps_obj, final_maps_color, final_maps_state,
+            final_stats_batch, iteration,
+        )
         final_maps_3ch = [
-            np.stack([obj, color, np.zeros_like(obj)], axis=0)
-            for obj, color in zip(final_maps_obj, final_maps_color)
+            np.stack([obj, color, state], axis=0)
+            for obj, color, state in zip(
+                final_maps_obj, final_maps_color, final_maps_state
+            )
         ]
         map_novelties, batch_logdet = (
             self._minigrid_map_novelty(final_maps_3ch)
             if self.is_minigrid else (np.zeros(self.batch_size, dtype=np.float32), 0.0)
         )
-        state_action_pending = []
-        state_action_novelties = []
-        reward_components = []
+        editable_masks_np = (mask[:, 0] < 0.5).detach().cpu().numpy()
+        combination_novelties, batch_nearest_hamming, archive_nearest_hamming, novelty_distance_std = (
+            self._minigrid_combination_novelty_batch(
+                actions_np, editable_masks_np, stats_actions_np
+            )
+            if self.is_minigrid else (np.zeros(self.batch_size, dtype=np.float32), 0.0, 0.0, 0.0)
+        )
+        random_feature_novelties = np.zeros(self.batch_size, dtype=np.float32)
+        valid_flags = []
+        round_trajectories = []
+        probe_trajectories = []
 
         for i in range(self.batch_size):
             final_map_obj = final_maps_obj[i]
             final_map_col = final_maps_color[i]
+            final_map_state = final_maps_state[i]
             final_stats = final_stats_batch[i]
 
             final_map_3ch = final_maps_3ch[i]
             res_rollout = self._rollout_combined(
                 final_map_obj, final_stats, iteration, i, old_params=old_params,
-                color_np=final_map_col, evaluate_wm=not is_warmup,
+                color_np=final_map_col, state_np=final_map_state,
+                evaluate_wm=not is_warmup,
             )
             traj, errors, raw_loss_val, solved = res_rollout[0], res_rollout[1], res_rollout[2], res_rollout[3]
+            round_trajectories.append(traj)
+            if self.is_minigrid and traj and "obs" in traj:
+                probe_traj = self._rollout_combined(
+                    final_map_obj,
+                    final_stats,
+                    iteration,
+                    f"{i}_lp_probe",
+                    old_params=old_params,
+                    color_np=final_map_col,
+                    state_np=final_map_state,
+                    evaluate_wm=False,
+                    maximum_dataset_size=self.minigrid_lp_probe_size,
+                )[0]
+            else:
+                probe_traj = {}
+            probe_trajectories.append(probe_traj)
             errors = self._normalize_rollout_errors(errors)
             t_loss_batch = res_rollout[4] if len(res_rollout) > 4 else raw_loss_val
             i_loss_batch = res_rollout[5] if len(res_rollout) > 5 else 0.0
             inv_changed_slots = res_rollout[6] if len(res_rollout) > 6 else 0
-            state_action_pairs = self._minigrid_state_action_pairs(traj) if self.is_minigrid else None
-            state_action_novelties.append(0.0)
-            state_action_pending.append(state_action_pairs)
             avg_ep_len = res_rollout[7] if len(res_rollout) > 7 else 200.0
             all_avg_ep_lens.append(avg_ep_len)
 
@@ -1170,35 +1608,33 @@ class GeneratorInterface:
                 if shortest_dist > 0:
                     solved_count += 1
 
-            is_connected_final = (
-                is_connected
-                if self.is_crafter
-                else (solved if self.is_bipedal else shortest_dist > 0)
-            )
-            mg_reach_ratio, mg_norm_dist = (0.0, 0.0)
-            if (not self.is_crafter) and (not self.is_bipedal):
-                mg_reach_ratio, mg_norm_dist = self._minigrid_path_metrics(final_map_obj)
-            r_div = float(map_novelties[i]) if self.is_minigrid else self._get_diversity_reward(final_map_3ch, inventory_vec=final_stats)
+            if self.is_minigrid:
+                if self.diversity_mode == "random_feature_knn":
+                    random_feature_novelties[i] = self._get_diversity_reward(
+                        final_map_3ch
+                    )
+                    r_div = float(random_feature_novelties[i])
+                else:
+                    r_div = float(combination_novelties[i])
+            else:
+                r_div = self._get_diversity_reward(
+                    final_map_3ch, inventory_vec=final_stats
+                )
             div_rewards.append(r_div)
             if self.is_minigrid:
-                components = self._minigrid_reward_components(
-                    raw_loss_val, is_connected_final, is_warmup, r_div,
-                    0.0, mg_reach_ratio, mg_norm_dist,
-                )
-                reward_components.append(components)
-                reward_clip = float(getattr(self.minigrid_reward_cfg, "clip", 60.0))
-                reward = float(np.clip(components["total"], -reward_clip, reward_clip))
+                reward = 0.0  # Finalized after this round's WM update.
             else:
                 reward = self._calculate_reward(
-                    raw_loss_val, r_div, is_connected_final, is_warmup,
+                    raw_loss_val, r_div, is_warmup,
                     inv_diversity=inv_changed_slots, ce_loss=t_loss_batch,
                     inv_loss=i_loss_batch, avg_ep_len=avg_ep_len,
-                    minigrid_reach_ratio=mg_reach_ratio,
-                    minigrid_norm_dist=mg_norm_dist,
                 )
 
             if not traj or 'obs' not in traj:
                 reward = -5.0
+                valid_flags.append(False)
+            else:
+                valid_flags.append(True)
             final_maps_for_history.append(final_map_obj.copy())
 
             cm = ppo_input_context[0][i:i+1]
@@ -1217,16 +1653,25 @@ class GeneratorInterface:
                 prev_data_i,
                 mask[i:i+1],
                 actions[i:i+1],
-                stats_actions[i:i+1] if self.is_crafter else torch.zeros((1, 32), device=self.device, dtype=torch.long),
+                (
+                    stats_actions[i:i+1]
+                    if self.is_crafter or self.is_minigrid
+                    else torch.zeros((1, 32), device=self.device, dtype=torch.long)
+                ),
                 logp[i:i+1],
                 values[i:i+1],
                 reward,
                 topk_action_mask[i:i+1],
+                location_order[i:i+1],
                 topk_stats_action_mask[i:i+1],
             )
 
             if traj and 'obs' in traj:
                 valid_trajs.append(traj)
+                # MiniGrid history is built from the held-out probe only after
+                # the WM update, so the pre-update rollout heat is not retained.
+                if self.is_minigrid:
+                    continue
                 next_maps.append(self._map_to_tensor(final_map_3ch))
                 terrain_feedback = np.asarray(errors['terrain'], dtype=np.float32)
                 if not self.is_crafter and not self.is_bipedal:
@@ -1300,10 +1745,11 @@ class GeneratorInterface:
                     next_heats_stats.append(torch.tensor(errors['inventory'], device=self.device).unsqueeze(0))
 
         if len(next_maps) > 0:
-            if self.is_crafter or self.is_bipedal:
-                self.prev_data = (torch.cat(next_maps), torch.cat(next_heats_terrain), torch.cat(next_heats_stats))
-            else:
-                self.prev_data = (torch.cat(next_maps), torch.cat(next_heats_terrain))
+            self.prev_data = (
+                torch.cat(next_maps),
+                torch.cat(next_heats_terrain),
+                torch.cat(next_heats_stats),
+            )
 
         avg_bfs = total_bfs_dist / max(1, bfs_count) if bfs_count > 0 else 0.0
         mean_raw_loss = np.mean(raw_scalar_losses) if len(raw_scalar_losses) > 0 else 0.0
@@ -1311,12 +1757,37 @@ class GeneratorInterface:
         mean_inv_loss = np.mean(raw_inv_losses) if len(raw_inv_losses) > 0 else 0.0
         mean_div_reward = np.mean(div_rewards) if len(div_rewards) > 0 else 0.0
         if self.is_minigrid:
-            state_action_novelties, _ = self._minigrid_state_action_novelty_batch(state_action_pending)
-            self._apply_state_action_reward_correction(state_action_novelties, reward_components)
-            self._record_minigrid_metrics(
-                final_maps_obj, map_novelties, state_action_novelties, batch_logdet,
-                topk_action_mask=topk_action_mask, reward_components=reward_components,
+            probe_valid_flags = [
+                valid and bool(probe) and "obs" in probe
+                for valid, probe in zip(valid_flags, probe_trajectories)
+            ]
+            pre_changed_focal_losses = self._evaluate_minigrid_changed_focal_losses(
+                probe_trajectories, probe_valid_flags, phase="Pre-update probe"
             )
+            self._record_minigrid_metrics(
+                final_maps_obj, map_novelties, combination_novelties, batch_logdet,
+                random_feature_novelties=random_feature_novelties,
+                topk_action_mask=topk_action_mask, editable_mask=mask < 0.5,
+                batch_nearest_hamming=batch_nearest_hamming,
+                archive_nearest_hamming=archive_nearest_hamming,
+                novelty_distance_std=novelty_distance_std,
+            )
+            self._pending_minigrid_round = {
+                "probe_trajectories": probe_trajectories,
+                "valid": probe_valid_flags,
+                "pre_changed_focal_losses": pre_changed_focal_losses,
+                "final_maps": final_maps_obj,
+                "history_maps": final_maps_3ch,
+                "map_novelties": map_novelties,
+                "combination_novelties": combination_novelties,
+                "random_feature_novelties": random_feature_novelties,
+                "batch_logdet": batch_logdet,
+                "topk_action_mask": topk_action_mask,
+                "editable_mask": mask < 0.5,
+                "batch_nearest_hamming": batch_nearest_hamming,
+                "archive_nearest_hamming": archive_nearest_hamming,
+                "novelty_distance_std": novelty_distance_std,
+            }
 
         if self.is_bipedal:
             # Debug Print: See if generator is actually doing anything
@@ -1333,13 +1804,53 @@ class GeneratorInterface:
         return None, None, mean_raw_loss, mean_ce_loss, mean_inv_loss, mean_div_reward, valid_trajs, solved_count, avg_bfs, mean_avg_ep_len
 
     def step(self, old_params, iteration=0):
+        explorer = self.minigrid_rmax_explorer
+        if explorer is not None:
+            explorer.begin_iteration()
+
         if self.agent_type == 'random':
-            return self._step_random(old_params, iteration=iteration)
-        return self._step_policy(old_params, iteration=iteration)
+            result = self._step_random(old_params, iteration=iteration)
+        else:
+            result = self._step_policy(old_params, iteration=iteration)
+
+        if explorer is not None:
+            update_metrics = explorer.end_iteration()
+            checkpoint_every = int(
+                getattr(
+                    self.cfg.domains.minigrid.rmax_like,
+                    "checkpoint_every_iterations",
+                    1,
+                )
+            )
+            if (
+                checkpoint_every > 0
+                and explorer.completed_iteration % checkpoint_every == 0
+            ):
+                explorer.save_checkpoint()
+            print(
+                "[MiniGrid RMax iteration] "
+                f"updated={bool(update_metrics.get('updated', False))} "
+                f"sequences={int(update_metrics.get('sequence_count', 0))} "
+                f"transitions={int(update_metrics.get('transition_count', 0))} "
+                f"ppo_optimizer_steps={int(update_metrics.get('optimizer_steps', 0))} "
+                f"ppo_approx_kl={float(update_metrics.get('approx_kl', 0.0)):.6f} "
+                f"ppo_clip_fraction={float(update_metrics.get('clip_fraction', 0.0)):.3f} "
+                f"ppo_entropy={float(update_metrics.get('entropy', 0.0)):.3f} "
+                f"ppo_updates={explorer.update_count} "
+                f"ride_updates={int(update_metrics.get('ride', {}).get('update_count', 0))} "
+                f"ride_transitions={int(update_metrics.get('ride', {}).get('transition_count', 0))} "
+                f"ride_sampled={int(update_metrics.get('ride', {}).get('sampled_transition_count', 0))} "
+                f"ride_action_counts={update_metrics.get('ride', {}).get('per_action_counts', [])} "
+                f"ride_inverse_accuracy={float(update_metrics.get('ride', {}).get('inverse_accuracy', 0.0)):.3f} "
+                f"ride_per_action_inverse_accuracy={update_metrics.get('ride', {}).get('per_action_inverse_accuracy', [])} "
+                f"ride_forward_loss={float(update_metrics.get('ride', {}).get('forward_loss', 0.0)):.6f} "
+                f"ride_inverse_loss={float(update_metrics.get('ride', {}).get('inverse_loss', 0.0)):.6f}"
+            )
+        return result
 
     def _rollout_combined(
         self, map_np, stats_np, iter, idx, old_params=None, color_np=None,
-        evaluate_wm=True,
+        state_np=None, evaluate_wm=True, maximum_dataset_size=None,
     ):
         import traceback
 
@@ -1351,7 +1862,9 @@ class GeneratorInterface:
                  interpreted = self.support.interpret_env(map_np, inventory_vec=stats_np)
                  env_source = interpreted[0] if isinstance(interpreted, tuple) else interpreted
              elif env_type == "minigrid":
-                 interpreted = self.support.interpret_env(map_np, color_array=color_np)
+                 interpreted = self.support.interpret_env(
+                     map_np, color_array=color_np, state_array=state_np
+                 )
                  if isinstance(interpreted, tuple) and len(interpreted) == 2:
                      # collect_data_general expects (layout_str, color_str) for MiniGrid.
                      env_source = interpreted
@@ -1366,7 +1879,92 @@ class GeneratorInterface:
                  raise ValueError(f"Unsupported env_type for rollout routing: {env_type}")
 
              save_name = f'UED_Dual_iter{iter}_b{idx}'
-             save_path = collect_data_general(self.support.cfg, env_source=env_source, save_name=save_name, recollect_data=True)
+             original_maximum_dataset_size = getattr(
+                 self.support.cfg.env.collect, "maximum_dataset_size", None
+             )
+             original_data_type = str(self.support.cfg.env.collect.data_type)
+             original_save_coverage = bool(
+                 getattr(
+                     self.support.cfg.env.collect,
+                     "save_coverage_visualize",
+                     False,
+                 )
+             )
+             original_visualize_save_path = str(
+                 self.support.cfg.env.collect.visualize_save_path
+             )
+             try:
+                exploration_policy = self.minigrid_rmax_explorer
+                if exploration_policy is not None:
+                    exploration_policy.set_training(bool(evaluate_wm))
+                    self.support.cfg.env.collect.data_type = "rmax"
+                    save_minienv_coverage = bool(
+                        getattr(
+                            self.cfg.domains.minigrid.rmax_like,
+                            "save_minienv_coverage",
+                            False,
+                        )
+                    )
+                    self.support.cfg.env.collect.save_coverage_visualize = (
+                        save_minienv_coverage and bool(evaluate_wm)
+                    )
+                    self.support.cfg.env.collect.visualize_save_path = os.path.join(
+                        original_visualize_save_path,
+                        "minienv_coverage",
+                        str(self.agent_type),
+                        f"seed{int(getattr(self.cfg, 'seed', 0))}",
+                    )
+                save_path = collect_data_general(
+                    self.support.cfg,
+                    env_source=env_source,
+                    save_name=save_name,
+                    maximum_dataset_size=maximum_dataset_size,
+                    recollect_data=True,
+                    initial_carrying_token=(
+                        int(np.asarray(stats_np).reshape(-1)[0])
+                        if env_type == "minigrid"
+                        else None
+                    ),
+                    policy=exploration_policy,
+                    intrinsic_reward_fn=(
+                        exploration_policy.intrinsic_reward
+                        if exploration_policy is not None and evaluate_wm
+                        else None
+                    ),
+                    # The WM dataset keeps native environment rewards; RIDE
+                    # reward is used only to train the exploration policy.
+                    store_intrinsic_reward=False,
+                )
+                if exploration_policy is not None and evaluate_wm:
+                    print(
+                        "[MiniGrid RMax] "
+                        f"unique_semantic_states={exploration_policy.unique_semantic_states} "
+                        f"unique_positions={exploration_policy.episodic_visited_positions} "
+                        f"ppo_updates={exploration_policy.update_count}"
+                    )
+                    metrics = exploration_policy.rollout_metrics
+                    print(
+                        "[MiniGrid RMax metrics] "
+                        f"rewarded_rate={metrics['rewarded_transition_rate']:.3f} "
+                        f"no_change_rate={metrics['semantic_no_change_rate']:.3f} "
+                        f"movement_rate={metrics['movement_rate']:.3f} "
+                        f"impact_by_action={metrics['ride_impact_by_action']} "
+                        f"reward_by_action={metrics['intrinsic_reward_by_action']} "
+                        f"pickup={int(metrics['pickup_successes'])} "
+                        f"toggle={int(metrics['toggle_successes'])} "
+                        f"drop={int(metrics['drop_successes'])}"
+                    )
+             finally:
+                 self.support.cfg.env.collect.maximum_dataset_size = (
+                     original_maximum_dataset_size
+                 )
+                 self.support.cfg.env.collect.data_type = original_data_type
+                 self.support.cfg.env.collect.save_coverage_visualize = (
+                     original_save_coverage
+                 )
+                 self.support.cfg.env.collect.visualize_save_path = (
+                     original_visualize_save_path
+                 )
              if not os.path.exists(save_path):
                  print(f"[GeneratorInterface] Missing rollout file after collection: {save_path}")
                  return {}, {}, 0.0, False, 0.0, 0.0, 0
@@ -1509,6 +2107,7 @@ class GeneratorInterface:
         # Local terrain modification logic (Spatial Head)
         obj = base_map.copy()
         color = np.zeros_like(obj)
+        state = np.zeros_like(obj)
         H, W = obj.shape
         
         # Track limits for restricted items
@@ -1546,12 +2145,14 @@ class GeneratorInterface:
                 
                 if val is not None: 
                     color_name = None
+                    door_state = STATE_TO_IDX["closed"]
                     # MiniGrid action table may encode (object_name, color_name).
                     # Preserve both object and color so generated DR maps match
                     # target color distributions.
                     if isinstance(val, tuple):
                         obj_name = val[0] if len(val) > 0 else None
                         color_name = val[1] if len(val) > 1 else None
+                        door_state = int(val[2]) if len(val) > 2 else door_state
                         if isinstance(obj_name, str):
                             val = OBJECT_TO_IDX.get(obj_name, None)
                         elif obj_name is None:
@@ -1564,10 +2165,6 @@ class GeneratorInterface:
                         if val is None:
                             continue
 
-                    if (not self.is_crafter) and (not self.is_bipedal) and int(val) == self.OBJ_GOAL:
-                        # Goal is fixed by the base map; editor cannot relocate it.
-                        continue
-
                     # Enforce restriction limits
                     if self.is_crafter and val in restricted_limits:
                         if counts[val] >= restricted_limits[val]:
@@ -1577,6 +2174,8 @@ class GeneratorInterface:
                     obj[i, j] = val
                     if color_name is not None:
                         color[i, j] = COLOR_TO_IDX.get(color_name, 0)
+                    if self.is_minigrid and val == OBJECT_TO_IDX["door"]:
+                        state[i, j] = door_state
 
                     # No hard rollback on unsolvable edits:
                     # MiniGrid agent learns solvability through reward signal.
@@ -1602,7 +2201,7 @@ class GeneratorInterface:
             # Safety net for legacy maps entering this path.
             obj = self._anchor_minigrid_terminals(obj)
                 
-        return obj, color
+        return obj, color, state
 
     def _normalize_rollout_errors(self, err_dict, H=None, W=None):
         if H is None: H = self.map_height
@@ -1661,78 +2260,15 @@ class GeneratorInterface:
             "inventory": inventory,
         }
 
-    def _minigrid_path_metrics(self, grid_obj_np):
-        """
-        Continuous MiniGrid difficulty signals (no hard solved gate):
-        - reach_ratio: reachable free cells / all free cells
-        - norm_dist: shortest path to goal normalized by (H+W-2), 0 if unreachable
-        """
-        if self.is_crafter or self.is_bipedal:
-            return 0.0, 0.0
-
-        obj = np.asarray(grid_obj_np)
-        if obj.ndim != 2:
-            return 0.0, 0.0
-
-        H, W = obj.shape
-        wall_id = OBJECT_TO_IDX["wall"]
-        lava_id = OBJECT_TO_IDX["lava"]
-        start_positions = np.argwhere(obj == self.OBJ_START)
-        if len(start_positions) == 0:
-            return 0.0, 0.0
-        sy, sx = map(int, start_positions[0])
-
-        passable = (obj != wall_id) & (obj != lava_id)
-        passable_count = int(passable.sum())
-        if passable_count <= 0:
-            return 0.0, 0.0
-
-        dist = np.full((H, W), -1, dtype=np.int64)
-        q = deque([(sy, sx)])
-        dist[sy, sx] = 0
-
-        while q:
-            y, x = q.popleft()
-            for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                ny, nx = y + dy, x + dx
-                if not (0 <= ny < H and 0 <= nx < W):
-                    continue
-                if dist[ny, nx] >= 0:
-                    continue
-                if not passable[ny, nx]:
-                    continue
-                dist[ny, nx] = dist[y, x] + 1
-                q.append((ny, nx))
-
-        reachable_count = int((dist >= 0).sum())
-        reach_ratio = float(reachable_count / max(passable_count, 1))
-
-        goal_positions = np.argwhere(obj == self.OBJ_GOAL)
-        shortest_dist = 0.0
-        if len(goal_positions) > 0:
-            gy, gx = map(int, goal_positions[0])
-            d = int(dist[gy, gx])
-            if d > 0:
-                shortest_dist = float(d)
-
-        dist_norm_denom = float(max(H + W - 2, 1))
-        norm_dist = float(np.clip(shortest_dist / dist_norm_denom, 0.0, 1.0))
-        return reach_ratio, norm_dist
-
     def _calculate_reward(
         self,
         raw_loss,
         div_score,
-        solved,
         is_warmup,
         inv_diversity=0,
         ce_loss=None,
         inv_loss=None,
         avg_ep_len=200.0,
-        minigrid_reach_ratio=0.0,
-        minigrid_norm_dist=0.0,
-        minigrid_map_novelty=0.0,
-        minigrid_state_action_novelty=0.0,
     ):
         if is_warmup and self.is_crafter:
             reward_cfg = self.crafter_reward_cfg
@@ -1828,20 +2364,7 @@ class GeneratorInterface:
 
             return reward
             
-        # MiniGrid: generic novelty/quality reward.  The warmup path keeps the
-        # same structural terms but intentionally omits WM difficulty.
-        components = self._minigrid_reward_components(
-            raw_loss=raw_loss,
-            solved=solved,
-            is_warmup=is_warmup,
-            map_novelty=minigrid_map_novelty,
-            state_action_novelty=minigrid_state_action_novelty,
-            minigrid_reach_ratio=minigrid_reach_ratio,
-            minigrid_norm_dist=minigrid_norm_dist,
-        )
-        reward_cfg = self.minigrid_reward_cfg
-        reward_clip = float(getattr(reward_cfg, "clip", 60.0))
-        return float(np.clip(components["total"], -reward_clip, reward_clip))
+        raise RuntimeError("_calculate_reward is only used for Crafter and BipedalWalker")
 
     def _immutable_mask(self, ids):
         mask = torch.zeros_like(ids, dtype=torch.float32)
