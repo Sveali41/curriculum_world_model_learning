@@ -26,6 +26,9 @@ domains:
     validation_metric: "ce"
     
   minigrid:
+    stochastic:
+      enabled: false
+      move_failure_prob: 0.2
     n_phases: 20
     task_prefix: "target_task"
     data_path: ${oc.env:TRAINER_PATH}/data/minigrid/target_tasks/

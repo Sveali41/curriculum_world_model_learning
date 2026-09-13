@@ -8,7 +8,11 @@ import torch
 from omegaconf import open_dict
 from modelBased.common.utils import TRAINER_PATH
 from modelBased.common.artifacts import dataset_metadata, layout_hash
-from domain.minigrid.minigrid_support import extract_unique_patches, generate_minitasks_until_covered
+from domain.minigrid.minigrid_support import (
+    extract_unique_patches,
+    generate_minitasks_until_covered,
+    stochastic_env_kwargs,
+)
 from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
 from modelBased.data.data_collect import visualize_agent_coverage, visualize_saved_dataset
 from modelBased.common.support import Support
@@ -113,7 +117,8 @@ def split_targets_into_minitasks(
             txt_file_path=TRAINER_PATH / "level" / file,
             custom_mission="Find the key and open the door.",
             max_steps=5000,
-            render_mode=None
+            render_mode=None,
+            **stochastic_env_kwargs(cfg),
         )
         env.reset()
         layout_str = env.layout_str
@@ -231,6 +236,7 @@ def collect_data_general(
             custom_mission="Learn minitask",
             render_mode=render_mode,
             max_steps=max_steps,
+            **stochastic_env_kwargs(cfg),
         ))
     elif hasattr(env_source, "reset") and hasattr(env_source, "step"):
         # Accept pre-built env objects, which is how the bipedal UED rollout path
