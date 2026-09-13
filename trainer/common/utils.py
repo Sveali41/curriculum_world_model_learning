@@ -2,11 +2,12 @@ import gc
 import os
 import random
 import copy
+from pathlib import Path
 import numpy as np
 import torch
 from omegaconf import open_dict
 from modelBased.common.utils import TRAINER_PATH
-from modelBased.common.artifacts import dataset_metadata
+from modelBased.common.artifacts import dataset_metadata, layout_hash
 from domain.minigrid.minigrid_support import extract_unique_patches, generate_minitasks_until_covered
 from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
 from modelBased.data.data_collect import visualize_agent_coverage, visualize_saved_dataset
@@ -438,6 +439,54 @@ def train_wm_with_subsets(
 
     return net, old_params, fisher, phase_transitions_used    
 
+def _relocated_minigrid_target_layout(metadata, data_save_dir):
+    """Resolve a missing archived target layout inside the current workspace."""
+    task_name = str(metadata.get("task_name", "")).strip()
+    expected_hash = metadata.get("layout_hash")
+    if not task_name or not expected_hash:
+        raise RuntimeError(
+            "MiniGrid target dataset references a missing layout path, but its "
+            "metadata lacks task_name or layout_hash; recollect the dataset or "
+            "restore the original layout."
+        )
+
+    trainer_roots = []
+    configured_trainer = os.environ.get("TRAINER_PATH")
+    if configured_trainer:
+        trainer_roots.append(Path(configured_trainer).expanduser())
+    trainer_roots.append(Path(TRAINER_PATH))
+
+    # ``data_save_dir`` normally lives below ``trainer/data``. Search its
+    # ancestors as a relocation fallback without accepting a file by name
+    # alone: the content hash below remains mandatory.
+    if data_save_dir:
+        data_root = Path(data_save_dir).expanduser()
+        trainer_roots.extend((data_root, *data_root.parents))
+
+    seen_roots = set()
+    candidates = []
+    for root in trainer_roots:
+        root = root.resolve()
+        if root in seen_roots:
+            continue
+        seen_roots.add(root)
+        candidates.append(
+            root / "level" / "minigrid" / "target_task" / f"{task_name}.txt"
+        )
+
+    for candidate in candidates:
+        if candidate.is_file() and layout_hash(candidate) == expected_hash:
+            return candidate
+
+    candidate_text = ", ".join(str(path) for path in candidates)
+    raise RuntimeError(
+        "MiniGrid target dataset layout was relocated, but no local target "
+        f"matching metadata layout_hash was found for {task_name!r}. Checked: "
+        f"{candidate_text}. Recollect the dataset, restore the original layout, "
+        "or set TRAINER_PATH to the current trainer directory."
+    )
+
+
 def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, phase_name="validation", VALID_TIMES=1):
     """
     Run WM validation on the fixed target task, return avg loss.
@@ -497,9 +546,17 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
                 )
             domain_cfg = validation_cfg.domains[selected_domain]
             domain_cfg.task_name = str(metadata.get("task_name", ""))
-            domain_cfg.layout_path = str(
-                metadata.get("layout_path", metadata.get("env_path", ""))
-            )
+            metadata_layout_path = Path(
+                str(metadata.get("layout_path", metadata.get("env_path", "")))
+            ).expanduser()
+            if (
+                selected_domain == "minigrid"
+                and not metadata_layout_path.is_file()
+            ):
+                metadata_layout_path = _relocated_minigrid_target_layout(
+                    metadata, data_save_dir
+                )
+            domain_cfg.layout_path = str(metadata_layout_path)
             validation_cfg.env.env_path = domain_cfg.layout_path
             validation_cfg.env.collect.replace_start_with_empty = bool(
                 metadata.get("collection_replace_start_with_empty", False)
