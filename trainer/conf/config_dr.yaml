@@ -26,7 +26,9 @@ attention_model:
 domains:
   minigrid:
     rmax_like:
-      checkpoint_path: ${oc.env:MODEL_FPATH}/Policy/dr_intrinsic_explorer_minigrid_spatial_ride_v6_seed${seed}.pt
+      backend: ppo
+      checkpoint_path: ${oc.env:MODEL_FPATH}/Policy/dr_intrinsic_explorer_minigrid_spatial_position_v1_seed${seed}.pt
+      dqn_checkpoint_path: ${oc.env:MODEL_FPATH}/Policy/dr_intrinsic_explorer_minigrid_spatial_dqn_v1_seed${seed}.pt
 
 env:
   collect:

@@ -2,6 +2,9 @@ import sys
 import os
 ROOT_DIR =os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WM_ROOT = os.path.join(ROOT_DIR, "wm")
+# Keep trainer results in the outer workspace even if a shell inherited a
+# PROJECT_ROOT value pointing at the nested WM tree.
+os.environ["TRAINER_ROOT"] = ROOT_DIR
 if WM_ROOT not in sys.path:
     sys.path.insert(0, WM_ROOT)
 if ROOT_DIR not in sys.path:
@@ -242,16 +245,18 @@ def adversarial_ued_training(cfg: DictConfig):
             "target_val_valid_count",
             "target_val_focal_loss", "target_val_changed_focal_loss",
             "target_val_false_set_rate", "target_val_changed_count",
-            "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
+            "Learning_Progress", "Difficulty_Rank", "Learning_Progress_Rank",
+            "New_Data_Size", "Buffer_Size", "Solvable_Count", "Solvable_Rate", "Avg_Path_Len",
             "Replay_Changed_Fraction", "Batch_Changed_Count",
             "Map_Novelty", "Combination_Novelty", "Random_Feature_Novelty",
-            "Pre_Changed_Focal_Loss", "Post_Changed_Focal_Loss", "Learning_Progress",
-            "Difficulty_Rank", "Learning_Progress_Rank", "Novelty_Rank", "Batch_Nearest_Hamming",
+            "Pre_Changed_Focal_Loss", "Post_Changed_Focal_Loss", "Novelty_Rank", "Batch_Nearest_Hamming",
             "Archive_Nearest_Hamming", "Novelty_Distance_Std", "Latent_Batch_LogDet",
             "Mean_Object_Pair_Distance", "Mean_Nearest_Object_Distance",
             "Selected_Edit_Pair_Distance", "Mean_Edit_Rate", "Unique_Goal_Positions",
             "Reward_Learning_Progress", "Reward_Combination_Novelty",
             "Reward_Random_Feature_Novelty", "Final_Generator_Reward",
+            "Explorer_Coverage_Rate", "Explorer_Unique_Positions",
+            "Explorer_Walkable_Cells",
         ]
     else:
         csv_header = [
@@ -289,7 +294,14 @@ def adversarial_ued_training(cfg: DictConfig):
     if getattr(cfg, "force_fresh_start", False):
         checkpoint_paths = [ckpt_path]
         if is_minigrid and str(domain_cfg.exploration_policy).lower() == "rmax":
-            checkpoint_paths.append(domain_cfg.rmax_like.checkpoint_path)
+            backend = str(getattr(domain_cfg.rmax_like, "backend", "ppo")).lower()
+            checkpoint_paths.append(
+                getattr(
+                    domain_cfg.rmax_like,
+                    "dqn_checkpoint_path" if backend == "dqn" else "checkpoint_path",
+                    domain_cfg.rmax_like.checkpoint_path,
+                )
+            )
         for checkpoint_path in checkpoint_paths:
             if os.path.exists(checkpoint_path):
                 os.remove(checkpoint_path)
@@ -504,6 +516,16 @@ def adversarial_ued_training(cfg: DictConfig):
         # Step 2: Prepare buffer inputs
         # --------------------------------------------------------
         new_batch = convert_trajectories_to_batch(valid_trajectories)
+        # An empty trajectory list currently returns an empty legacy-shaped
+        # batch with ``info=None``.  Do not send that placeholder through the
+        # MiniGrid DataModule: it is not a legacy dataset and has no inventory
+        # transitions to supervise.
+        if new_batch is not None and len(new_batch.get("obs", [])) == 0:
+            print(
+                "[World Model] No valid transitions collected; skipping this "
+                "iteration's WM update."
+            )
+            new_batch = None
         new_data_size = 0
         buffer_input = None  # Init for later use
 
@@ -687,6 +709,15 @@ def adversarial_ued_training(cfg: DictConfig):
         # Evaluate held-out post-loss and apply LP + diversity before PPO.
         if is_minigrid:
             gen_interface.finalize_minigrid_rewards()
+            # For MiniGrid, expose the first (learning-progress) component of
+            # the actual generator reward in the historical CSV slot.  This is
+            # the weighted value used by PPO, not the unweighted pre-update
+            # focal loss or the aggregate rollout validation loss.
+            minigrid_metrics = getattr(gen_interface, "last_minigrid_metrics", {})
+            if "Reward_Learning_Progress" in minigrid_metrics:
+                gen_val_avg_val_loss_wm = float(
+                    minigrid_metrics["Reward_Learning_Progress"]
+                )
             gen_loss, gen_entropy, gen_mean_reward = gen_interface.update(iteration=iteration)
             print(
                 f"[Generator] Policy Updated. Loss: {gen_loss:.4f} | "
@@ -901,9 +932,13 @@ def adversarial_ued_training(cfg: DictConfig):
                                 "target_val_changed_focal_loss": f"{target_val_changed_focal_loss:.6f}",
                                 "target_val_false_set_rate": f"{target_val_false_set_rate:.6f}",
                                 "target_val_changed_count": f"{target_val_changed_count:.2f}",
+                                "Learning_Progress": f"{mg_metrics.get('Learning_Progress', 0.0):.6f}",
+                                "Difficulty_Rank": f"{mg_metrics.get('Difficulty_Rank', 0.0):.6f}",
+                                "Learning_Progress_Rank": f"{mg_metrics.get('Learning_Progress_Rank', 0.0):.6f}",
                                 "New_Data_Size": new_data_size,
                                 "Buffer_Size": len(fisher_buffer),
                                 "Solvable_Count": f"{gen_solvable_count}",
+                                "Solvable_Rate": f"{gen_solvable_count / max(1, int(gen_interface.batch_size)):.6f}",
                                 "Avg_Path_Len": f"{gen_avg_bfs:.2f}",
                                 "Replay_Changed_Fraction": f"{replay_changed_fraction:.6f}",
                                 "Batch_Changed_Count": batch_changed_count,
@@ -912,9 +947,6 @@ def adversarial_ued_training(cfg: DictConfig):
                                 "Random_Feature_Novelty": f"{mg_metrics.get('Random_Feature_Novelty', 0.0):.6f}",
                                 "Pre_Changed_Focal_Loss": f"{mg_metrics.get('Pre_Changed_Focal_Loss', 0.0):.6f}",
                                 "Post_Changed_Focal_Loss": f"{mg_metrics.get('Post_Changed_Focal_Loss', 0.0):.6f}",
-                                "Learning_Progress": f"{mg_metrics.get('Learning_Progress', 0.0):.6f}",
-                                "Difficulty_Rank": f"{mg_metrics.get('Difficulty_Rank', 0.0):.6f}",
-                                "Learning_Progress_Rank": f"{mg_metrics.get('Learning_Progress_Rank', 0.0):.6f}",
                                 "Novelty_Rank": f"{mg_metrics.get('Novelty_Rank', 0.0):.6f}",
                                 "Batch_Nearest_Hamming": f"{mg_metrics.get('Batch_Nearest_Hamming', 0.0):.6f}",
                                 "Archive_Nearest_Hamming": f"{mg_metrics.get('Archive_Nearest_Hamming', 0.0):.6f}",
@@ -929,6 +961,9 @@ def adversarial_ued_training(cfg: DictConfig):
                                 "Reward_Combination_Novelty": f"{mg_metrics.get('Reward_Combination_Novelty', 0.0):.6f}",
                                 "Reward_Random_Feature_Novelty": f"{mg_metrics.get('Reward_Random_Feature_Novelty', 0.0):.6f}",
                                 "Final_Generator_Reward": f"{mg_metrics.get('Final_Generator_Reward', 0.0):.6f}",
+                                "Explorer_Coverage_Rate": f"{mg_metrics.get('Explorer_Coverage_Rate', 0.0):.6f}",
+                                "Explorer_Unique_Positions": f"{mg_metrics.get('Explorer_Unique_Positions', 0.0):.2f}",
+                                "Explorer_Walkable_Cells": f"{mg_metrics.get('Explorer_Walkable_Cells', 0.0):.2f}",
                             }
                         else:
                             row_data = {

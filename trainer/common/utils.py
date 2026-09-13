@@ -504,6 +504,17 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
             validation_cfg.env.collect.replace_start_with_empty = bool(
                 metadata.get("collection_replace_start_with_empty", False)
             )
+            # Target archives are collected independently from the active
+            # generator settings.  In particular, the ordinary uniform target
+            # datasets predate the optional MiniGrid interaction mix and thus
+            # do not carry ``interaction_fraction`` metadata.  Align the
+            # validation identity with the archive (defaulting to zero) so
+            # the compatibility check does not compare it against the live
+            # generator's 0.3 fraction.
+            if selected_domain == "minigrid":
+                validation_cfg.env.collect.minigrid_interaction_fraction = float(
+                    metadata.get("interaction_fraction", 0.0)
+                )
 
     losses = []
     inv_losses = []

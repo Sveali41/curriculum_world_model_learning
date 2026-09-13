@@ -11,6 +11,9 @@ from pathlib import Path
 # Add project root to path
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WM_ROOT = os.path.join(ROOT_DIR, "wm")
+# Keep trainer results in the outer workspace even if a shell inherited a
+# PROJECT_ROOT value pointing at the nested WM tree.
+os.environ["TRAINER_ROOT"] = ROOT_DIR
 sys.path.insert(0, ROOT_DIR)
 sys.path.insert(0, WM_ROOT)
 

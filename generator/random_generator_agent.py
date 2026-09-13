@@ -36,7 +36,7 @@ class RandomGeneratorAgent:
             base_map: [B, C, H, W]
             prev_data: (prev_map, prev_heat) or None
             mask: [B, 1, H, W] (immutable mask, 1.0=immutable)
-            max_edits_layout: expected per-cell terrain edit probability
+            max_edits_layout: terrain edit ratio / budget
             max_stats_edit_ratio: float ratio for inventory [0..1]
         
         returns:
@@ -57,9 +57,25 @@ class RandomGeneratorAgent:
             if mask is not None
             else torch.zeros((B, H, W), dtype=torch.bool, device=self.device)
         )
-        edit_probability = float(np.clip(max_edits_layout, 0.0, 1.0))
-        edit_mask = (torch.rand((B, H, W), device=self.device) < edit_probability)
-        edit_mask &= ~immutable
+        edit_ratio = float(np.clip(max_edits_layout, 0.0, 1.0))
+        if self.env_type == "minigrid":
+            # Match MAC's fixed MiniGrid edit budget while keeping DR's
+            # location sampling random.  The previous Bernoulli mask gave DR
+            # an additional edit-count variance that MAC did not have.
+            edit_mask = torch.zeros((B, H, W), dtype=torch.bool, device=self.device)
+            editable = ~immutable
+            for batch_idx in range(B):
+                editable_positions = torch.nonzero(
+                    editable[batch_idx].reshape(-1), as_tuple=False
+                ).flatten()
+                editable_count = int(editable_positions.numel())
+                k = max(0, min(int(round(edit_ratio * editable_count)), editable_count))
+                if k > 0:
+                    order = torch.randperm(editable_count, device=self.device)[:k]
+                    edit_mask[batch_idx].view(-1)[editable_positions[order]] = True
+        else:
+            edit_mask = (torch.rand((B, H, W), device=self.device) < edit_ratio)
+            edit_mask &= ~immutable
         edit_count = int(edit_mask.sum().item())
         if edit_count > 0:
             action[edit_mask] = torch.multinomial(

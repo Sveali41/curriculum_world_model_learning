@@ -11,10 +11,12 @@ import os
 from pathlib import Path
 
 
+# Trainer run artifacts are anchored to this repository's outer workspace,
+# independently of WM_ROOT.  Entry points set TRAINER_ROOT explicitly; the
+# source-tree fallback also protects imports made before that setup.
 WORKSPACE_ROOT = Path(
-    os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parents[2])
+    os.environ.get("TRAINER_ROOT", Path(__file__).resolve().parents[2])
 ).expanduser().resolve()
 OUTPUTS_ROOT = WORKSPACE_ROOT / "outputs"
 RESULTS_ROOT = OUTPUTS_ROOT / "results"
 VISUALIZATIONS_ROOT = OUTPUTS_ROOT / "visualizations"
-

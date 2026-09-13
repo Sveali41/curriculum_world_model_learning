@@ -28,7 +28,7 @@ lightning_logs
 
 # ignore trainer files
 trainer/logs
-trainer/data
+# trainer/data
 trainer/results
 trainer/*.png
 trainer/experiments_visualization.ipynb

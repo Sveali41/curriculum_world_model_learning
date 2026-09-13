@@ -35,7 +35,7 @@ domains:
     obs_norm: [10, 5, 3]
     action_norm: 6
     start_idx: 0
-    target_dataset_size: 7000
+    target_dataset_size: 28580
     data_type: discrete
     validation_metric: "mse_weighted"
 
@@ -57,5 +57,7 @@ seed: 0
 attention_model:
   continue_learning: true      # Ensure EWC is active
   ewc_ratio: 0.9              # bipedal:0.9 | crafter and minigrid: 0.9
-  replay_frac: 0.7            # bipedal:0.7 | crafter and minigrid: 3
+  replay_frac: 1            # bipedal:0.7 | crafter and minigrid: 3
+  # Validation-only batch size; training batch_size remains inherited as 64.
+  target_validation_batch_size: 512
   model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/target_attention_world_model_${domain}_${ablation.type}_seed${seed}.ckpt

@@ -47,6 +47,33 @@ MINIGRID_INVENTORY_ACTION_TO_TOKEN = np.asarray([
 ], dtype=np.int64)
 
 
+def _minigrid_effective_edit_map(base_obj, final_obj, final_color, base_color=None):
+    """Encode only cells whose object or colour changed from the base map.
+
+    Unchanged cells are zeroed before diversity scoring, preventing random
+    differences in the base layout from contributing to generator novelty.
+    Changed cells retain the final edited object and colour.
+    """
+    base_obj = np.asarray(base_obj)
+    final_obj = np.asarray(final_obj)
+    final_color = np.asarray(final_color)
+    if base_color is None:
+        base_color = np.zeros_like(base_obj)
+    else:
+        base_color = np.asarray(base_color)
+    if not (base_obj.shape == final_obj.shape == final_color.shape == base_color.shape):
+        raise ValueError(
+            "MiniGrid edit maps must have matching shapes: "
+            f"base_obj={base_obj.shape}, final_obj={final_obj.shape}, "
+            f"final_color={final_color.shape}, base_color={base_color.shape}"
+        )
+    changed = (base_obj != final_obj) | (base_color != final_color)
+    return np.stack(
+        [np.where(changed, final_obj, 0), np.where(changed, final_color, 0)],
+        axis=0,
+    )
+
+
 def minigrid_action_table(enable_locked_doors):
     table = dict(ACTION_TABLE_MINIGRID)
     if enable_locked_doors:
@@ -83,9 +110,28 @@ class GeneratorInterface:
                     "domains.minigrid.exploration_policy must be 'random' or 'rmax'"
                 )
             if exploration_policy == "rmax":
-                from modelBased.exploration.minigrid_rmax import MiniGridRMaxExplorer
+                explorer_backend = str(
+                    getattr(minigrid_domain_cfg.rmax_like, "backend", "ppo")
+                ).lower()
+                if explorer_backend == "ppo":
+                    from modelBased.exploration.minigrid_rmax import MiniGridRMaxExplorer
 
-                self.minigrid_rmax_explorer = MiniGridRMaxExplorer(cfg)
+                    explorer_class = MiniGridRMaxExplorer
+                elif explorer_backend == "dqn":
+                    from modelBased.exploration.minigrid_dqn import MiniGridDQNExplorer
+
+                    explorer_class = MiniGridDQNExplorer
+                else:
+                    raise ValueError(
+                        "domains.minigrid.rmax_like.backend must be 'ppo' or 'dqn'"
+                    )
+                self.minigrid_rmax_explorer = explorer_class(cfg)
+                if explorer_backend == "dqn":
+                    dqn_checkpoint = getattr(
+                        minigrid_domain_cfg.rmax_like, "dqn_checkpoint_path", None
+                    )
+                    if dqn_checkpoint:
+                        self.minigrid_rmax_explorer.checkpoint_path = dqn_checkpoint
                 if bool(getattr(minigrid_domain_cfg.rmax_like, "resume", False)):
                     self.minigrid_rmax_explorer.load_checkpoint()
 
@@ -557,6 +603,25 @@ class GeneratorInterface:
             **component_means,
         }
 
+    def _attach_minigrid_explorer_coverage(self):
+        """Preserve explorer rollout coverage when generator metrics refresh."""
+        records = getattr(
+            self, "_active_minigrid_explorer_coverage_records", None
+        )
+        if not self.is_minigrid or not records:
+            return
+        self.last_minigrid_metrics.update({
+            "Explorer_Coverage_Rate": float(np.mean([
+                item["coverage_rate"] for item in records
+            ])),
+            "Explorer_Unique_Positions": float(np.mean([
+                item["unique_positions"] for item in records
+            ])),
+            "Explorer_Walkable_Cells": float(np.mean([
+                item["walkable_cells"] for item in records
+            ])),
+        })
+
     def _get_warmup_iterations(self):
         raw = self.cfg.generator_agent.get("warmup_iterations", 0)
         if raw is None:
@@ -803,12 +868,16 @@ class GeneratorInterface:
         diversity_mode="action_hamming",
         learning_progress_weight=1.0,
         diversity_weight=1.0,
+        path_length_score=0.0,
+        path_length_weight=0.0,
     ):
         learning_progress = float(learning_progress)
         combination_novelty = float(np.clip(combination_novelty, 0.0, 1.0))
         random_feature_novelty = float(np.clip(random_feature_novelty, 0.0, 1.0))
         learning_progress_weight = max(float(learning_progress_weight), 0.0)
         diversity_weight = max(float(diversity_weight), 0.0)
+        path_length_score = float(np.clip(path_length_score, 0.0, 1.0))
+        path_length_weight = max(float(path_length_weight), 0.0)
         reward_learning_progress = learning_progress_weight * learning_progress
         if diversity_mode == "random_feature_knn":
             reward_combination_novelty = 0.0
@@ -820,17 +889,21 @@ class GeneratorInterface:
                 diversity_weight * combination_novelty
             )
             reward_random_feature_novelty = 0.0
+        reward_path_length = path_length_weight * path_length_score
         return {
             "learning_progress": learning_progress,
             "combination_novelty": combination_novelty,
             "random_feature_novelty": random_feature_novelty,
+            "path_length_score": path_length_score,
             "reward_learning_progress": reward_learning_progress,
             "reward_combination_novelty": reward_combination_novelty,
             "reward_random_feature_novelty": reward_random_feature_novelty,
+            "reward_path_length": reward_path_length,
             "total": (
                 reward_learning_progress
                 + reward_combination_novelty
                 + reward_random_feature_novelty
+                + reward_path_length
             ),
         }
 
@@ -917,6 +990,19 @@ class GeneratorInterface:
         combination_values = np.asarray(
             pending["combination_novelties"], dtype=np.float32
         )
+        path_lengths = np.asarray(
+            pending.get("path_lengths", np.zeros(self.batch_size, dtype=np.float32)),
+            dtype=np.float32,
+        )
+        if path_lengths.shape[0] != self.batch_size:
+            raise ValueError(
+                "MiniGrid path lengths must contain one value per generated map"
+            )
+        path_normalizer = max(
+            float(getattr(self.minigrid_reward_cfg, "path_length_normalizer", self.map_height + self.map_width)),
+            1.0,
+        )
+        path_length_scores = np.clip(path_lengths / path_normalizer, 0.0, 1.0)
         random_feature_values = np.asarray(
             pending.get("random_feature_novelties", np.zeros(self.batch_size)),
             dtype=np.float32,
@@ -937,6 +1023,9 @@ class GeneratorInterface:
             diversity_weight = float(
                 getattr(self.minigrid_reward_cfg, "combination_novelty", 1.0)
             )
+        path_length_weight = float(
+            getattr(self.minigrid_reward_cfg, "path_length", 0.0)
+        )
         if self.ablation_type == "no_diversity" or diversity_weight <= 0.0:
             novelty_ranks = np.zeros(self.batch_size, dtype=np.float32)
             diversity_weight = 0.0
@@ -964,6 +1053,8 @@ class GeneratorInterface:
                 diversity_mode=diversity_mode,
                 learning_progress_weight=learning_progress_weight,
                 diversity_weight=diversity_weight,
+                path_length_score=path_length_scores[index],
+                path_length_weight=path_length_weight,
             )
             reward_components.append(component)
             rewards.append(float(component["total"]))
@@ -988,6 +1079,9 @@ class GeneratorInterface:
             archive_nearest_hamming=pending["archive_nearest_hamming"],
             novelty_distance_std=pending["novelty_distance_std"],
         )
+        # finalize_minigrid_rewards refreshes last_minigrid_metrics; restore
+        # the explorer coverage fields before MAC writes its CSV row.
+        self._attach_minigrid_explorer_coverage()
         self._pending_minigrid_round = None
 
     def _normalize_base_map(self, grid):
@@ -1289,7 +1383,8 @@ class GeneratorInterface:
         valid_flags = []
         round_trajectories = []
         probe_trajectories = []
-
+        solvable_flags = []
+        path_lengths = []
         for i in range(self.batch_size):
             final_map_obj = final_maps_obj[i]
             final_map_col = final_maps_color[i]
@@ -1343,11 +1438,16 @@ class GeneratorInterface:
                     bfs_count += 1
                 if shortest_dist > 0:
                     solved_count += 1
+                solvable_flags.append(bool(shortest_dist > 0))
+                path_lengths.append(float(max(shortest_dist, 0.0)))
 
             if self.is_minigrid:
                 if self.diversity_mode == "random_feature_knn":
+                    diversity_map = _minigrid_effective_edit_map(
+                        base_ids_np[i], final_map_obj, final_map_col
+                    )
                     random_feature_novelties[i] = self._get_diversity_reward(
-                        final_map_3ch
+                        diversity_map
                     )
                     r_div = float(random_feature_novelties[i])
                 else:
@@ -1407,6 +1507,8 @@ class GeneratorInterface:
                 "history_maps": final_maps_3ch,
                 "map_novelties": map_novelties,
                 "combination_novelties": combination_novelties,
+                "solvable": np.asarray(solvable_flags, dtype=bool),
+                "path_lengths": np.asarray(path_lengths, dtype=np.float32),
                 "random_feature_novelties": random_feature_novelties,
                 "batch_logdet": batch_logdet,
                 "topk_action_mask": topk_action_mask,
@@ -1552,6 +1654,12 @@ class GeneratorInterface:
         valid_flags = []
         round_trajectories = []
         probe_trajectories = []
+        solvable_flags = []
+        path_lengths = []
+        # Explorer coverage is collected per generated map and aggregated
+        # after all rollouts so the MAC CSV receives a batch-level value.
+        explorer_coverage_records = []
+        self._active_minigrid_explorer_coverage_records = explorer_coverage_records
 
         for i in range(self.batch_size):
             final_map_obj = final_maps_obj[i]
@@ -1607,11 +1715,16 @@ class GeneratorInterface:
                     bfs_count += 1
                 if shortest_dist > 0:
                     solved_count += 1
+                solvable_flags.append(bool(shortest_dist > 0))
+                path_lengths.append(float(max(shortest_dist, 0.0)))
 
             if self.is_minigrid:
                 if self.diversity_mode == "random_feature_knn":
+                    diversity_map = _minigrid_effective_edit_map(
+                        base_ids_np[i], final_map_obj, final_map_col
+                    )
                     random_feature_novelties[i] = self._get_diversity_reward(
-                        final_map_3ch
+                        diversity_map
                     )
                     r_div = float(random_feature_novelties[i])
                 else:
@@ -1780,6 +1893,8 @@ class GeneratorInterface:
                 "history_maps": final_maps_3ch,
                 "map_novelties": map_novelties,
                 "combination_novelties": combination_novelties,
+                "solvable": np.asarray(solvable_flags, dtype=bool),
+                "path_lengths": np.asarray(path_lengths, dtype=np.float32),
                 "random_feature_novelties": random_feature_novelties,
                 "batch_logdet": batch_logdet,
                 "topk_action_mask": topk_action_mask,
@@ -1788,6 +1903,8 @@ class GeneratorInterface:
                 "archive_nearest_hamming": archive_nearest_hamming,
                 "novelty_distance_std": novelty_distance_std,
             }
+
+        self._attach_minigrid_explorer_coverage()
 
         if self.is_bipedal:
             # Debug Print: See if generator is actually doing anything
@@ -1827,25 +1944,32 @@ class GeneratorInterface:
                 and explorer.completed_iteration % checkpoint_every == 0
             ):
                 explorer.save_checkpoint()
-            print(
-                "[MiniGrid RMax iteration] "
-                f"updated={bool(update_metrics.get('updated', False))} "
-                f"sequences={int(update_metrics.get('sequence_count', 0))} "
-                f"transitions={int(update_metrics.get('transition_count', 0))} "
-                f"ppo_optimizer_steps={int(update_metrics.get('optimizer_steps', 0))} "
-                f"ppo_approx_kl={float(update_metrics.get('approx_kl', 0.0)):.6f} "
-                f"ppo_clip_fraction={float(update_metrics.get('clip_fraction', 0.0)):.3f} "
-                f"ppo_entropy={float(update_metrics.get('entropy', 0.0)):.3f} "
-                f"ppo_updates={explorer.update_count} "
-                f"ride_updates={int(update_metrics.get('ride', {}).get('update_count', 0))} "
-                f"ride_transitions={int(update_metrics.get('ride', {}).get('transition_count', 0))} "
-                f"ride_sampled={int(update_metrics.get('ride', {}).get('sampled_transition_count', 0))} "
-                f"ride_action_counts={update_metrics.get('ride', {}).get('per_action_counts', [])} "
-                f"ride_inverse_accuracy={float(update_metrics.get('ride', {}).get('inverse_accuracy', 0.0)):.3f} "
-                f"ride_per_action_inverse_accuracy={update_metrics.get('ride', {}).get('per_action_inverse_accuracy', [])} "
-                f"ride_forward_loss={float(update_metrics.get('ride', {}).get('forward_loss', 0.0)):.6f} "
-                f"ride_inverse_loss={float(update_metrics.get('ride', {}).get('inverse_loss', 0.0)):.6f}"
-            )
+            backend = str(
+                getattr(self.cfg.domains.minigrid.rmax_like, "backend", "ppo")
+            ).lower()
+            if backend == "dqn":
+                print(
+                    "[MiniGrid RMax iteration] "
+                    f"backend=dqn updated={bool(update_metrics.get('updated', False))} "
+                    f"transitions={int(update_metrics.get('transition_count', 0))} "
+                    f"replay={int(update_metrics.get('replay_size', 0))} "
+                    f"optimizer_steps={int(update_metrics.get('optimizer_steps', 0))} "
+                    f"loss={float(update_metrics.get('dqn_loss', 0.0)):.6f} "
+                    f"epsilon={float(update_metrics.get('epsilon', 0.0)):.3f} "
+                    f"updates={explorer.update_count}"
+                )
+            else:
+                print(
+                    "[MiniGrid RMax iteration] "
+                    f"backend=ppo updated={bool(update_metrics.get('updated', False))} "
+                    f"transitions={int(update_metrics.get('transition_count', 0))} "
+                    f"ppo_optimizer_steps={int(update_metrics.get('optimizer_steps', 0))} "
+                    f"ppo_approx_kl={float(update_metrics.get('approx_kl', 0.0)):.6f} "
+                    f"ppo_clip_fraction={float(update_metrics.get('clip_fraction', 0.0)):.3f} "
+                    f"ppo_entropy={float(update_metrics.get('entropy', 0.0)):.3f} "
+                    f"ppo_rollout_updates={int(update_metrics.get('rollout_updates', 1))} "
+                    f"ppo_updates={explorer.update_count}"
+                )
         return result
 
     def _rollout_combined(
@@ -1931,25 +2055,54 @@ class GeneratorInterface:
                         if exploration_policy is not None and evaluate_wm
                         else None
                     ),
-                    # The WM dataset keeps native environment rewards; RIDE
-                    # reward is used only to train the exploration policy.
+                    # The WM dataset keeps native environment rewards; the
+                    # Intrinsic position reward trains only the explorer policy.
                     store_intrinsic_reward=False,
                 )
                 if exploration_policy is not None and evaluate_wm:
+                    map_object = np.asarray(map_np)
+                    # Lava is a terminal hazard, not a coverage target. Keep
+                    # it out of both the denominator and the visited count.
+                    safe_cells = (
+                        (map_object != OBJECT_TO_IDX["wall"])
+                        & (map_object != OBJECT_TO_IDX["lava"])
+                    )
+                    walkable_cells = int(np.count_nonzero(safe_cells))
+                    visited_mask = exploration_policy.visited_position_mask
+                    if visited_mask.shape != safe_cells.shape:
+                        raise ValueError(
+                            "MiniGrid explorer visited mask shape does not match generated map: "
+                            f"{visited_mask.shape} vs {safe_cells.shape}"
+                        )
+                    unique_positions = int(np.count_nonzero(visited_mask & safe_cells))
+                    coverage_rate = unique_positions / max(walkable_cells, 1)
+                    active_records = getattr(
+                        self, "_active_minigrid_explorer_coverage_records", None
+                    )
+                    if active_records is not None:
+                        active_records.append({
+                            "coverage_rate": float(coverage_rate),
+                            "unique_positions": unique_positions,
+                            "walkable_cells": walkable_cells,
+                            "lava_cells": int(
+                                np.count_nonzero(map_object == OBJECT_TO_IDX["lava"])
+                            ),
+                        })
                     print(
                         "[MiniGrid RMax] "
-                        f"unique_semantic_states={exploration_policy.unique_semantic_states} "
-                        f"unique_positions={exploration_policy.episodic_visited_positions} "
+                        f"unique_positions={unique_positions} "
+                        f"coverage_rate={coverage_rate:.3f} "
+                        f"ppo_rollout_updates={getattr(exploration_policy, 'rollout_update_count', 0)} "
                         f"ppo_updates={exploration_policy.update_count}"
                     )
                     metrics = exploration_policy.rollout_metrics
                     print(
                         "[MiniGrid RMax metrics] "
-                        f"rewarded_rate={metrics['rewarded_transition_rate']:.3f} "
-                        f"no_change_rate={metrics['semantic_no_change_rate']:.3f} "
+                        f"new_position_rate={metrics['new_position_rate']:.3f} "
+                        f"no_effect_rate={metrics['no_effect_rate']:.3f} "
                         f"movement_rate={metrics['movement_rate']:.3f} "
-                        f"impact_by_action={metrics['ride_impact_by_action']} "
-                        f"reward_by_action={metrics['intrinsic_reward_by_action']} "
+                        f"action_distribution={metrics['action_distribution']} "
+                        f"deaths={int(metrics.get('death_count', 0.0))} "
                         f"pickup={int(metrics['pickup_successes'])} "
                         f"toggle={int(metrics['toggle_successes'])} "
                         f"drop={int(metrics['drop_successes'])}"
@@ -1997,7 +2150,13 @@ class GeneratorInterface:
 
              shortest_dist = 0.0
              if env_type == "minigrid":
-                 _, shortest_dist = check_solvability(map_np)
+                 initial_token = int(np.asarray(stats_np).reshape(-1)[0]) if np.asarray(stats_np).size else 0
+                 _, shortest_dist = check_solvability(
+                     map_np,
+                     color_np=color_np,
+                     state_np=state_np,
+                     inventory_token=initial_token,
+                 )
 
              error_dict = {
                  "terrain": np.zeros((self.map_height, self.map_width)),

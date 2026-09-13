@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from collections import deque
-from minigrid.core.constants import OBJECT_TO_IDX
+from minigrid.core.constants import OBJECT_TO_IDX, STATE_TO_IDX
 from torch.nn import functional as F
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -20,75 +20,88 @@ device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 # ==========================================
 from collections import deque
 import numpy as np
-from minigrid.core.constants import OBJECT_TO_IDX
+from minigrid.core.constants import OBJECT_TO_IDX, STATE_TO_IDX
 
 
-def check_solvability(grid_obj_np):
+def check_solvability(grid_obj_np, color_np=None, state_np=None, inventory_token=0):
     """
-    Check whether there exists a safe path from start to goal using BFS.
-    A valid path:
-      - does NOT pass through walls
-      - does NOT step on lava
-      - doors and keys are treated as passable
+    Check whether a MiniGrid map has a safe path from start to goal.
 
-    grid_obj_np: np.ndarray of shape [H, W], containing object IDs
-    return: bool
+    When color/state maps are supplied, BFS tracks the set of key colours
+    reachable by the agent and blocks locked doors unless the matching key is
+    available.  The legacy object-only call keeps the original geometric BFS
+    for non-MiniGrid callers.
     """
+    obj = np.asarray(grid_obj_np)
+    H, W = obj.shape
+    WALL, LAVA = OBJECT_TO_IDX["wall"], OBJECT_TO_IDX["lava"]
+    START, GOAL = OBJECT_TO_IDX["agent"], OBJECT_TO_IDX["goal"]
+    starts = np.argwhere(obj == START)
+    if len(starts) == 0:
+        return False, 0
+    start = tuple(int(value) for value in starts[0])
 
-    H, W = grid_obj_np.shape
-
-    # Object IDs
-    WALL  = OBJECT_TO_IDX["wall"]
-    LAVA  = OBJECT_TO_IDX["lava"]
-    START = OBJECT_TO_IDX["agent"]
-    GOAL  = OBJECT_TO_IDX["goal"]
-
-    # ------------------------------------------------
-    # 1. Find start position automatically
-    # ------------------------------------------------
-    start_positions = np.argwhere(grid_obj_np == START)
-    if len(start_positions) == 0:
-        return False  # no start → invalid map
-
-    start_pos = tuple(start_positions[0])  # (row, col)
-
-    # ------------------------------------------------
-    # 2. BFS
-    # ------------------------------------------------
-    # ------------------------------------------------
-    # 2. BFS
-    # ------------------------------------------------
-    # Queue stores: (row, col, distance)
-    queue = deque([(start_pos[0], start_pos[1], 0)])
-    visited = set([start_pos])
-    max_dist = 0
-
-    while queue:
-        r, c, dist = queue.popleft()
-        max_dist = max(max_dist, dist)
-
-        # reached goal
-        if grid_obj_np[r, c] == GOAL:
-            # Found shortest path to goal
-            return True, dist
-
-        # 4-neighborhood
-        for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
-            nr, nc = r + dr, c + dc
-
-            if 0 <= nr < H and 0 <= nc < W:
-                if (nr, nc) in visited:
+    # Without semantic channels, preserve the original geometry-only check.
+    semantic = color_np is not None or state_np is not None
+    if not semantic:
+        queue = deque([(start, 0)])
+        visited = {start}
+        while queue:
+            (r, c), dist = queue.popleft()
+            if obj[r, c] == GOAL:
+                return True, dist
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < H and 0 <= nc < W):
                     continue
-
-                cell = grid_obj_np[nr, nc]
-
-                # block walls & lava
-                if cell == WALL or cell == LAVA:
+                if (nr, nc) in visited or obj[nr, nc] in (WALL, LAVA):
                     continue
-
                 visited.add((nr, nc))
-                queue.append((nr, nc, dist + 1))
+                queue.append(((nr, nc), dist + 1))
+        return False, 0
 
+    if color_np is None or state_np is None:
+        raise ValueError("MiniGrid semantic solvability requires both color_np and state_np")
+    colors, states = np.asarray(color_np), np.asarray(state_np)
+    if colors.shape != obj.shape or states.shape != obj.shape:
+        raise ValueError(
+            f"MiniGrid solvability channels must match object map shape {obj.shape}, "
+            f"got color={colors.shape}, state={states.shape}"
+        )
+    owned = frozenset({int(inventory_token) - 1}) if int(inventory_token) > 0 else frozenset()
+    queue = deque([(start, owned, 0)])
+    visited = {(start, owned)}
+    while queue:
+        (r, c), owned, dist = queue.popleft()
+        if obj[r, c] == GOAL:
+            return True, dist
+        # Treat reaching a key as the corresponding pickup being available.
+        # This is a reachability oracle, so it does not require an exact
+        # orientation/action sequence to stand next to the key.
+        next_owned = owned
+        if obj[r, c] == OBJECT_TO_IDX["key"]:
+            next_owned = frozenset(set(owned) | {int(colors[r, c])})
+        if next_owned != owned and ((r, c), next_owned) not in visited:
+            visited.add(((r, c), next_owned))
+            queue.appendleft(((r, c), next_owned, dist))
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < H and 0 <= nc < W):
+                continue
+            position = (nr, nc)
+            cell = int(obj[nr, nc])
+            if cell in (WALL, LAVA):
+                continue
+            if (
+                cell == OBJECT_TO_IDX["door"]
+                and int(states[nr, nc]) == STATE_TO_IDX["locked"]
+                and int(colors[nr, nc]) not in next_owned
+            ):
+                continue
+            key = (position, next_owned)
+            if key not in visited:
+                visited.add(key)
+                queue.append((position, next_owned, dist + 1))
     return False, 0
 
 

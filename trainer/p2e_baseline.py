@@ -11,7 +11,12 @@ from pathlib import Path
 
 # Fix Paths
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(ROOT_DIR)
+WM_ROOT = os.path.join(ROOT_DIR, "wm")
+# Keep trainer results in the outer workspace even if a shell inherited a
+# PROJECT_ROOT value pointing at the nested WM tree.
+os.environ["TRAINER_ROOT"] = ROOT_DIR
+sys.path.insert(0, ROOT_DIR)
+sys.path.insert(0, WM_ROOT)
 
 # Project Module Imports
 from modelBased.common.utils import TRAINER_PATH
@@ -243,10 +248,22 @@ class P2E_Explorer_Policy:
 
             return self._map_policy_action_to_env(action_idx)
 
-    def record_transition(self, reward, is_terminal):
-        """Called by env runner after reward is available."""
+    def record_transition(
+        self,
+        reward,
+        is_terminal,
+        *,
+        terminated=None,
+        truncated=None,
+        **_,
+    ):
+        """Record one rollout step using the current data-collector API."""
         if self.current_step_context is None:
             return
+        # ``run_env`` passes the combined terminal flag positionally and also
+        # provides Gymnasium's separate flags as diagnostics.  Include either
+        # explicit flag so older/custom callers cannot lose episode boundaries.
+        is_terminal = bool(is_terminal or terminated or truncated)
         state, action, logprob, state_val = self.current_step_context
         self.ppo.save_buffer(
             state=state,
@@ -254,7 +271,7 @@ class P2E_Explorer_Policy:
             logprob=logprob,
             state_value=state_val,
             reward=float(reward),
-            is_terminal=bool(is_terminal),
+            is_terminal=is_terminal,
         )
         self.current_step_context = None
 

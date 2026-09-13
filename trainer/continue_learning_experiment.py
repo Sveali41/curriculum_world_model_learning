@@ -12,6 +12,8 @@ from hydra import initialize, compose
 # Add project root to path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_WM_ROOT = os.path.join(PROJECT_ROOT, "wm")
+# Continue-learning trainer artifacts use the outer workspace output tree.
+os.environ["TRAINER_ROOT"] = PROJECT_ROOT
 WM_ROOT = os.environ.get("WM_ROOT", DEFAULT_WM_ROOT)
 for import_root in (PROJECT_ROOT, WM_ROOT):
     if import_root not in sys.path:
@@ -73,6 +75,7 @@ def _resolve_bipedal_dataset_path(cfg, domain_name):
 
 
 def setup_env():
+    os.environ["TRAINER_ROOT"] = PROJECT_ROOT
     os.environ["PROJECT_ROOT"] = PROJECT_ROOT
     os.environ["TRAINER_PATH"] = os.path.join(PROJECT_ROOT, "trainer")
     wm_root = os.environ.get("WM_ROOT", DEFAULT_WM_ROOT)
