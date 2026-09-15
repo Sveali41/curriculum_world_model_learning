@@ -1,6 +1,7 @@
 /modelBased/wandb/
 wandb/
 outputs/
+legacy/artifacts/
 .env
 .codex/
 .vscode/

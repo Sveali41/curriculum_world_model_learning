@@ -77,13 +77,13 @@ class HistoryEncoder(nn.Module):
         # 3. CNN Backbone
         self.net = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
+            nn.GroupNorm(8, 32) if self.env_type == "minigrid" else nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64) if self.env_type == "minigrid" else nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64) if self.env_type == "minigrid" else nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
 

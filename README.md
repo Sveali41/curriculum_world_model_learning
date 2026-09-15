@@ -128,6 +128,14 @@ python trainer/mac_wm_learning.py domain=<domain> seed=0
 ```
 *Ablations: append `ablation.type=no_history` or `ablation.type=no_diversity`.*
 
+Generator diagnostics are written beside the MAC CSV (`*.manifest.json` and
+`*.maps.jsonl`). After a run, create a report without retraining:
+
+```bash
+python trainer/analyze_mac_diagnostics.py \
+  --mac <mac-csv> --dr <dr-csv> --output <report-dir>
+```
+
 **2. DR baseline (domain randomization)**
 ```bash
 python trainer/dr_baseline_experiment.py domain=<domain> seed=0

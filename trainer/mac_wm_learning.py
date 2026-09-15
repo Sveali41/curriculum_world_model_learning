@@ -1,5 +1,7 @@
 import sys
 import os
+import json
+import subprocess
 ROOT_DIR =os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WM_ROOT = os.path.join(ROOT_DIR, "wm")
 # Keep trainer results in the outer workspace even if a shell inherited a
@@ -29,7 +31,7 @@ os.environ.setdefault("GENERATOR_PATH", os.path.join(ROOT_DIR, "generator"))
 os.environ.setdefault("TRAINER_PATH", os.path.join(ROOT_DIR, "trainer"))
 
 import hydra
-from omegaconf import DictConfig, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 from pathlib import Path
 import torch
 import glob
@@ -80,6 +82,75 @@ def _ensure_csv_header_compatible(csv_path: Path, expected_columns):
     print(f"[Logger] CSV schema changed; old file backed up to {backup_path}")
     return False
 
+
+def _validate_existing_result_rows(csv_path: Path, expected_columns, seed):
+    """Validate rows before appending a new seed to a shared result CSV.
+
+    MAC runs are fresh per seed, so an existing row for the same seed almost
+    always means that the run would be duplicated.  Other seeds are allowed to
+    coexist in the same file, while duplicate ``(Seed, Iter)`` keys are
+    rejected for every seed.
+    """
+    import csv
+
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return
+
+    seen_keys = set()
+    existing_seed_rows = 0
+    expected_header = list(expected_columns)
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames != expected_header:
+            raise ValueError(
+                f"Existing MAC CSV has an incompatible schema: {csv_path}"
+            )
+        for row_number, row in enumerate(reader, start=2):
+            if not row or all(value in (None, "") for value in row.values()):
+                continue
+            try:
+                row_seed = int(row["Seed"])
+                row_iter = int(row["Iter"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid Seed/Iter at {csv_path}:{row_number}"
+                ) from exc
+            key = (row_seed, row_iter)
+            if key in seen_keys:
+                raise ValueError(
+                    f"Duplicate (Seed, Iter)={key} in existing MAC CSV: {csv_path}"
+                )
+            seen_keys.add(key)
+            if row_seed == int(seed):
+                existing_seed_rows += 1
+
+    if existing_seed_rows:
+        raise FileExistsError(
+            f"Refusing to append MAC seed {int(seed)}: {csv_path} already contains "
+            f"{existing_seed_rows} row(s) for this seed. Choose a new seed or "
+            "remove/backup the previous run."
+        )
+
+
+def _write_run_manifest(path: Path, cfg: DictConfig):
+    """Persist run provenance so historical MAC curves remain attributable."""
+    def git_value(args, cwd):
+        try:
+            return subprocess.run(
+                ["git", *args], cwd=cwd, check=True, text=True,
+                capture_output=True,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            return "unknown"
+
+    manifest = {
+        "config": OmegaConf.to_container(cfg, resolve=True),
+        "outer_git_commit": git_value(["rev-parse", "HEAD"], ROOT_DIR),
+        "outer_git_status": git_value(["status", "--porcelain"], ROOT_DIR),
+        "wm_git_commit": git_value(["rev-parse", "HEAD"], WM_ROOT),
+        "wm_git_status": git_value(["status", "--porcelain"], WM_ROOT),
+    }
+    path.write_text(json.dumps(manifest, indent=2, default=str) + "\n", encoding="utf-8")
 
 def _safe_int_cfg(value, default=0, name="value"):
     if value is None:
@@ -168,6 +239,8 @@ def adversarial_ued_training(cfg: DictConfig):
 
     # Logging and data paths
     log_dir = Path(getattr(cfg, "mac_results_dir", RESULTS_ROOT / "mac"))
+    diagnostics_cfg = getattr(cfg, "diagnostics", None)
+    strict_results = bool(getattr(diagnostics_cfg, "strict_results", False))
     os.makedirs(log_dir, exist_ok=True)
     csv_path = log_dir / "ued_adversarial_log.csv"
     # Suffix used for ablation-specific CSV files
@@ -193,6 +266,13 @@ def adversarial_ued_training(cfg: DictConfig):
         summary_csv_path = log_dir / f"{env_type}_ued_results{mask_suffix}{ablation_suffix}{metric_suffix}.csv"
     if ablation_suffix or metric_suffix or env_type != "crafter":
         print(f"[Log] CSV Path Adjusted: {summary_csv_path}")
+
+    # Keep one provenance file per seed; the summary CSV and map sidecar are
+    # intentionally shared across seeds.
+    run_manifest_path = summary_csv_path.with_name(
+        f"{summary_csv_path.stem}.seed{int(seed)}.manifest.json"
+    )
+    map_diagnostics_path = summary_csv_path.with_suffix(".maps.jsonl")
 
     data_save_dir = Path(getattr(cfg.env.collect, "data_folder", str(TRAINER_PATH / "data")))
     
@@ -257,6 +337,11 @@ def adversarial_ued_training(cfg: DictConfig):
             "Reward_Random_Feature_Novelty", "Final_Generator_Reward",
             "Explorer_Coverage_Rate", "Explorer_Unique_Positions",
             "Explorer_Walkable_Cells",
+            "LP_Split_Spearman", "PPO_Updated", "PPO_Num_Samples",
+            "PPO_Policy_Loss", "PPO_Value_Loss", "PPO_Approx_KL",
+            "PPO_Clip_Fraction", "PPO_Ratio_Mean", "PPO_Ratio_Min",
+            "PPO_Ratio_Max", "PPO_Reward_Std", "PPO_Advantage_Std",
+            "PPO_Initial_Logprob_Error", "PPO_Grad_Norm", "PPO_Param_Delta",
         ]
     else:
         csv_header = [
@@ -267,6 +352,9 @@ def adversarial_ued_training(cfg: DictConfig):
         ]
 
     file_exists = _ensure_csv_header_compatible(summary_csv_path, csv_header)
+    if strict_results:
+        _validate_existing_result_rows(summary_csv_path, csv_header, seed)
+    _write_run_manifest(run_manifest_path, cfg)
     if not file_exists:
         with open(summary_csv_path, mode='w', newline='') as f:
             writer = csv.writer(f)
@@ -887,12 +975,33 @@ def adversarial_ued_training(cfg: DictConfig):
         # --------------------------------------------------------
         if summary_csv_path is not None:
             try:
+                if is_minigrid and bool(getattr(diagnostics_cfg, "enabled", False)):
+                    map_records = getattr(gen_interface, "last_minigrid_map_diagnostics", [])
+                    if map_records:
+                        with open(map_diagnostics_path, mode="a", encoding="utf-8") as handle:
+                            for record in map_records:
+                                payload = {"Seed": int(seed), "Iter": int(iteration + 1), **record}
+                                handle.write(json.dumps(payload, sort_keys=True) + "\n")
                 with open(summary_csv_path, mode='a', newline='') as f:
                     # --- [Symmetrical 6-Column Metrics] ---
                     # Ensure we don't log NaN if lists are empty
                     gen_div_reward_val = gen_div_score if gen_div_score is not None else 0.0
 
                     # Prepare row as a dictionary (Exact Column Order Alignment)
+                    ppo_metrics = getattr(gen_interface, "last_generator_update_metrics", {})
+                    def ppo_value(name, default=0.0):
+                        aliases = {
+                            "num_samples": "sample_count",
+                            "initial_logprob_error": "initial_logprob_max_error",
+                            "grad_norm": "preclip_grad_norm",
+                            "param_delta": "parameter_delta",
+                        }
+                        value = ppo_metrics.get(name, ppo_metrics.get(aliases.get(name, ""), default))
+                        try:
+                            return float(value)
+                        except (TypeError, ValueError):
+                            return default
+
                     if is_bipedal:
                         row_data = {
                             "Seed": seed,
@@ -964,6 +1073,21 @@ def adversarial_ued_training(cfg: DictConfig):
                                 "Explorer_Coverage_Rate": f"{mg_metrics.get('Explorer_Coverage_Rate', 0.0):.6f}",
                                 "Explorer_Unique_Positions": f"{mg_metrics.get('Explorer_Unique_Positions', 0.0):.2f}",
                                 "Explorer_Walkable_Cells": f"{mg_metrics.get('Explorer_Walkable_Cells', 0.0):.2f}",
+                                "LP_Split_Spearman": f"{mg_metrics.get('LP_Split_Spearman', 0.0):.6f}",
+                                "PPO_Updated": int(bool(ppo_metrics.get("updated", False))),
+                                "PPO_Num_Samples": int(ppo_value("num_samples", 0)),
+                                "PPO_Policy_Loss": f"{ppo_value('policy_loss'):.6f}",
+                                "PPO_Value_Loss": f"{ppo_value('value_loss'):.6f}",
+                                "PPO_Approx_KL": f"{ppo_value('approx_kl'):.6f}",
+                                "PPO_Clip_Fraction": f"{ppo_value('clip_fraction'):.6f}",
+                                "PPO_Ratio_Mean": f"{ppo_value('ratio_mean'):.6f}",
+                                "PPO_Ratio_Min": f"{ppo_value('ratio_min'):.6f}",
+                                "PPO_Ratio_Max": f"{ppo_value('ratio_max'):.6f}",
+                                "PPO_Reward_Std": f"{ppo_value('reward_std'):.6f}",
+                                "PPO_Advantage_Std": f"{ppo_value('advantage_std'):.6f}",
+                                "PPO_Initial_Logprob_Error": f"{ppo_value('initial_logprob_error'):.9f}",
+                                "PPO_Grad_Norm": f"{ppo_value('grad_norm'):.6f}",
+                                "PPO_Param_Delta": f"{ppo_value('param_delta'):.9f}",
                             }
                         else:
                             row_data = {

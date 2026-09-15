@@ -219,6 +219,7 @@ class GeneratorInterface:
                 entropy_coef_end=float(getattr(ppo_cfg, "entropy_coef_end", getattr(ppo_cfg, "entropy_coef", 0.05))) if ppo_cfg is not None else 0.05,
                 entropy_anneal_iters=int(getattr(ppo_cfg, "entropy_anneal_iters", 0)) if ppo_cfg is not None else 0,
                 buffer_window_rounds=int(getattr(ppo_cfg, "buffer_window_rounds", 1)) if ppo_cfg is not None else 1,
+                update_every_rounds=int(getattr(ppo_cfg, "update_every_rounds", 1)) if ppo_cfg is not None else 1,
                 initial_edit_ratio=float(hparams.max_edits_layout),
                 initial_inventory_edit_ratio=float(hparams.max_edits_inventory),
                 edit_action_group_sizes=edit_group_sizes,
@@ -315,6 +316,10 @@ class GeneratorInterface:
         self.last_minigrid_metrics = {}
         self.last_generated_minigrid_batch = None
         self._pending_minigrid_round = None
+        self.last_minigrid_map_diagnostics = []
+        self.last_generator_update_metrics = {}
+        diagnostics_cfg = getattr(cfg, "diagnostics", None)
+        self.enable_lp_split_diagnostic = bool(getattr(diagnostics_cfg, "lp_split", True))
         self.bipedal_history_len = int(self._get_bipedal_history_len())
         self.bipedal_history = deque(maxlen=self.bipedal_history_len)
         self._last_bipedal_memory = (
@@ -508,6 +513,7 @@ class GeneratorInterface:
         learning_progress_ranks=None,
         novelty_ranks=None, batch_nearest_hamming=0.0,
         archive_nearest_hamming=0.0, novelty_distance_std=0.0,
+        lp_split_spearman=0.0,
     ):
         if not self.is_minigrid:
             return
@@ -591,6 +597,7 @@ class GeneratorInterface:
                 float(np.mean(novelty_ranks))
                 if novelty_ranks is not None and len(novelty_ranks) > 0 else 0.0
             ),
+            "LP_Split_Spearman": float(lp_split_spearman),
             "Batch_Nearest_Hamming": float(batch_nearest_hamming),
             "Archive_Nearest_Hamming": float(archive_nearest_hamming),
             "Novelty_Distance_Std": float(novelty_distance_std),
@@ -657,6 +664,7 @@ class GeneratorInterface:
             self.map_archive.clear()
             self.combination_archive.clear()
             self.last_minigrid_metrics = {}
+            self.last_minigrid_map_diagnostics = []
             self._pending_minigrid_round = None
         self.elite_buffer.clear()
         self.prev_data = None
@@ -667,6 +675,7 @@ class GeneratorInterface:
 
         if hasattr(self.ppo, "clear_buffer"):
             self.ppo.clear_buffer()
+        self.last_generator_update_metrics = {}
 
     def _zero_context(self, B, H, W):
         # (Map features, Inventory Heatmap)
@@ -861,6 +870,54 @@ class GeneratorInterface:
         return np.clip(ranks, 0.0, 1.0)
 
     @staticmethod
+    def _split_probe_trajectory(trajectory, parity):
+        """Return an alternating-transition view used only for LP reliability."""
+        if not isinstance(trajectory, dict) or "obs" not in trajectory:
+            return {}
+        try:
+            n_steps = len(trajectory["obs"])
+        except TypeError:
+            return {}
+        if n_steps < 2:
+            return {}
+        result = {}
+        for key, value in trajectory.items():
+            try:
+                if len(value) == n_steps:
+                    result[key] = value[int(parity) :: 2]
+                else:
+                    result[key] = value
+            except (TypeError, IndexError, KeyError):
+                result[key] = value
+        return result
+
+    @staticmethod
+    def _spearman_correlation(x, y):
+        """Tie-aware Spearman correlation without adding a scipy dependency."""
+        x = np.asarray(x, dtype=np.float64).reshape(-1)
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
+        valid = np.isfinite(x) & np.isfinite(y)
+        x, y = x[valid], y[valid]
+        if x.size < 2 or np.std(x) <= 1e-12 or np.std(y) <= 1e-12:
+            return 0.0
+
+        def rank(values):
+            order = np.argsort(values, kind="mergesort")
+            ranks = np.empty(values.size, dtype=np.float64)
+            sorted_values = values[order]
+            start = 0
+            while start < values.size:
+                end = start + 1
+                while end < values.size and sorted_values[end] == sorted_values[start]:
+                    end += 1
+                ranks[order[start:end]] = 0.5 * (start + end - 1)
+                start = end
+            return ranks
+
+        rx, ry = rank(x), rank(y)
+        return float(np.corrcoef(rx, ry)[0, 1])
+
+    @staticmethod
     def _minigrid_reward_components(
         learning_progress,
         combination_novelty,
@@ -924,7 +981,7 @@ class GeneratorInterface:
                 )
         return losses
 
-    def _evaluate_minigrid_post_update_probes(self, trajectories, valid):
+    def _evaluate_minigrid_post_update_probes(self, trajectories, valid, include_spatial=True):
         """Evaluate post-update probe loss and spatial history feedback."""
         losses = np.zeros(self.batch_size, dtype=np.float32)
         error_maps = np.zeros(
@@ -936,15 +993,16 @@ class GeneratorInterface:
                 continue
             try:
                 metrics = self.wm.calc_minigrid_probe_metrics(
-                    trajectory, include_spatial=True
+                    trajectory, include_spatial=include_spatial
                 )
                 losses[index] = float(metrics["changed_focal_loss"])
-                error_maps[index] = np.asarray(
-                    metrics["error_map"], dtype=np.float32
-                )
-                coverage_maps[index] = np.asarray(
-                    metrics["coverage_map"], dtype=np.float32
-                )
+                if include_spatial:
+                    error_maps[index] = np.asarray(
+                        metrics["error_map"], dtype=np.float32
+                    )
+                    coverage_maps[index] = np.asarray(
+                        metrics["coverage_map"], dtype=np.float32
+                    )
             except Exception as exc:
                 print(
                     "[GeneratorInterface] Post-update probe evaluation failed for "
@@ -983,6 +1041,36 @@ class GeneratorInterface:
             pending["history_maps"], post_error_maps, post_coverage_maps
         )
         learning_progress = pre_losses - post_losses
+        # Reliability diagnostic: evaluate the same held-out probe on alternating
+        # transitions. The full probe remains the actual PPO reward.
+        lp_even = np.zeros(self.batch_size, dtype=np.float32)
+        lp_odd = np.zeros(self.batch_size, dtype=np.float32)
+        split_valid = np.zeros(self.batch_size, dtype=bool)
+        split_lp_corr = 0.0
+        if self.enable_lp_split_diagnostic:
+            even_probes = [self._split_probe_trajectory(item, 0) for item in pending["probe_trajectories"]]
+            odd_probes = [self._split_probe_trajectory(item, 1) for item in pending["probe_trajectories"]]
+            even_valid = [bool(item) and "obs" in item for item in even_probes]
+            odd_valid = [bool(item) and "obs" in item for item in odd_probes]
+            probe_valid = np.asarray(valid, dtype=bool)
+            pre_even = self._evaluate_minigrid_changed_focal_losses(
+                even_probes, probe_valid & np.asarray(even_valid, dtype=bool),
+                phase="Pre-update probe even"
+            )
+            pre_odd = self._evaluate_minigrid_changed_focal_losses(
+                odd_probes, probe_valid & np.asarray(odd_valid, dtype=bool),
+                phase="Pre-update probe odd"
+            )
+            post_even, _, _ = self._evaluate_minigrid_post_update_probes(
+                even_probes, probe_valid & np.asarray(even_valid, dtype=bool), include_spatial=False
+            )
+            post_odd, _, _ = self._evaluate_minigrid_post_update_probes(
+                odd_probes, probe_valid & np.asarray(odd_valid, dtype=bool), include_spatial=False
+            )
+            lp_even = pre_even - post_even
+            lp_odd = pre_odd - post_odd
+            split_valid = probe_valid & np.asarray(even_valid, dtype=bool) & np.asarray(odd_valid, dtype=bool)
+            split_lp_corr = self._spearman_correlation(lp_even[split_valid], lp_odd[split_valid])
         difficulty_ranks = self._tie_aware_percentile_rank(pre_losses, valid)
         learning_progress_ranks = self._tie_aware_percentile_rank(
             learning_progress, valid
@@ -1078,7 +1166,27 @@ class GeneratorInterface:
             batch_nearest_hamming=pending["batch_nearest_hamming"],
             archive_nearest_hamming=pending["archive_nearest_hamming"],
             novelty_distance_std=pending["novelty_distance_std"],
+            lp_split_spearman=split_lp_corr,
         )
+        self.last_minigrid_map_diagnostics = [
+            {
+                "map_index": int(index),
+                "valid": bool(valid[index]),
+                "pre_changed_focal_loss": float(pre_losses[index]),
+                "post_changed_focal_loss": float(post_losses[index]),
+                "learning_progress": float(learning_progress[index]),
+                "lp_even": float(lp_even[index]),
+                "lp_odd": float(lp_odd[index]),
+                "split_valid": bool(split_valid[index]),
+                "split_spearman_batch": float(split_lp_corr),
+                "random_feature_novelty": float(np.asarray(pending["random_feature_novelties"])[index]),
+                "combination_novelty": float(np.asarray(pending["combination_novelties"])[index]),
+                "reward_learning_progress": float(reward_components[index]["reward_learning_progress"]),
+                "reward_random_feature_novelty": float(reward_components[index]["reward_random_feature_novelty"]),
+                "reward_total": float(reward_components[index]["total"]),
+            }
+            for index in range(self.batch_size)
+        ]
         # finalize_minigrid_rewards refreshes last_minigrid_metrics; restore
         # the explorer coverage fields before MAC writes its CSV row.
         self._attach_minigrid_explorer_coverage()
@@ -2546,4 +2654,11 @@ class GeneratorInterface:
 
     def update(self, iteration=None):
         loss, ent = self.ppo.update(iteration=iteration)
+        self.last_generator_update_metrics = dict(
+            getattr(
+                self.ppo,
+                "last_diagnostics",
+                getattr(self.ppo, "last_update_metrics", {}),
+            )
+        )
         return loss, ent, self.ppo.last_mean_reward
