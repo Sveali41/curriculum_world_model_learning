@@ -9,6 +9,7 @@ import hydra
 from omegaconf import DictConfig, open_dict
 from pathlib import Path
 import glob
+import shutil
 
 # Add project root
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -45,6 +46,7 @@ from modelBased.continue_learning.reservoir_buffer import ReservoirReplayBuffer
 from modelBased.common.artifacts import align_world_model_artifact_path
 from generator.generator_interface import GeneratorInterface
 from trainer.common.utils import (
+    CRAFTER_INVENTORY_VAL_METRICS,
     MINIGRID_VAL_LOSS_FIELDS,
     set_seed,
     validate_on_target_task,
@@ -149,6 +151,80 @@ def _ensure_csv_header_compatible(csv_path: Path, expected_columns):
     )
     return False
 
+
+def _crafter_gate_artifact_suffix(cfg: DictConfig, is_crafter: bool) -> str:
+    """Return a stable artifact namespace for Crafter gate-loss variants."""
+    if not is_crafter:
+        return ""
+    output_mode = str(
+        getattr(cfg.attention_model, "crafter_inventory_output_mode", "categorical_gate")
+    ).strip().lower()
+    if output_mode == "categorical_effect":
+        reduction = str(
+            getattr(
+                cfg.attention_model,
+                "crafter_inventory_effect_reduction",
+                "balanced_mean",
+            )
+        ).strip().lower()
+        labels = {
+            "balanced_mean": "effect5balanced",
+            "sqrt_balanced": "effect5sqrt",
+            "mean": "effect5natural",
+        }
+        label = labels.get(reduction)
+        if label is None:
+            label = "effect5_" + "".join(
+                ch if ch.isalnum() else "_" for ch in reduction
+            ).strip("_")
+        return f"_{label}"
+    gate_mode = str(
+        getattr(cfg.attention_model, "crafter_inventory_gate_reduction", "global_balanced")
+    ).strip().lower()
+    labels = {
+        "global_balanced": "globalgate",
+        "slot_macro_changed": "slotmacro",
+    }
+    label = labels.get(gate_mode)
+    if label is None:
+        label = "".join(ch if ch.isalnum() else "_" for ch in gate_mode).strip("_")
+    return f"_{label or 'unspecifiedgate'}"
+
+
+def _crafter_pose_artifact_suffix(cfg: DictConfig, is_crafter: bool) -> str:
+    """Keep opt-in learned-pose experiments out of legacy artifact names."""
+    if not is_crafter:
+        return ""
+    pose_cfg = getattr(cfg.attention_model, "crafter_pose", None)
+    enabled = (
+        bool(pose_cfg.get("enabled", False)) if isinstance(pose_cfg, dict)
+        else bool(getattr(pose_cfg, "enabled", False)) if pose_cfg is not None else False
+    )
+    return "_pose" if enabled else ""
+
+
+def _crafter_event_residual_artifact_suffix(cfg: DictConfig, is_crafter: bool) -> str:
+    """Keep opt-in legal-event residual runs separate from old DR artifacts."""
+    if not is_crafter:
+        return ""
+    residual = getattr(cfg.attention_model, "crafter_inventory_event_residual", None)
+    enabled = bool(residual.get("enabled", False)) if isinstance(residual, dict) else bool(
+        getattr(residual, "enabled", False)
+    ) if residual is not None else False
+    if not enabled:
+        return ""
+    dims = residual.get("hidden_dims", (64,)) if isinstance(residual, dict) else getattr(residual, "hidden_dims", (64,))
+    label = "x".join(str(int(width)) for width in dims)
+    return f"_eventresidual{label}"
+
+
+def _crafter_validation_artifact_suffix(val_suffix: str, is_crafter: bool) -> str:
+    """Isolate the new Crafter coverage-v3 experiment from legacy artifacts."""
+    if not is_crafter:
+        return ""
+    return "_coverage_v3" if Path(str(val_suffix)).name == "_coverage_v3.npz" else ""
+
+
 @hydra.main(version_base=None, config_path="conf", config_name="config_dr")
 def run_dr_baseline_experiment(cfg: DictConfig):
     align_world_model_artifact_path(cfg)
@@ -164,10 +240,12 @@ def run_dr_baseline_experiment(cfg: DictConfig):
     d_cfg = cfg.domains[domain_name]
     is_bipedal = (domain_name == "bipedalwalker")
     is_minigrid = (domain_name == "minigrid")
+    is_crafter = (domain_name == "crafter")
     val_n_phases = int(getattr(d_cfg, "val_n_phases", getattr(d_cfg, "target_task_count", 20)))
     val_task_prefix = str(getattr(d_cfg, "val_task_prefix", getattr(d_cfg, "target_task_prefix", "target_task")))
     val_data_path = str(getattr(d_cfg, "val_data_path", getattr(d_cfg, "target_tasks_folder", "")))
     val_suffix = str(getattr(d_cfg, "val_suffix", getattr(d_cfg, "target_task_suffix", "_uniform.npz")))
+    crafter_validation_suffix = _crafter_validation_artifact_suffix(val_suffix, is_crafter)
     val_start_idx = int(
         getattr(
             d_cfg,
@@ -189,6 +267,42 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         cfg.attention_model.validation_metric = d_cfg.validation_metric
         cfg.attention_model.data_type = d_cfg.data_type
     _apply_domain_collection_budget(cfg, domain_name)
+
+    transition_replay_cfg = getattr(cfg.attention_model, "crafter_transition_replay", None)
+    if isinstance(transition_replay_cfg, dict):
+        transition_replay_enabled = is_crafter and bool(transition_replay_cfg.get("enabled", False))
+        configured_include_changed_slot = bool(
+            transition_replay_cfg.get("include_changed_slot", False)
+        )
+    else:
+        transition_replay_enabled = is_crafter and bool(getattr(transition_replay_cfg, "enabled", False))
+        configured_include_changed_slot = bool(
+            getattr(transition_replay_cfg, "include_changed_slot", False)
+        )
+    transition_replay_include_changed_slot = (
+        transition_replay_enabled and configured_include_changed_slot
+    )
+    crafter_value_mode = str(
+        getattr(cfg.attention_model, "crafter_inventory_value_mode", "categorical_absolute")
+    ).lower()
+    crafter_inventory_output_mode = str(
+        getattr(cfg.attention_model, "crafter_inventory_output_mode", "categorical_gate")
+    ).lower()
+    crafter_value_mode_suffix = (
+        "_delta"
+        if is_crafter
+        and crafter_inventory_output_mode == "categorical_gate"
+        and crafter_value_mode == "categorical_delta"
+        else ""
+    )
+    protected_cfg = getattr(transition_replay_cfg, "protected_slot_replay", {})
+    protected_enabled = bool(
+        protected_cfg.get("enabled", False) if isinstance(protected_cfg, dict)
+        else getattr(protected_cfg, "enabled", False)
+    )
+    crafter_gate_suffix = _crafter_gate_artifact_suffix(cfg, is_crafter)
+    crafter_pose_suffix = _crafter_pose_artifact_suffix(cfg, is_crafter)
+    crafter_event_residual_suffix = _crafter_event_residual_artifact_suffix(cfg, is_crafter)
 
     # Optionally start from a clean checkpoint state.
     ckpt_path = cfg.attention_model.model_save_path
@@ -234,6 +348,8 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         fisher_buffer = FisherReplayBuffer(
             max_size=cfg.attention_model.fisher_buffer_size,
             contact_positive_ratio=float(getattr(cfg.domains[cfg.domain], "contact_positive_ratio", 0.5)),
+            crafter_transition_replay=transition_replay_cfg if transition_replay_enabled else None,
+            seed=int(getattr(cfg, "seed", 0)),
         )
     
     log_dir = Path(cfg.dr_log_dir)
@@ -251,10 +367,62 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             "_focal_reservoir.csv"
         )
     else:
-        summary_csv_path = log_dir / f"dr_summary_{domain_name}{mask_suffix}.csv"
+        ewc_suffix = "_ewc_balanced_inventory" if bool(getattr(cfg.attention_model, "ewc_enabled", False)) else ""
+        ewc_suffix += crafter_value_mode_suffix
+        if transition_replay_enabled:
+            ewc_suffix += "_transition_replay"
+        if transition_replay_include_changed_slot:
+            ewc_suffix += "_slot"
+        if protected_enabled:
+            ewc_suffix += "protect"
+        ewc_suffix += crafter_gate_suffix
+        ewc_suffix += crafter_pose_suffix
+        ewc_suffix += crafter_event_residual_suffix
+        ewc_suffix += crafter_validation_suffix
+        summary_csv_path = log_dir / f"dr_summary_{domain_name}{mask_suffix}{ewc_suffix}.csv"
+    transition_stats_csv_path = (
+        log_dir / (
+            f"dr_transition_replay_{domain_name}{crafter_value_mode_suffix}"
+            f"{'_slotprotect' if protected_enabled else ('_slot' if transition_replay_include_changed_slot else '')}"
+            f"{crafter_gate_suffix}{crafter_pose_suffix}{crafter_event_residual_suffix}{crafter_validation_suffix}_seed{seed}.csv"
+        )
+        if transition_replay_enabled else None
+    )
     file_exists = False
 
     old_params, fisher = None, None
+    global_best_selection = float("inf")
+    global_best_iteration = 0
+    def _transition_stat_columns(source, stats):
+        """Flatten four transition classes for the compact DR summary."""
+        result = {}
+        total = sum(value["count"] for value in stats.values()) if stats else 0
+        for transition_type in FisherReplayBuffer.CRAFTER_TRANSITION_TYPES:
+            value = (stats or {}).get(transition_type, {"count": 0, "actions": {}})
+            count = int(value["count"])
+            result[f"{source}_{transition_type}_count"] = count
+            result[f"{source}_{transition_type}_fraction"] = count / total if total else 0.0
+            result[f"{source}_{transition_type}_action_coverage"] = len(value["actions"])
+        return result
+    def _slot_counts(stats):
+        result = {}
+        for values in (stats or {}).values():
+            for slot, count in values.get("changed_slots", {}).items():
+                result[int(slot)] = result.get(int(slot), 0) + int(count)
+        return result
+    def _sum_slot_counts(*rows):
+        result = {}
+        for row in rows:
+            for slot, count in (row or {}).items():
+                result[int(slot)] = result.get(int(slot), 0) + int(count)
+        return result
+    validation_slot_counts = {}
+    if is_crafter and getattr(cfg.attention_model, "dr_validation_archive", None) and os.path.isfile(str(cfg.attention_model.dr_validation_archive)):
+        validation_archive = np.load(str(cfg.attention_model.dr_validation_archive), allow_pickle=True)
+        val_inv = validation_archive["g"] if "g" in validation_archive.files else validation_archive["inv"]
+        val_next = validation_archive["h"] if "h" in validation_archive.files else validation_archive["inv_next"]
+        changed = np.asarray(val_inv)[:, 4:16] != np.asarray(val_next)[:, 4:16]
+        validation_slot_counts = {int(slot + 4): int(changed[:, slot].sum()) for slot in range(12) if changed[:, slot].any()}
     if is_minigrid:
         csv_columns = [
             "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
@@ -278,8 +446,22 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
             "gen_val_val_inv_loss", "gen_val_val_ce_loss", "gen_val_avg_val_loss_wm",
             "target_val_val_inv_loss", "target_val_val_ce_loss", "target_val_avg_val_loss_wm",
+            "target_val_changed_nll", "target_val_changed_count",
+            *[f"target_val_{name}" for name in CRAFTER_INVENTORY_VAL_METRICS],
             "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
+            "EWC_Enabled", "EWC_Lambda", "EWC_Fisher_Samples", "EWC_Fisher_Beta", "EWC_Scale_Factor",
+            "train_ewc_raw", "train_ewc_weighted", "train_ewc_to_wm_ratio",
+            "train_ewc_raw_epoch", "train_ewc_weighted_epoch", "train_ewc_to_wm_ratio_epoch",
+            "current_selection_loss", "best_selection_loss", "best_iteration",
         ]
+        if transition_replay_enabled:
+            for source in ("Current", "Buffer", "Sampled_Replay"):
+                for transition_type in FisherReplayBuffer.CRAFTER_TRANSITION_TYPES:
+                    csv_columns.extend([
+                        f"{source}_{transition_type}_count",
+                        f"{source}_{transition_type}_fraction",
+                        f"{source}_{transition_type}_action_coverage",
+                    ])
     elif is_bipedal:
         csv_columns = [
             "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
@@ -359,6 +541,19 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         new_batch = convert_trajectories_to_batch(valid_trajs)
         current_transitions = len(new_batch["obs"]) if new_batch is not None and new_batch.get("obs") is not None else 0
         print(f"  [Data] Current batch transitions: {current_transitions}")
+        current_transition_stats = (
+            fisher_buffer.transition_replay_stats(new_batch)
+            if transition_replay_enabled else None
+        )
+        sampled_replay_stats = None
+        protected_replay_slot_counts = {}
+        fisher_slot_counts = {}
+        train_ewc_raw = float("nan")
+        train_ewc_weighted = float("nan")
+        train_ewc_to_wm_ratio = float("nan")
+        train_ewc_raw_epoch = float("nan")
+        train_ewc_weighted_epoch = float("nan")
+        train_ewc_to_wm_ratio_epoch = float("nan")
         
         # B. Train World Model
         # [ALIGN] Respect warmup: freeze WM training during warmup (same as MAC)
@@ -420,7 +615,32 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                     cfg, net=wm, old_params=old_params, fisher=fisher,
                     replay_data=replay_data
                 )
+                if is_crafter and protected_enabled:
+                    phase_path = Path(str(cfg.attention_model.model_save_path))
+                    last_path = phase_path.with_name(phase_path.stem + "_last" + phase_path.suffix)
+                    best_path = phase_path.with_name(phase_path.stem + "_best" + phase_path.suffix)
+                    if phase_path.is_file():
+                        shutil.copy2(phase_path, last_path)
+                        current_selection = float(res_train.get("best_loss", float("inf")))
+                        if current_selection < global_best_selection:
+                            shutil.copy2(phase_path, best_path)
+                            global_best_selection = current_selection
+                            global_best_iteration = iteration + 1
+                            print(f"  [Checkpoint] Updated fixed-DR-validation best at iteration {global_best_iteration}.")
+                if transition_replay_enabled and replay_data is not None:
+                    sampled_replay_stats = replay_data.get("_replay_sampling_stats")
+                protected_replay_slot_counts = dict(res_train.get("protected_replay_slot_counts", {}))
+                fisher_slot_counts = dict(res_train.get("fisher_slot_counts", {}))
                 old_params = res_train["old_params"]
+                # train_api removes the ``train/`` prefix from Lightning
+                # callback metrics, making per-iteration EWC diagnostics
+                # directly traceable in the experiment summary.
+                train_ewc_raw = float(res_train.get("ewc_raw", float("nan")))
+                train_ewc_weighted = float(res_train.get("ewc_weighted", float("nan")))
+                train_ewc_to_wm_ratio = float(res_train.get("ewc_to_wm_ratio", float("nan")))
+                train_ewc_raw_epoch = float(res_train.get("ewc_raw_epoch", float("nan")))
+                train_ewc_weighted_epoch = float(res_train.get("ewc_weighted_epoch", float("nan")))
+                train_ewc_to_wm_ratio_epoch = float(res_train.get("ewc_to_wm_ratio_epoch", float("nan")))
             finally:
                 cfg.attention_model.freeze_weight = old_freeze
                 cfg.attention_model.data_dir = old_data_dir
@@ -464,6 +684,11 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         target_val_changed_focal_loss = 0.0
         target_val_false_set_rate = 0.0
         target_val_changed_count = 0.0
+        target_val_crafter_changed_nll = 0.0
+        target_val_crafter_changed_count = 0.0
+        target_val_crafter_inventory_metrics = {
+            name: 0.0 for name in CRAFTER_INVENTORY_VAL_METRICS
+        }
         target_val_valid_count = 0
         if iteration >= (warmup_iters - 1):
             print(f"  [Validation] Running zero-shot test on all {val_n_phases} targets...")
@@ -491,6 +716,13 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                 else:
                     target_val_val_ce_loss = val_summary.get("terrain_loss", 0.0)
                     target_val_val_inv_loss = val_summary.get("inventory_loss", 0.0)
+                    if is_crafter:
+                        target_val_crafter_changed_nll = float(val_summary.get("changed_nll", 0.0))
+                        target_val_crafter_changed_count = float(val_summary.get("changed_count", 0.0))
+                        target_val_crafter_inventory_metrics = {
+                            name: float(val_summary.get(name, 0.0))
+                            for name in CRAFTER_INVENTORY_VAL_METRICS
+                        }
                     target_val_contact_acc = 0.0
                     target_val_contact_bce = 0.0
                     if is_minigrid:
@@ -512,17 +744,31 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                             f"{component_summary}"
                         )
                     else:
-                        print(f"    -> Results: Avg Loss = {target_val_avg_val_loss_wm:.5f}")
+                        print(
+                            f"    -> Results: Avg Loss = {target_val_avg_val_loss_wm:.5f} | "
+                            f"Changed NLL = {target_val_crafter_changed_nll:.5f} | "
+                            f"Changed Count = {target_val_crafter_changed_count:.0f}"
+                        )
             else:
                 target_val_avg_val_loss_wm = 0.0
                 target_val_val_ce_loss = 0.0
                 target_val_val_inv_loss = 0.0
+                target_val_crafter_changed_nll = 0.0
+                target_val_crafter_changed_count = 0.0
+                target_val_crafter_inventory_metrics = {
+                    name: 0.0 for name in CRAFTER_INVENTORY_VAL_METRICS
+                }
                 target_val_contact_acc = 0.0
                 target_val_contact_bce = 0.0
         else:
             target_val_avg_val_loss_wm = 0.0
             target_val_val_ce_loss = 0.0
             target_val_val_inv_loss = 0.0
+            target_val_crafter_changed_nll = 0.0
+            target_val_crafter_changed_count = 0.0
+            target_val_crafter_inventory_metrics = {
+                name: 0.0 for name in CRAFTER_INVENTORY_VAL_METRICS
+            }
             target_val_contact_acc = 0.0
             target_val_contact_bce = 0.0
 
@@ -536,6 +782,10 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                 fisher_buffer_elements_ratio=cfg.attention_model.fisher_buffer_elements_ratio,
             )
         print(f"  [Buffer] Archived {current_transitions} transitions. Buffer Size: {len(fisher_buffer)}")
+        buffer_transition_stats = (
+            fisher_buffer.transition_replay_stats()
+            if transition_replay_enabled and len(fisher_buffer) else None
+        )
         if is_minigrid:
             replay_data_after = fisher_buffer.export_dict() if len(fisher_buffer) else None
             replay_changed_fraction, _ = minigrid_changed_fraction(replay_data_after)
@@ -597,9 +847,31 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                 "gen_val_avg_val_loss_wm": gen_val_avg_val_loss_wm,
                 "target_val_val_inv_loss": target_val_val_inv_loss, "target_val_val_ce_loss": target_val_val_ce_loss,
                 "target_val_avg_val_loss_wm": target_val_avg_val_loss_wm,
+                "target_val_changed_nll": target_val_crafter_changed_nll,
+                "target_val_changed_count": target_val_crafter_changed_count,
+                **{f"target_val_{name}": value
+                   for name, value in target_val_crafter_inventory_metrics.items()},
                 "New_Data_Size": current_transitions, "Buffer_Size": len(fisher_buffer),
                 "Solvable_Count": solvable_count, "Avg_Path_Len": avg_path_len,
+                "EWC_Enabled": bool(getattr(cfg.attention_model, "ewc_enabled", False)),
+                "EWC_Lambda": float(getattr(cfg.attention_model, "lambda_ewc", 0.0)),
+                "EWC_Fisher_Samples": int(getattr(cfg.attention_model, "fisher_samples", 0)),
+                "EWC_Fisher_Beta": float(getattr(cfg.attention_model, "fisher_beta", 0.0)),
+                "EWC_Scale_Factor": float(getattr(cfg.attention_model, "scale_factor", 1.0)),
+                "train_ewc_raw": train_ewc_raw,
+                "train_ewc_weighted": train_ewc_weighted,
+                "train_ewc_to_wm_ratio": train_ewc_to_wm_ratio,
+                "train_ewc_raw_epoch": train_ewc_raw_epoch,
+                "train_ewc_weighted_epoch": train_ewc_weighted_epoch,
+                "train_ewc_to_wm_ratio_epoch": train_ewc_to_wm_ratio_epoch,
+                "current_selection_loss": float(res_train.get("best_loss", float("nan"))) if 'res_train' in locals() else float("nan"),
+                "best_selection_loss": global_best_selection,
+                "best_iteration": global_best_iteration,
             }
+            if transition_replay_enabled:
+                row_data.update(_transition_stat_columns("Current", current_transition_stats))
+                row_data.update(_transition_stat_columns("Buffer", buffer_transition_stats))
+                row_data.update(_transition_stat_columns("Sampled_Replay", sampled_replay_stats))
 
         pd.DataFrame([row_data], columns=csv_columns).to_csv(
             summary_csv_path,
@@ -608,6 +880,48 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             header=not file_exists,
         )
         file_exists = True
+        if transition_replay_enabled and transition_stats_csv_path is not None:
+            detail_rows = []
+            for source, stats in (
+                ("current", current_transition_stats),
+                ("buffer", buffer_transition_stats),
+                ("sampled_replay", sampled_replay_stats),
+            ):
+                for transition_type, values in (stats or {}).items():
+                    for action, count in values["actions"].items():
+                        detail_rows.append({
+                            "seed": seed, "iteration": iteration + 1, "source": source,
+                            "transition_type": transition_type, "action": action,
+                            "changed_slot": None, "count": count,
+                        })
+                    for slot, count in values.get("changed_slots", {}).items():
+                        detail_rows.append({
+                            "seed": seed, "iteration": iteration + 1, "source": source,
+                            "transition_type": transition_type, "action": "all",
+                            "changed_slot": int(slot), "count": count,
+                        })
+            # Slot-only sources deliberately have no transition-type/action
+            # rows; the legacy rows above stay intact for those dimensions.
+            train_slot_counts = _sum_slot_counts(
+                _slot_counts(current_transition_stats), _slot_counts(sampled_replay_stats)
+            )
+            for source, counts in (
+                ("protected_replay", protected_replay_slot_counts),
+                ("train", train_slot_counts),
+                ("fisher", fisher_slot_counts),
+                ("validation", validation_slot_counts),
+            ):
+                for slot, count in (counts or {}).items():
+                    detail_rows.append({
+                        "seed": seed, "iteration": iteration + 1, "source": source,
+                        "transition_type": "inventory_change", "action": "all",
+                        "changed_slot": int(slot), "count": int(count),
+                    })
+            if detail_rows:
+                pd.DataFrame(detail_rows).to_csv(
+                    transition_stats_csv_path, mode="a",
+                    header=not transition_stats_csv_path.exists(), index=False,
+                )
         torch.cuda.empty_cache()
 
         # E. Cleanup Temporary Data

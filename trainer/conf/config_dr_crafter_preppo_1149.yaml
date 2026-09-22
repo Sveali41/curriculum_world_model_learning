@@ -1,0 +1,104 @@
+# Reproduction configuration for the Crafter DR WM used before the 15:00 PPO
+# run.  Keep this namespace isolated from the current production DR artifacts.
+
+defaults:
+  - config_dr
+  - _self_
+
+domain: crafter
+seed: 0
+force_fresh_start: true
+
+generator_agent:
+  agent_type: random
+  total_iterations: 50
+  warmup_iterations: 0
+  wm_train_frequency: 1
+
+domains:
+  crafter:
+    # The pre-PPO run collected 8,000 transitions per DR iteration.
+    iter_transition_budget: 8000
+    generator_batch_size: 8
+    replay_frac: 0.8
+    lambda_ewc: 10
+    val_suffix: "_coverage_v3.npz"
+    env_visualize_folder: ${paths.visualizations}/environments/ued/crafter/dr_preppo_1149/
+    dataset_visualize_folder: ${paths.visualizations}/datasets/ued/crafter/dr_preppo_1149/
+
+    crafter_wm:
+      inventory_value_mode: categorical_delta
+      inventory_output_mode: categorical_effect
+      inventory_effect_reduction: sqrt_balanced
+      inventory_architecture: shared_pool_v1
+      event_residual:
+        enabled: true
+        hidden_dims: [64]
+        action_embed_dim: 8
+        change_bias: 1.875
+        loss_weight: 1.0
+      pose:
+        enabled: true
+        mode: learned_detached
+
+attention_model:
+  seed: ${seed}
+  embed_dim: 128
+  num_heads: 1
+  batch_size: 64
+  n_epochs: 10
+  lr: 5e-4
+  wd: 1e-5
+  predict_survival: false
+  crafter_inventory_value_mode: categorical_delta
+  crafter_inventory_output_mode: categorical_effect
+  crafter_inventory_effect_reduction: sqrt_balanced
+  crafter_inventory_architecture: shared_pool_v1
+  crafter_inventory_event_residual:
+    enabled: true
+    hidden_dims: [64]
+    action_embed_dim: 8
+    change_bias: 1.875
+    loss_weight: 1.0
+  crafter_pose:
+    enabled: true
+    mode: learned_detached
+  ewc_enabled: true
+  compute_fisher: true
+  continue_learning: true
+  resume_optimizer: false
+  lambda_ewc: 10
+  fisher_samples: 1000
+  fisher_beta: 0.3
+  scale_factor: 1.0
+  fisher_buffer_size: 500000
+  current_sample_ratio: 0.7
+  fisher_buffer_elements_ratio: 0.8
+  replay_frac: 0.8
+  crafter_transition_replay:
+    enabled: true
+    balance_exponent: 0.35
+    inventory_replay_fraction: 0.25
+    include_action: true
+    include_changed_slot: true
+    protected_slot_replay:
+      enabled: true
+      min_samples_per_observed_slot: 32
+  fisher_slot_stratified:
+    enabled: true
+    min_samples_per_observed_slot: 16
+  dr_validation_archive: null
+  max_validation_samples: 0
+  validation_sample_from_full_dataset: false
+  validation_subset_seed: ${seed}
+  checkpoint_metric: val/observation_loss
+  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/dr_preppo_1149_attention_world_model_crafter_none_seed${seed}.ckpt
+
+dr_log_dir: ${paths.results}/dr_preppo_1149/
+dr_temp_data_dir: ${oc.env:TRAINER_PATH}/data/crafter/mini_tasks_temp/dr_preppo_1149/
+
+env:
+  collect:
+    env_visualize_save_path: ${domains.crafter.env_visualize_folder}collection/seed${seed}/
+    visualize_save_path: ${domains.crafter.dataset_visualize_folder}
+

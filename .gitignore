@@ -35,3 +35,5 @@ trainer/*.png
 trainer/experiments_visualization.ipynb
 my_research_project.egg-info/
 trainer/experiments_visualization.ipynb
+Curriculum_Learning_World_Models_AAMAS_2027_without_bipedal_continual_appendix/
+trainer/data

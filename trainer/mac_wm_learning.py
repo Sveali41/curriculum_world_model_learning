@@ -348,6 +348,7 @@ def adversarial_ued_training(cfg: DictConfig):
             "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
             "gen_val_val_inv_loss", "gen_val_val_ce_loss", "gen_val_avg_val_loss_wm",
             "target_val_val_inv_loss", "target_val_val_ce_loss", "target_val_avg_val_loss_wm",
+            "target_val_changed_nll", "target_val_changed_count",
             "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len", "Inv_Change_Ratio",
         ]
 
@@ -853,6 +854,8 @@ def adversarial_ued_training(cfg: DictConfig):
         target_val_changed_focal_loss = 0.0
         target_val_false_set_rate = 0.0
         target_val_changed_count = 0.0
+        target_val_crafter_changed_nll = 0.0
+        target_val_crafter_changed_count = 0.0
         # Validation policy:
         # 1. Skip validation during early warmup to save time.
         # 2. Validate every step afterward to track progress.
@@ -875,6 +878,8 @@ def adversarial_ued_training(cfg: DictConfig):
             target_changed_focal_losses = []
             target_false_set_rates = []
             target_changed_counts = []
+            target_crafter_changed_nlls = []
+            target_crafter_changed_counts = []
             
             # Temporarily switch to validation mode.
             old_freeze = cfg.attention_model.freeze_weight
@@ -915,6 +920,8 @@ def adversarial_ued_training(cfg: DictConfig):
                     elif not is_minigrid:
                         target_ce_losses.append(res_dict.get('terrain_loss', 0.0))
                         target_inv_losses.append(res_dict.get('inventory_loss', 0.0))
+                        target_crafter_changed_nlls.append(res_dict.get('changed_nll', 0.0))
+                        target_crafter_changed_counts.append(res_dict.get('changed_count', 0.0))
             
             # Restore configuration values.
             cfg.attention_model.freeze_weight = old_freeze
@@ -931,7 +938,15 @@ def adversarial_ued_training(cfg: DictConfig):
                 elif not is_minigrid:
                     target_val_val_ce_loss = float(np.mean(target_ce_losses))
                     target_val_val_inv_loss = float(np.mean(target_inv_losses))
-                    print(f"[Metrics] Combined Target Loss -> Total: {target_val_avg_val_loss_wm:.4f} | Terrain: {target_val_val_ce_loss:.4f}")
+                    target_val_crafter_changed_nll = float(np.mean(target_crafter_changed_nlls)) if target_crafter_changed_nlls else 0.0
+                    target_val_crafter_changed_count = float(np.mean(target_crafter_changed_counts)) if target_crafter_changed_counts else 0.0
+                    print(
+                        f"[Metrics] Combined Target Loss -> Total: "
+                        f"{target_val_avg_val_loss_wm:.4f} | "
+                        f"Terrain: {target_val_val_ce_loss:.4f} | "
+                        f"Changed NLL: {target_val_crafter_changed_nll:.4f} | "
+                        f"Changed Count: {target_val_crafter_changed_count:.0f}"
+                    )
                 else:
                     target_val_focal_loss = float(np.mean(target_focal_losses)) if target_focal_losses else 0.0
                     target_val_changed_focal_loss = float(np.mean(target_changed_focal_losses)) if target_changed_focal_losses else 0.0
@@ -961,6 +976,8 @@ def adversarial_ued_training(cfg: DictConfig):
                 elif not is_minigrid:
                     target_val_val_ce_loss = 0.0
                     target_val_val_inv_loss = 0.0
+                    target_val_crafter_changed_nll = 0.0
+                    target_val_crafter_changed_count = 0.0
         else:
             target_val_avg_val_loss_wm = 0.0
             if is_bipedal:
@@ -969,6 +986,8 @@ def adversarial_ued_training(cfg: DictConfig):
             elif not is_minigrid:
                 target_val_val_ce_loss = 0.0
                 target_val_val_inv_loss = 0.0
+                target_val_crafter_changed_nll = 0.0
+                target_val_crafter_changed_count = 0.0
 
         # --------------------------------------------------------
         # Step 6: Write the experiment summary CSV
@@ -1103,6 +1122,8 @@ def adversarial_ued_training(cfg: DictConfig):
                                 "target_val_val_inv_loss": f"{target_val_val_inv_loss:.6f}",
                                 "target_val_val_ce_loss": f"{target_val_val_ce_loss:.6f}",
                                 "target_val_avg_val_loss_wm": f"{target_val_avg_val_loss_wm:.6f}",
+                                "target_val_changed_nll": f"{target_val_crafter_changed_nll:.6f}",
+                                "target_val_changed_count": f"{target_val_crafter_changed_count:.2f}",
                                 "New_Data_Size": new_data_size,
                                 "Buffer_Size": len(fisher_buffer),
                                 "Solvable_Count": f"{gen_solvable_count}",

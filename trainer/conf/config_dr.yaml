@@ -6,12 +6,12 @@ defaults:
   - _self_
 
 # --- Control Switch ---
-domain: 'minigrid'             # Options: 'crafter' or 'minigrid' or 'bipedal'
+domain: 'crafter'             # Options: 'crafter' or 'minigrid' or 'bipedal'
 
 # --- Force Random Exploration (DR core) ---
 generator_agent:
   agent_type: 'random'         # No adversarial, just random maps
-  total_iterations: 50 # 30 minigrid 50 bipedal 
+  total_iterations: 100 # 30 minigrid 50 bipedal
   wm_train_frequency: 1
   warmup_iterations: 0         # No need to warm up random
 
@@ -19,11 +19,51 @@ generator_agent:
 dr_log_dir: ${paths.results}/dr/
 dr_temp_data_dir: ${domains.${domain}.mini_tasks_temp_root}dr/
 
-# Keep DR checkpoints separate from MAC and other baselines.
+# Keep DR checkpoints separate from MAC and other baselines. Architecture and
+# loss details remain in checkpoint metadata and CSV logs, not the filename.
 attention_model:
+  seed: ${seed}
   model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/dr_attention_world_model_${domain}_${ablation.type}_seed${seed}.ckpt
+  continue_learning: true
+  ewc_enabled: true
+  compute_fisher: true
+  # Preserve the domain-specific EWC strength from the shared config.
+  lambda_ewc: ${domains.${domain}.lambda_ewc}
+  fisher_samples: 1000
+  fisher_beta: 0.3
+  scale_factor: 1.0
+  # Crafter DR only: retain observed interaction outcomes and softly rebalance
+  # historical replay. Other domains leave this opt-in path disabled in code.
+  crafter_transition_replay:
+    enabled: true
+    balance_exponent: 0.35
+    # Reserve a quarter of historical replay for observed inventory changes.
+    # This changes replay composition only; current-iteration collection and
+    # the action distribution remain untouched.
+    inventory_replay_fraction: 0.25
+    include_action: true
+    # Keep rare observed item changes distinct from common wood/stone changes.
+    # This affects historical replay only; collection remains uniformly random.
+    include_changed_slot: true
+    protected_slot_replay:
+      enabled: true
+      min_samples_per_observed_slot: 32
+  fisher_slot_stratified:
+    enabled: true
+    min_samples_per_observed_slot: 16
+  # Optional fixed non-target holdout. Keep disabled for the initial loss
+  # ablation so DR uses its historical internal 90/10 validation split.
+  dr_validation_archive: null
+  max_validation_samples: 0
+  validation_sample_from_full_dataset: false
+  validation_subset_seed: ${seed}
+  checkpoint_metric: val/observation_loss
 
 domains:
+  crafter:
+    # DR validation uses the newly collected controlled coverage benchmark.
+    # Keep the shared MAC/default Crafter suffix on the legacy uniform data.
+    val_suffix: "_coverage_v3.npz"
   minigrid:
     rmax_like:
       backend: ppo
@@ -34,5 +74,5 @@ env:
   collect:
     env_visualize_save_path: ${domains.${domain}.env_visualize_folder}dr/${ablation.type}/seed${seed}/
 
-seed: 1
+seed: 0
 force_fresh_start: true         # Set to true to delete old model and start from scratch

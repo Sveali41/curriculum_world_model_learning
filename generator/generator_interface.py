@@ -254,6 +254,14 @@ class GeneratorInterface:
                 "device": self.device,
                 "env_type": env_type,
             }
+            if self.is_crafter:
+                crafter_cfg = getattr(getattr(cfg, "domains", None), "crafter", None)
+                reward_cfg = getattr(crafter_cfg, "reward", None)
+                diversity_kwargs.update({
+                    "crafter_map_weight": float(getattr(reward_cfg, "map_edit_novelty", 1.0)),
+                    "crafter_start_weight": float(getattr(reward_cfg, "start_position_novelty", 0.1)),
+                    "crafter_inventory_weight": float(getattr(reward_cfg, "inventory_novelty", 0.2)),
+                })
             if self.is_minigrid:
                 cuda_devices = []
                 diversity_device = torch.device(self.device)

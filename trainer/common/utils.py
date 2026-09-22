@@ -26,6 +26,26 @@ MINIGRID_VAL_LOSS_FIELDS = (
     "inventory_nll",
 )
 
+CRAFTER_INVENTORY_VAL_METRICS = (
+    "inventory_overall_accuracy",
+    # Legacy categorical_gate checkpoints retain these names.
+    "inventory_gate_change_recall",
+    "inventory_gate_change_precision",
+    "inventory_gate_false_positive_rate",
+    "inventory_gate_row_exact",
+    "inventory_changed_accuracy",
+    "survival_changed_accuracy",
+    "item_value_accuracy_on_changed",
+    # Unified categorical_effect checkpoints log these independently.  Do
+    # not substitute the gate fields: absent mode-specific fields remain 0.
+    "inventory_effect_change_recall",
+    "inventory_effect_change_precision",
+    "inventory_effect_false_positive_rate",
+    "inventory_effect_row_exact",
+    "item_effect_accuracy_on_changed",
+    *tuple(f"inventory_slot_{slot}_changed_count" for slot in range(16)),
+)
+
 
 def minigrid_changed_fraction(samples):
     """Return the fraction of transitions with any observed state change."""
@@ -572,6 +592,27 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
                 validation_cfg.env.collect.minigrid_interaction_fraction = float(
                     metadata.get("interaction_fraction", 0.0)
                 )
+            # Crafter controlled coverage archives use a controlled one-step
+            # collection protocol rather than the live DR/random collector.
+            # Align only this isolated validation config with the archive so
+            # the strict dataset identity check compares the same protocol
+            # and episode horizon.  Keep the caller's config unchanged.
+            collection_policy = str(metadata.get("collection_policy", "")).lower()
+            if selected_domain == "crafter" and (
+                "coverage_v2" in collection_policy or "coverage_v3" in collection_policy
+            ):
+                validation_cfg.env.collect.data_type = (
+                    "coverage_v3" if "coverage_v3" in collection_policy else "coverage_v2"
+                )
+                episode_max_steps = metadata.get("episode_max_steps")
+                if episode_max_steps is not None:
+                    episode_max_steps = int(episode_max_steps)
+                    if "data_collection" not in domain_cfg:
+                        domain_cfg.data_collection = {
+                            "max_steps": episode_max_steps,
+                        }
+                    else:
+                        domain_cfg.data_collection.max_steps = episode_max_steps
 
     losses = []
     inv_losses = []
@@ -586,6 +627,9 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
     minigrid_changed_focal_losses = []
     minigrid_false_set_rates = []
     minigrid_changed_counts = []
+    crafter_changed_nlls = []
+    crafter_changed_counts = []
+    crafter_inventory_metrics = {name: [] for name in CRAFTER_INVENTORY_VAL_METRICS}
 
     for v in range(VALID_TIMES):
         # train_api in validation mode returns a dict where "avg_val_loss" holds the Lightning metrics
@@ -632,6 +676,11 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
                 metric_name = f"val/{name}"
                 if metric_name in metrics:
                     minigrid_field_losses[name].append(float(metrics[metric_name]))
+        elif is_crafter:
+            crafter_changed_nlls.append(float(metrics.get("val/changed_nll", 0.0)))
+            crafter_changed_counts.append(float(metrics.get("val/changed_count", 0.0)))
+            for name in CRAFTER_INVENTORY_VAL_METRICS:
+                crafter_inventory_metrics[name].append(float(metrics.get(f"val/{name}", 0.0)))
 
         del model
         torch.cuda.empty_cache()
@@ -643,6 +692,10 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
     if is_crafter:
         result['terrain_loss'] = float(np.mean(terrain_losses))
         result['inventory_loss'] = float(np.mean(inv_losses))
+        result['changed_nll'] = float(np.mean(crafter_changed_nlls)) if crafter_changed_nlls else 0.0
+        result['changed_count'] = float(np.mean(crafter_changed_counts)) if crafter_changed_counts else 0.0
+        for name, values in crafter_inventory_metrics.items():
+            result[name] = float(np.mean(values)) if values else 0.0
     if is_bipedal:
         result['contact_acc'] = float(np.mean(contact_accs))
         result['contact_bce'] = float(np.mean(contact_bces))
@@ -685,6 +738,9 @@ def validate_on_all_targets(
     minigrid_changed_focal_losses = []
     minigrid_false_set_rates = []
     minigrid_changed_counts = []
+    crafter_changed_nlls = []
+    crafter_changed_counts = []
+    crafter_inventory_metrics = {name: [] for name in CRAFTER_INVENTORY_VAL_METRICS}
     per_target = {}
     valid_count = 0
     is_bipedal = (getattr(cfg.attention_model, "env_type", "") == "bipedalwalker")
@@ -730,16 +786,24 @@ def validate_on_all_targets(
                 minigrid_changed_focal_losses.append(float(res.get("changed_focal_loss", 0.0)))
                 minigrid_false_set_rates.append(float(res.get("false_set_rate", 0.0)))
                 minigrid_changed_counts.append(float(res.get("changed_count", 0.0)))
+            elif is_crafter:
+                crafter_changed_nlls.append(float(res.get("changed_nll", 0.0)))
+                crafter_changed_counts.append(float(res.get("changed_count", 0.0)))
+                for name in CRAFTER_INVENTORY_VAL_METRICS:
+                    crafter_inventory_metrics[name].append(float(res.get(name, 0.0)))
             per_target[task_base] = {
                 "avg_val_loss_wm": l_val,
                 "focal_loss": float(res.get("focal_loss", 0.0)),
                 "changed_focal_loss": float(res.get("changed_focal_loss", 0.0)),
                 "false_set_rate": float(res.get("false_set_rate", 0.0)),
                 "changed_count": float(res.get("changed_count", 0.0)),
+                "changed_nll": float(res.get("changed_nll", 0.0)),
                 "terrain_loss": ce_or_terrain,
                 "inventory_loss": inv_val,
                 "contact_acc": c_acc,
                 "contact_bce": c_bce,
+                **({name: float(res.get(name, 0.0)) for name in CRAFTER_INVENTORY_VAL_METRICS}
+                   if is_crafter else {}),
             }
             valid_count += 1
     finally:
@@ -754,6 +818,10 @@ def validate_on_all_targets(
     if is_crafter:
         result["terrain_loss"] = float(np.mean(terrain_losses)) if valid_count > 0 else 0.0
         result["inventory_loss"] = float(np.mean(inv_losses)) if valid_count > 0 else 0.0
+        result["changed_nll"] = float(np.mean(crafter_changed_nlls)) if crafter_changed_nlls else 0.0
+        result["changed_count"] = float(np.mean(crafter_changed_counts)) if crafter_changed_counts else 0.0
+        for name, values in crafter_inventory_metrics.items():
+            result[name] = float(np.mean(values)) if values else 0.0
     elif is_bipedal:
         result["contact_acc"] = float(np.mean(contact_accs)) if valid_count > 0 else 0.0
         result["contact_bce"] = float(np.mean(contact_bces)) if valid_count > 0 else 0.0

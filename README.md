@@ -190,7 +190,7 @@ The table below links each experiment family to the exact command and the expect
 | MAC | `domain=crafter` | `python trainer/mac_wm_learning.py domain=crafter seed=0` | `outputs/results/mac/crafter_ued_results_mask*.csv` |
 | MAC | `domain=minigrid` | `python trainer/mac_wm_learning.py domain=minigrid seed=0` | `outputs/results/mac/minigrid_ued_results_mask*.csv` |
 | MAC | `domain=bipedalwalker` | `python trainer/mac_wm_learning.py domain=bipedalwalker seed=0` | `outputs/results/mac/bipedalwalker_ued_results*.csv` |
-| DR | `domain=crafter` | `python trainer/dr_baseline_experiment.py domain=crafter seed=0` | `outputs/results/dr/dr_summary_crafter_mask*.csv` |
+| DR-EWC (balanced inventory) | `domain=crafter` | `python trainer/dr_baseline_experiment.py domain=crafter seed=0` | `outputs/results/dr/dr_summary_crafter_mask5_ewc_balanced_inventory.csv` |
 | DR | `domain=minigrid` | `python trainer/dr_baseline_experiment.py domain=minigrid seed=0` | `outputs/results/dr/dr_summary_minigrid_mask*.csv` |
 | DR | `domain=bipedalwalker` | `python trainer/dr_baseline_experiment.py domain=bipedalwalker seed=0` | `outputs/results/dr/dr_summary_bipedalwalker_mask*.csv` |
 | Target baseline | `domain=crafter` | `python trainer/target_baseline_experiment.py domain=crafter seed=0` | `outputs/results/target_baseline/target_baseline_crafter_mask*.csv` |

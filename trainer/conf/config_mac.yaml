@@ -38,6 +38,8 @@ domains:
     target_tasks_folder: ${oc.env:TRAINER_PATH}/data/crafter/target_tasks/
     target_task_prefix: "crafter_target_task_"
     target_task_suffix: "_uniform.npz"
+    coverage_v2_target_task_suffix: "_coverage_v2.npz"
+    coverage_v3_target_task_suffix: "_coverage_v3.npz"
     target_task_start_idx: 1
     target_task_count: 20
     mini_tasks_temp_root: ${oc.env:TRAINER_PATH}/data/crafter/mini_tasks_temp/
@@ -47,6 +49,33 @@ domains:
     color_elements: {}
     data_type: discrete
     use_bipedal_attention: false
+    predict_survival: false
+    target_collection:
+      samples_per_target: 12500
+      seed: ${seed}
+      version: coverage_v3
+      output_dir: ${oc.env:TRAINER_PATH}/data/crafter/target_tasks
+    observation_schema:
+      - {name: layout_object_effect, distribution: categorical_effect, prediction_slice: [0, 21], target_index: 0, classes: 20, label_smoothing: 0.0}
+      - {name: layout_direction_effect, distribution: categorical_effect, prediction_slice: [21, 27], target_index: 1, classes: 5, label_smoothing: 0.0}
+      - {name: inventory, distribution: categorical_inventory_effect, prediction_source: auxiliary, target_source: inventory, target_mode: categorical_effect, classes: 10, effect_classes: 5}
+    # Authoritative Crafter WM settings recovered from the run that produced
+    # dr_attention_world_model_crafter_none_seed0_best.ckpt.
+    crafter_wm:
+      inventory_value_mode: categorical_delta
+      inventory_output_mode: categorical_effect
+      inventory_effect_reduction: sqrt_balanced
+      inventory_architecture: shared_pool_v1
+      event_residual:
+        enabled: true
+        hidden_dims: [64]
+        action_embed_dim: 8
+        change_bias: 1.875
+        loss_weight: 1.0
+      pose:
+        enabled: true
+        mode: learned_detached
+      artifact_suffix: _effect5sqrt_pose_eventresidual64
     # Data collection budget for MAC/DR (per training iteration).
     # Runtime will split this by generator_batch_size to get per-rollout max transitions.
     iter_transition_budget: 8000
@@ -54,12 +83,15 @@ domains:
     max_edits_layout: 0.3
     max_edits_inventory: 0.8
     replay_frac: 0.8
-    lambda_ewc: 20 #20000.0
+    lambda_ewc: 10 #20000.0
     validation_metric: "mse"
     reward:
       ce: 6.0
       inv: 3.0
       div: 1
+      map_edit_novelty: 1.0
+      start_position_novelty: 0.1
+      inventory_novelty: 0.2
       inv_change: 2
       layout_change: 0         # Auxiliary reward for dynamic terrain interactions
       inv_change_norm_slots: 3.0
@@ -69,6 +101,7 @@ domains:
   minigrid:
     h: 8
     w: 8
+    focal_gamma: 1.0
     # Use ordinary closed doors only; locked-door actions/maps are disabled.
     locked_doors: false
     # Real-environment acquisition policy shared by MAC and DR generated tasks.
@@ -167,6 +200,23 @@ domains:
     replay_frac: 1
     lambda_ewc: 0.5 # larger-> protect old memory and smaller-> new knowledge
     validation_metric: "mse_weighted"
+    # Non-Crafter domains keep inert defaults so the shared WM interpolation
+    # remains resolvable without changing their model behavior.
+    crafter_wm:
+      inventory_value_mode: categorical_absolute
+      inventory_output_mode: categorical_gate
+      inventory_effect_reduction: balanced_mean
+      inventory_architecture: shared_pool_v1
+      event_residual:
+        enabled: false
+        hidden_dims: [64]
+        action_embed_dim: 8
+        change_bias: 1.875
+        loss_weight: 1.0
+      pose:
+        enabled: false
+        mode: learned_detached
+      artifact_suffix: ""
     reward:
       # Reward held-out WM learning progress plus layout diversity.
       learning_progress: 1.0
@@ -203,6 +253,21 @@ domains:
     replay_frac: 0.7
     lambda_ewc: 0.05
     validation_metric: "mse"
+    crafter_wm:
+      inventory_value_mode: categorical_absolute
+      inventory_output_mode: categorical_gate
+      inventory_effect_reduction: balanced_mean
+      inventory_architecture: shared_pool_v1
+      event_residual:
+        enabled: false
+        hidden_dims: [64]
+        action_embed_dim: 8
+        change_bias: 1.875
+        loss_weight: 1.0
+      pose:
+        enabled: false
+        mode: learned_detached
+      artifact_suffix: ""
     reward:
       contact_bce: 1
       total_loss: 1.0
@@ -288,6 +353,13 @@ attention_model:
   obs_norm_values: ${domains.${domain}.obs_norm}
   action_norm_values: ${domains.${domain}.action_norm}
   observation_schema: ${domains.${domain}.observation_schema}
+  predict_survival: ${oc.select:domains.${domain}.predict_survival,true}
+  crafter_inventory_value_mode: ${domains.${domain}.crafter_wm.inventory_value_mode}
+  crafter_inventory_output_mode: ${domains.${domain}.crafter_wm.inventory_output_mode}
+  crafter_inventory_effect_reduction: ${domains.${domain}.crafter_wm.inventory_effect_reduction}
+  crafter_inventory_architecture: ${domains.${domain}.crafter_wm.inventory_architecture}
+  crafter_inventory_event_residual: ${domains.${domain}.crafter_wm.event_residual}
+  crafter_pose: ${domains.${domain}.crafter_wm.pose}
   valid_values_obj: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
   valid_values_color: [0, 1, 2, 3, 4, 5]
   valid_values_state: [0, 1, 2, 3]
@@ -303,10 +375,10 @@ attention_model:
   debug_mode: False
   keep_cell_loss: false
   target_validation_keep_cell_loss: false
-  # Each target archive contains 30k transitions. MAC evaluates the same fixed
-  # random 1k-transition subset on every iteration (20 targets -> 20k samples).
+  # MAC evaluates the same fixed 500-transition subset from each target on
+  # every iteration (20 targets -> 10k validation samples).
   # Set to 0 to restore validation on the complete target archive.
-  target_validation_max_samples: 1000
+  target_validation_max_samples: 500
   target_validation_seed: 0
   target_validation_batch_size: 256
   frame_stack: 1
@@ -322,13 +394,13 @@ attention_model:
   save_path: ${paths.visualizations}/world_model
   direction_map: {0: 'right', 1: 'down', 2: 'left', 3: 'up'}
   action_map: {0: 'left', 1: 'right', 2: 'forward', 3: 'pickup', 4: 'toggle', 5: 'drop'}
-  minigrid_transition_mode: ${domains.${domain}.minigrid_transition_mode}
+  minigrid_transition_mode: ${oc.select:domains.${domain}.minigrid_transition_mode,absolute}
   # Natural per-cell likelihood is safer for open-loop MiniGrid rollout: rare
   # CHANGE cells no longer receive the same total weight as all KEEP cells.
   effect_reduction: mean
   # Per-cell focal modulation suppresses already-correct KEEP predictions
   # without assigning semantic weights to any MiniGrid object type.
-  focal_gamma: 1.0
+  focal_gamma: ${oc.select:domains.${domain}.focal_gamma,0.0}
   # Replay is sampled uniformly from the reservoir; do not rebalance by
   # action/change buckets.
   transition_balanced_sampling: false

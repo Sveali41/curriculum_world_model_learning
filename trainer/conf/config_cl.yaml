@@ -50,7 +50,7 @@ domains:
 # Override core params for CL stability
 seed: 0
 attention_model:
-  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/cl_attention_world_model_${domain}_${ablation.type}_seed${seed}.ckpt
+  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/cl_attention_world_model_${domain}_${ablation.type}${domains.${domain}.crafter_wm.artifact_suffix}_seed${seed}.ckpt
   n_epochs: 15
   batch_size: 256
   continue_learning: true      # Ensure EWC is active
