@@ -24,7 +24,7 @@ from modelBased.world_model.AttentionWM import AttentionWorldModel
 from modelBased.world_model import AttentionWM_training
 from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
 from modelBased.common.artifacts import align_world_model_artifact_path
-from modelBased.policy_training.PPO import PPO
+from modelBased.policy_training.ppo.PPO import PPO
 from modelBased.common.support import Support
 from domain.minigrid import minigrid_support as minigrid_utils
 from domain.minigrid.minigrid_support import ColRowCanl_to_CanlRowCol
