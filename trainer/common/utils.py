@@ -26,6 +26,16 @@ MINIGRID_VAL_LOSS_FIELDS = (
     "inventory_nll",
 )
 
+
+# Aggregate MiniGrid validation values persisted by every baseline CSV.
+MINIGRID_TARGET_VAL_METRICS = (
+    "valid_count",
+    "focal_loss",
+    "changed_focal_loss",
+    "false_set_rate",
+    "changed_count",
+)
+
 CRAFTER_INVENTORY_VAL_METRICS = (
     "inventory_overall_accuracy",
     # Legacy categorical_gate checkpoints retain these names.
@@ -46,6 +56,19 @@ CRAFTER_INVENTORY_VAL_METRICS = (
     *tuple(f"inventory_slot_{slot}_changed_count" for slot in range(16)),
 )
 
+
+CRAFTER_FOCAL_VAL_METRICS = (
+    "changed_focal_loss",
+    "layout_changed_focal_loss", "layout_false_set_rate", "layout_changed_count",
+    "inventory_changed_focal_loss", "inventory_false_set_rate", "inventory_changed_count",
+    "joint_accuracy", "position_accuracy", "direction_accuracy",
+)
+
+CRAFTER_FOCAL_LOSS_COUNTS = {
+    "changed_focal_loss": "changed_count",
+    "layout_changed_focal_loss": "layout_changed_count",
+    "inventory_changed_focal_loss": "inventory_changed_count",
+}
 
 def minigrid_changed_fraction(samples):
     """Return the fraction of transitions with any observed state change."""
@@ -630,6 +653,7 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
     crafter_changed_nlls = []
     crafter_changed_counts = []
     crafter_inventory_metrics = {name: [] for name in CRAFTER_INVENTORY_VAL_METRICS}
+    crafter_focal_metrics = {name: [] for name in CRAFTER_FOCAL_VAL_METRICS}
 
     for v in range(VALID_TIMES):
         # train_api in validation mode returns a dict where "avg_val_loss" holds the Lightning metrics
@@ -681,6 +705,13 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
             crafter_changed_counts.append(float(metrics.get("val/changed_count", 0.0)))
             for name in CRAFTER_INVENTORY_VAL_METRICS:
                 crafter_inventory_metrics[name].append(float(metrics.get(f"val/{name}", 0.0)))
+            for name in CRAFTER_FOCAL_VAL_METRICS:
+                value = metrics.get(f"val/{name}")
+                count_name = CRAFTER_FOCAL_LOSS_COUNTS.get(name)
+                count = metrics.get(f"val/{count_name}") if count_name else None
+                if (value is not None and np.isfinite(float(value))
+                        and (count_name is None or (count is not None and float(count) > 0))):
+                    crafter_focal_metrics[name].append(float(value))
 
         del model
         torch.cuda.empty_cache()
@@ -696,6 +727,8 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
         result['changed_count'] = float(np.mean(crafter_changed_counts)) if crafter_changed_counts else 0.0
         for name, values in crafter_inventory_metrics.items():
             result[name] = float(np.mean(values)) if values else 0.0
+        for name, values in crafter_focal_metrics.items():
+            result[name] = float(np.mean(values)) if values else float("nan")
     if is_bipedal:
         result['contact_acc'] = float(np.mean(contact_accs))
         result['contact_bce'] = float(np.mean(contact_bces))
@@ -741,6 +774,7 @@ def validate_on_all_targets(
     crafter_changed_nlls = []
     crafter_changed_counts = []
     crafter_inventory_metrics = {name: [] for name in CRAFTER_INVENTORY_VAL_METRICS}
+    crafter_focal_metrics = {name: [] for name in CRAFTER_FOCAL_VAL_METRICS}
     per_target = {}
     valid_count = 0
     is_bipedal = (getattr(cfg.attention_model, "env_type", "") == "bipedalwalker")
@@ -791,6 +825,13 @@ def validate_on_all_targets(
                 crafter_changed_counts.append(float(res.get("changed_count", 0.0)))
                 for name in CRAFTER_INVENTORY_VAL_METRICS:
                     crafter_inventory_metrics[name].append(float(res.get(name, 0.0)))
+                for name in CRAFTER_FOCAL_VAL_METRICS:
+                    value = res.get(name)
+                    count_name = CRAFTER_FOCAL_LOSS_COUNTS.get(name)
+                    count = res.get(count_name) if count_name else None
+                    if (value is not None and np.isfinite(float(value))
+                            and (count_name is None or (count is not None and float(count) > 0))):
+                        crafter_focal_metrics[name].append(float(value))
             per_target[task_base] = {
                 "avg_val_loss_wm": l_val,
                 "focal_loss": float(res.get("focal_loss", 0.0)),
@@ -803,6 +844,8 @@ def validate_on_all_targets(
                 "contact_acc": c_acc,
                 "contact_bce": c_bce,
                 **({name: float(res.get(name, 0.0)) for name in CRAFTER_INVENTORY_VAL_METRICS}
+                   if is_crafter else {}),
+                **({name: float(res.get(name, float("nan"))) for name in CRAFTER_FOCAL_VAL_METRICS}
                    if is_crafter else {}),
             }
             valid_count += 1
@@ -822,6 +865,8 @@ def validate_on_all_targets(
         result["changed_count"] = float(np.mean(crafter_changed_counts)) if crafter_changed_counts else 0.0
         for name, values in crafter_inventory_metrics.items():
             result[name] = float(np.mean(values)) if values else 0.0
+        for name, values in crafter_focal_metrics.items():
+            result[name] = float(np.mean(values)) if values else float("nan")
     elif is_bipedal:
         result["contact_acc"] = float(np.mean(contact_accs)) if valid_count > 0 else 0.0
         result["contact_bce"] = float(np.mean(contact_bces)) if valid_count > 0 else 0.0

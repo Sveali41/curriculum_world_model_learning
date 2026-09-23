@@ -345,14 +345,26 @@ class MapEditorActorCritic(nn.Module):
         location_entropy = location_entropy / step_count.clamp_min(1.0)
         return location_logprob, location_entropy
 
+    @staticmethod
+    def _crafter_editable_stats_mask(device):
+        # 32 decisions: +1 bank 0:16 and +5 bank 16:32. Slots 0:4 are
+        # tracker-owned survival state, outside Crafter WM output/loss.
+        mask = torch.ones(32, device=device, dtype=torch.bool)
+        mask[0:4] = False
+        mask[16:20] = False
+        return mask
+
     def _get_stats_topk_mask(self, logits_stats, max_stats_edit_ratio):
         B, N, _ = logits_stats.shape
+        eligible = self._crafter_editable_stats_mask(logits_stats.device)
+        if N != eligible.numel():
+            raise ValueError(f"Crafter stats head must have {eligible.numel()} decisions, got {N}")
         prob_click = torch.softmax(logits_stats, dim=-1)[:, :, 1]
-        
-        # Calculate dynamic k from ratio (e.g. 0.1 * 32 slots = 3.2 -> 3)
-        k = max(1, min(int(round(max_stats_edit_ratio * N)), N))
-        
-        _, topk_indices = torch.topk(prob_click, k=k, dim=-1)
+        # The edit budget is defined over the 24 item decisions, not all 32.
+        eligible_count = int(eligible.sum().item())
+        k = max(1, min(int(round(max_stats_edit_ratio * eligible_count)), eligible_count))
+        masked_prob = prob_click.masked_fill(~eligible.unsqueeze(0), -float("inf"))
+        _, topk_indices = torch.topk(masked_prob, k=k, dim=-1)
         mask = torch.zeros_like(prob_click, dtype=torch.bool)
         mask.scatter_(1, topk_indices, True)
         return mask
@@ -427,8 +439,13 @@ class MapEditorActorCritic(nn.Module):
             # logits_stats[:, :, 0].masked_fill_(~topk_stats_mask, 1e9)
             # logits_stats[:, :, 1].masked_fill_(~topk_stats_mask, -1e9)
             stats_dist = Categorical(logits=logits_stats)
-            stats_action = stats_dist.sample()
-            stats_logprob = stats_dist.log_prob(stats_action).sum(dim=-1)
+            # Keep the historical independent Bernoulli-style sampling over
+            # all item decisions. Top-k remains a diagnostic only; survival
+            # decisions are the sole actions removed from PPO's action space.
+            editable_stats = self._crafter_editable_stats_mask(map_vec.device)
+            sampled_stats_action = stats_dist.sample()
+            stats_action = sampled_stats_action.masked_fill(~editable_stats.unsqueeze(0), 0)
+            stats_logprob = (stats_dist.log_prob(stats_action) * editable_stats.unsqueeze(0)).sum(dim=-1)
 
         value = self.critic(critic_features)
         return (
@@ -529,8 +546,12 @@ class MapEditorActorCritic(nn.Module):
             #     logits_stats[:, :, 0].masked_fill_(~target_stats_topk_mask, 1e9)
             #     logits_stats[:, :, 1].masked_fill_(~target_stats_topk_mask, -1e9)
             stats_dist = Categorical(logits=logits_stats)
-            stats_logprobs = stats_dist.log_prob(stats_action).sum(dim=-1)
-            stats_entropy = stats_dist.entropy().mean()
+            # Match act(): top-k is diagnostic, while all 24 editable item
+            # decisions contribute to PPO likelihood and entropy.
+            active = self._crafter_editable_stats_mask(logits.device).unsqueeze(0).expand(B, -1)
+            stats_logprobs = (stats_dist.log_prob(stats_action) * active).sum(dim=-1)
+            active_float = active.to(dtype=logits.dtype)
+            stats_entropy = (stats_dist.entropy() * active_float).sum() / active_float.sum().clamp_min(1.0)
 
         value = self.critic(critic_features)
         total_entropy = dist_entropy + stats_entropy

@@ -321,9 +321,18 @@ class GeneratorInterface:
         self.minigrid_lp_probe_size = max(
             1, int(math.ceil(lp_probe_budget / max(self.batch_size, 1)))
         )
+        crafter_domain_cfg = getattr(getattr(cfg, "domains", None), "crafter", None)
+        crafter_lp_probe_budget = int(
+            getattr(crafter_domain_cfg, "learning_progress_probe_budget", 1000)
+        )
+        self.crafter_lp_probe_size = max(
+            1, int(math.ceil(crafter_lp_probe_budget / max(self.batch_size, 1)))
+        )
         self.last_minigrid_metrics = {}
+        self.last_crafter_metrics = {}
         self.last_generated_minigrid_batch = None
         self._pending_minigrid_round = None
+        self._pending_crafter_round = None
         self.last_minigrid_map_diagnostics = []
         self.last_generator_update_metrics = {}
         diagnostics_cfg = getattr(cfg, "diagnostics", None)
@@ -452,10 +461,14 @@ class GeneratorInterface:
             current_stats = stats_actions[i] if stats_actions is not None else None
             if self.is_crafter and getattr(self.cfg.generator_agent, "random_stats_actions", False):
                 current_stats = (np.random.rand(32) < 0.15).astype(np.int64)
+                current_stats[0:4] = 0
+                current_stats[16:20] = 0
             if self.is_crafter and current_stats is not None:
                 for k_idx, value in enumerate(current_stats):
-                    if value == 1:
-                        slot = k_idx % 16
+                    slot = k_idx % 16
+                    # Invariant: survival slots are tracker-owned. Even a
+                    # malformed action request cannot alter them.
+                    if value == 1 and slot >= 4:
                         stats[slot] += 1 if k_idx < 16 else 5
             elif self.is_minigrid and current_stats is not None:
                 inventory_action = int(np.asarray(current_stats).reshape(-1)[0])
@@ -1200,6 +1213,64 @@ class GeneratorInterface:
         self._attach_minigrid_explorer_coverage()
         self._pending_minigrid_round = None
 
+    def _evaluate_crafter_changed_focal_losses(self, trajectories, valid, phase):
+        losses = np.full(self.batch_size, np.nan, dtype=np.float32)
+        for index, trajectory in enumerate(trajectories):
+            if not valid[index] or not trajectory:
+                continue
+            try:
+                losses[index] = float(self.wm.calc_crafter_changed_focal_loss(trajectory))
+            except Exception as exc:
+                print(f"[GeneratorInterface] {phase} Crafter probe failed for env {index}: {exc}")
+        return losses
+
+    @staticmethod
+    def _aggregate_crafter_learning_progress(pre_losses, post_losses):
+        pre = np.asarray(pre_losses, dtype=np.float32)
+        post = np.asarray(post_losses, dtype=np.float32)
+        valid = np.isfinite(pre) & np.isfinite(post)
+        if not valid.any():
+            return float("nan"), float("nan"), float("nan"), valid
+        return (float(pre[valid].mean()), float(post[valid].mean()),
+                float((pre[valid] - post[valid]).mean()), valid)
+
+    def finalize_crafter_learning_progress(self, apply_rewards=False):
+        """Finalize identical held-out Crafter probes after the WM update."""
+        pending = self._pending_crafter_round
+        if not self.is_crafter or pending is None:
+            return
+        valid = np.asarray(pending["valid"], dtype=bool)
+        pre = np.asarray(pending["pre_changed_focal_losses"], dtype=np.float32)
+        post = self._evaluate_crafter_changed_focal_losses(
+            pending["probe_trajectories"], valid, "Post-update"
+        )
+        _, _, learning_progress, paired = self._aggregate_crafter_learning_progress(pre, post)
+        self.last_crafter_metrics = {
+            "Learning_Progress": learning_progress,
+            "paired_probe_count": int(paired.sum()),
+        }
+        if apply_rewards:
+            # Never retain the provisional instantaneous CE/inventory reward.
+            # A valid probe without a scored change receives only the same
+            # diversity/inventory-change/bias auxiliary terms; only a finite
+            # identical pre/post pair contributes learning progress.
+            rewards = []
+            weight = float(getattr(self.crafter_reward_cfg, "learning_progress", 1.0))
+            reward_clip = float(getattr(self.crafter_reward_cfg, "clip", 100.0))
+            for index in range(self.batch_size):
+                if not valid[index]:
+                    reward = -5.0
+                else:
+                    reward = float(pending["auxiliary_rewards"][index])
+                    if paired[index]:
+                        reward += weight * float(pre[index] - post[index])
+                    reward = float(np.clip(reward, -reward_clip, reward_clip))
+                rewards.append(reward)
+            buffer_rewards = getattr(self.ppo, "buffer", {}).get("reward", [])
+            if buffer_rewards and len(buffer_rewards) >= self.batch_size:
+                buffer_rewards[-self.batch_size:] = rewards
+        self._pending_crafter_round = None
+
     def _normalize_base_map(self, grid):
         """
         Normalize environment layouts to a single-sample `[H, W]` integer array.
@@ -1515,7 +1586,11 @@ class GeneratorInterface:
             )
             traj, errors, raw_loss_val, solved = res_rollout[0], res_rollout[1], res_rollout[2], res_rollout[3]
             round_trajectories.append(traj)
-            if self.is_minigrid and traj and "obs" in traj:
+            if (self.is_minigrid or self.is_crafter) and traj and "obs" in traj:
+                probe_budget = (
+                    self.crafter_lp_probe_size if self.is_crafter
+                    else self.minigrid_lp_probe_size
+                )
                 probe_traj = self._rollout_combined(
                     final_map_obj,
                     final_stats,
@@ -1525,7 +1600,7 @@ class GeneratorInterface:
                     color_np=final_map_col,
                     state_np=final_map_state,
                     evaluate_wm=False,
-                    maximum_dataset_size=self.minigrid_lp_probe_size,
+                    maximum_dataset_size=probe_budget,
                 )[0]
             else:
                 probe_traj = {}
@@ -1632,6 +1707,24 @@ class GeneratorInterface:
                 "batch_nearest_hamming": batch_nearest_hamming,
                 "archive_nearest_hamming": archive_nearest_hamming,
                 "novelty_distance_std": novelty_distance_std,
+            }
+
+        elif self.is_crafter:
+            probe_valid_flags = [
+                valid and bool(probe) and "obs" in probe
+                for valid, probe in zip(valid_flags, probe_trajectories)
+            ]
+            pre_changed_focal_losses = self._evaluate_crafter_changed_focal_losses(
+                probe_trajectories, probe_valid_flags, "Pre-update"
+            )
+            self._pending_crafter_round = {
+                "probe_trajectories": probe_trajectories,
+                "valid": probe_valid_flags,
+                "pre_changed_focal_losses": pre_changed_focal_losses,
+                # The random DR path never applies these rewards, while MAC
+                # replaces its provisional reward after the WM update.
+                "rewards": [0.0] * self.batch_size,
+                "auxiliary_rewards": [0.0] * self.batch_size,
             }
 
         self.prev_data = None
@@ -1770,6 +1863,8 @@ class GeneratorInterface:
         valid_flags = []
         round_trajectories = []
         probe_trajectories = []
+        crafter_auxiliary_rewards = []
+        crafter_buffer_rewards = []
         solvable_flags = []
         path_lengths = []
         # Explorer coverage is collected per generated map and aggregated
@@ -1791,17 +1886,12 @@ class GeneratorInterface:
             )
             traj, errors, raw_loss_val, solved = res_rollout[0], res_rollout[1], res_rollout[2], res_rollout[3]
             round_trajectories.append(traj)
-            if self.is_minigrid and traj and "obs" in traj:
+            if (self.is_minigrid or (self.is_crafter and not is_warmup)) and traj and "obs" in traj:
+                probe_budget = self.crafter_lp_probe_size if self.is_crafter else self.minigrid_lp_probe_size
                 probe_traj = self._rollout_combined(
-                    final_map_obj,
-                    final_stats,
-                    iteration,
-                    f"{i}_lp_probe",
-                    old_params=old_params,
-                    color_np=final_map_col,
-                    state_np=final_map_state,
-                    evaluate_wm=False,
-                    maximum_dataset_size=self.minigrid_lp_probe_size,
+                    final_map_obj, final_stats, iteration, f"{i}_lp_probe",
+                    old_params=old_params, color_np=final_map_col, state_np=final_map_state,
+                    evaluate_wm=False, maximum_dataset_size=probe_budget,
                 )[0]
             else:
                 probe_traj = {}
@@ -1874,6 +1964,9 @@ class GeneratorInterface:
                 chs = ppo_input_context[2][i:i+1]
                 prev_data_i = (cm, cht, chs)
 
+            if self.is_crafter:
+                crafter_buffer_rewards.append(float(reward))
+                crafter_auxiliary_rewards.append(self._crafter_auxiliary_reward(r_div, inv_changed_slots))
             raw_scalar_losses.append(raw_loss_val)
             raw_ce_losses.append(t_loss_batch)
             raw_inv_losses.append(i_loss_batch)
@@ -2018,6 +2111,20 @@ class GeneratorInterface:
                 "batch_nearest_hamming": batch_nearest_hamming,
                 "archive_nearest_hamming": archive_nearest_hamming,
                 "novelty_distance_std": novelty_distance_std,
+            }
+        elif self.is_crafter and not is_warmup:
+            probe_valid_flags = [
+                valid and bool(probe) and "obs" in probe
+                for valid, probe in zip(valid_flags, probe_trajectories)
+            ]
+            self._pending_crafter_round = {
+                "probe_trajectories": probe_trajectories,
+                "valid": probe_valid_flags,
+                "pre_changed_focal_losses": self._evaluate_crafter_changed_focal_losses(
+                    probe_trajectories, probe_valid_flags, "Pre-update"
+                ),
+                "rewards": crafter_buffer_rewards,
+                "auxiliary_rewards": crafter_auxiliary_rewards,
             }
 
         self._attach_minigrid_explorer_coverage()
@@ -2534,6 +2641,18 @@ class GeneratorInterface:
             "coverage": coverage,
             "inventory": inventory,
         }
+
+    def _crafter_auxiliary_reward(self, div_score, inv_diversity):
+        reward_cfg = self.crafter_reward_cfg
+        w_div = float(getattr(reward_cfg, "div", getattr(self.cfg.generator_agent, "reward_w_div", 3.0)))
+        w_inv_change = float(getattr(reward_cfg, "inv_change", getattr(self.cfg.generator_agent, "reward_w_inv_change", 0.0)))
+        inv_norm = max(float(getattr(reward_cfg, "inv_change_norm_slots", 8.0)), 1e-6)
+        bias = float(getattr(reward_cfg, "bias", getattr(self.cfg.generator_agent, "reward_bias", 2.0)))
+        clip = float(getattr(reward_cfg, "clip", getattr(self.cfg.generator_agent, "reward_clip", 100.0)))
+        inv_bonus = min(max(float(inv_diversity), 0.0) / inv_norm, 1.0)
+        if self.ablation_type == "no_diversity":
+            div_score, inv_bonus = 0.0, 0.0
+        return float(np.clip(w_div * float(div_score) + w_inv_change * inv_bonus + bias, -clip, clip))
 
     def _calculate_reward(
         self,

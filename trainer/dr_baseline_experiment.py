@@ -47,6 +47,7 @@ from modelBased.common.artifacts import align_world_model_artifact_path
 from generator.generator_interface import GeneratorInterface
 from trainer.common.utils import (
     CRAFTER_INVENTORY_VAL_METRICS,
+    CRAFTER_FOCAL_VAL_METRICS,
     MINIGRID_VAL_LOSS_FIELDS,
     set_seed,
     validate_on_target_task,
@@ -366,6 +367,10 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             f"dr_summary_minigrid_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
             "_focal_reservoir.csv"
         )
+    elif is_crafter:
+        ablation_type = str(getattr(getattr(cfg, "ablation", None), "type", "none"))
+        ablation_suffix = "" if ablation_type == "none" else f"_{ablation_type}"
+        summary_csv_path = log_dir / f"dr_crafter_results{ablation_suffix}.csv"
     else:
         ewc_suffix = "_ewc_balanced_inventory" if bool(getattr(cfg.attention_model, "ewc_enabled", False)) else ""
         ewc_suffix += crafter_value_mode_suffix
@@ -381,11 +386,7 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         ewc_suffix += crafter_validation_suffix
         summary_csv_path = log_dir / f"dr_summary_{domain_name}{mask_suffix}{ewc_suffix}.csv"
     transition_stats_csv_path = (
-        log_dir / (
-            f"dr_transition_replay_{domain_name}{crafter_value_mode_suffix}"
-            f"{'_slotprotect' if protected_enabled else ('_slot' if transition_replay_include_changed_slot else '')}"
-            f"{crafter_gate_suffix}{crafter_pose_suffix}{crafter_event_residual_suffix}{crafter_validation_suffix}_seed{seed}.csv"
-        )
+        log_dir / f"dr_crafter_replay{ablation_suffix}_seed{seed}.csv"
         if transition_replay_enabled else None
     )
     file_exists = False
@@ -443,25 +444,15 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         ]
     elif not is_bipedal: # Crafter or others
         csv_columns = [
-            "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
-            "gen_val_val_inv_loss", "gen_val_val_ce_loss", "gen_val_avg_val_loss_wm",
-            "target_val_val_inv_loss", "target_val_val_ce_loss", "target_val_avg_val_loss_wm",
-            "target_val_changed_nll", "target_val_changed_count",
-            *[f"target_val_{name}" for name in CRAFTER_INVENTORY_VAL_METRICS],
-            "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
-            "EWC_Enabled", "EWC_Lambda", "EWC_Fisher_Samples", "EWC_Fisher_Beta", "EWC_Scale_Factor",
-            "train_ewc_raw", "train_ewc_weighted", "train_ewc_to_wm_ratio",
-            "train_ewc_raw_epoch", "train_ewc_weighted_epoch", "train_ewc_to_wm_ratio_epoch",
-            "current_selection_loss", "best_selection_loss", "best_iteration",
+            "Seed", "Iter", "New_Data_Size", "Cumulative_Transitions", "Buffer_Size",
+            "target_val_valid_count", "target_val_avg_val_loss_wm",
+            "target_val_changed_focal_loss",
+            "target_val_layout_changed_focal_loss", "target_val_layout_false_set_rate", "target_val_layout_changed_count",
+            "target_val_inventory_changed_focal_loss", "target_val_inventory_false_set_rate", "target_val_inventory_changed_count",
+            "target_val_joint_accuracy", "target_val_position_accuracy", "target_val_direction_accuracy",
+            "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward", "Inv_Change_Ratio",
+            "Learning_Progress", "Solvable_Count", "Avg_Path_Len",
         ]
-        if transition_replay_enabled:
-            for source in ("Current", "Buffer", "Sampled_Replay"):
-                for transition_type in FisherReplayBuffer.CRAFTER_TRANSITION_TYPES:
-                    csv_columns.extend([
-                        f"{source}_{transition_type}_count",
-                        f"{source}_{transition_type}_fraction",
-                        f"{source}_{transition_type}_action_coverage",
-                    ])
     elif is_bipedal:
         csv_columns = [
             "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
@@ -492,6 +483,7 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             print(f"[System] No existing checkpoint found at {ckpt_path}. Starting from scratch.")
 
     # 2. Main Loop
+    cumulative_transitions = 0
     for iteration in range(cfg.generator_agent.total_iterations):
         print(f"\n>>> DR Iteration {iteration + 1}/{cfg.generator_agent.total_iterations}")
         
@@ -540,6 +532,14 @@ def run_dr_baseline_experiment(cfg: DictConfig):
 
         new_batch = convert_trajectories_to_batch(valid_trajs)
         current_transitions = len(new_batch["obs"]) if new_batch is not None and new_batch.get("obs") is not None else 0
+        inv_change_ratio = 0.0
+        if is_crafter:
+            inv_cur, inv_next = new_batch.get("inv"), new_batch.get("inv_next")
+            if inv_cur is not None and inv_next is not None:
+                inv_cur = inv_cur.detach().cpu().numpy() if torch.is_tensor(inv_cur) else np.asarray(inv_cur)
+                inv_next = inv_next.detach().cpu().numpy() if torch.is_tensor(inv_next) else np.asarray(inv_next)
+                inv_change_ratio = float((np.abs(inv_next.astype(np.float32) - inv_cur.astype(np.float32))[:, 4:16] > 1e-6).mean())
+        cumulative_transitions += int(current_transitions)
         print(f"  [Data] Current batch transitions: {current_transitions}")
         current_transition_stats = (
             fisher_buffer.transition_replay_stats(new_batch)
@@ -669,8 +669,9 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         # update, but the reward components remain comparable.
         if is_minigrid:
             generator.finalize_minigrid_rewards()
+        elif is_crafter:
+            generator.finalize_crafter_learning_progress(apply_rewards=False)
 
-            
         # C. Validation on Target Tasks (aligned with MAC: validate every iter after warmup)
         warmup_iters = _safe_int_cfg(
             getattr(cfg.generator_agent, "warmup_iterations", 0),
@@ -689,6 +690,7 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         target_val_crafter_inventory_metrics = {
             name: 0.0 for name in CRAFTER_INVENTORY_VAL_METRICS
         }
+        target_val_crafter_focal = {name: float("nan") for name in CRAFTER_FOCAL_VAL_METRICS}
         target_val_valid_count = 0
         if iteration >= (warmup_iters - 1):
             print(f"  [Validation] Running zero-shot test on all {val_n_phases} targets...")
@@ -722,6 +724,10 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                         target_val_crafter_inventory_metrics = {
                             name: float(val_summary.get(name, 0.0))
                             for name in CRAFTER_INVENTORY_VAL_METRICS
+                        }
+                        target_val_crafter_focal = {
+                            name: float(val_summary.get(name, float("nan")))
+                            for name in CRAFTER_FOCAL_VAL_METRICS
                         }
                     target_val_contact_acc = 0.0
                     target_val_contact_bce = 0.0
@@ -841,37 +847,27 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             }
         else:
             row_data = {
-                "Seed": seed, "Iter": iteration + 1, "Gen_Mean_Reward": 0.0, "Gen_Loss": 0.0,
-                "Gen_Entropy": 0.0, "Gen_Div_Reward": gen_div_reward,
-                "gen_val_val_inv_loss": gen_val_val_inv_loss, "gen_val_val_ce_loss": gen_val_val_ce_loss,
-                "gen_val_avg_val_loss_wm": gen_val_avg_val_loss_wm,
-                "target_val_val_inv_loss": target_val_val_inv_loss, "target_val_val_ce_loss": target_val_val_ce_loss,
+                "Seed": seed, "Iter": iteration + 1,
+                "New_Data_Size": current_transitions,
+                "Cumulative_Transitions": cumulative_transitions,
+                "Buffer_Size": len(fisher_buffer),
+                "target_val_valid_count": target_val_valid_count,
                 "target_val_avg_val_loss_wm": target_val_avg_val_loss_wm,
-                "target_val_changed_nll": target_val_crafter_changed_nll,
-                "target_val_changed_count": target_val_crafter_changed_count,
-                **{f"target_val_{name}": value
-                   for name, value in target_val_crafter_inventory_metrics.items()},
-                "New_Data_Size": current_transitions, "Buffer_Size": len(fisher_buffer),
+                "target_val_changed_focal_loss": target_val_crafter_focal["changed_focal_loss"],
+                "target_val_layout_changed_focal_loss": target_val_crafter_focal["layout_changed_focal_loss"],
+                "target_val_layout_false_set_rate": target_val_crafter_focal["layout_false_set_rate"],
+                "target_val_layout_changed_count": target_val_crafter_focal["layout_changed_count"],
+                "target_val_inventory_changed_focal_loss": target_val_crafter_focal["inventory_changed_focal_loss"],
+                "target_val_inventory_false_set_rate": target_val_crafter_focal["inventory_false_set_rate"],
+                "target_val_inventory_changed_count": target_val_crafter_focal["inventory_changed_count"],
+                "target_val_joint_accuracy": target_val_crafter_focal["joint_accuracy"],
+                "target_val_position_accuracy": target_val_crafter_focal["position_accuracy"],
+                "target_val_direction_accuracy": target_val_crafter_focal["direction_accuracy"],
+                "Gen_Mean_Reward": 0.0, "Gen_Loss": 0.0, "Gen_Entropy": 0.0,
+                "Gen_Div_Reward": gen_div_reward, "Inv_Change_Ratio": inv_change_ratio,
+                "Learning_Progress": getattr(generator, "last_crafter_metrics", {}).get("Learning_Progress", float("nan")),
                 "Solvable_Count": solvable_count, "Avg_Path_Len": avg_path_len,
-                "EWC_Enabled": bool(getattr(cfg.attention_model, "ewc_enabled", False)),
-                "EWC_Lambda": float(getattr(cfg.attention_model, "lambda_ewc", 0.0)),
-                "EWC_Fisher_Samples": int(getattr(cfg.attention_model, "fisher_samples", 0)),
-                "EWC_Fisher_Beta": float(getattr(cfg.attention_model, "fisher_beta", 0.0)),
-                "EWC_Scale_Factor": float(getattr(cfg.attention_model, "scale_factor", 1.0)),
-                "train_ewc_raw": train_ewc_raw,
-                "train_ewc_weighted": train_ewc_weighted,
-                "train_ewc_to_wm_ratio": train_ewc_to_wm_ratio,
-                "train_ewc_raw_epoch": train_ewc_raw_epoch,
-                "train_ewc_weighted_epoch": train_ewc_weighted_epoch,
-                "train_ewc_to_wm_ratio_epoch": train_ewc_to_wm_ratio_epoch,
-                "current_selection_loss": float(res_train.get("best_loss", float("nan"))) if 'res_train' in locals() else float("nan"),
-                "best_selection_loss": global_best_selection,
-                "best_iteration": global_best_iteration,
             }
-            if transition_replay_enabled:
-                row_data.update(_transition_stat_columns("Current", current_transition_stats))
-                row_data.update(_transition_stat_columns("Buffer", buffer_transition_stats))
-                row_data.update(_transition_stat_columns("Sampled_Replay", sampled_replay_stats))
 
         pd.DataFrame([row_data], columns=csv_columns).to_csv(
             summary_csv_path,

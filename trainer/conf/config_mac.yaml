@@ -79,6 +79,9 @@ domains:
     # Data collection budget for MAC/DR (per training iteration).
     # Runtime will split this by generator_batch_size to get per-rollout max transitions.
     iter_transition_budget: 8000
+    # Held-out transitions per iteration for identical pre/post WM probes.
+    # These never enter training or replay.
+    learning_progress_probe_budget: 1000
     generator_batch_size: 8
     max_edits_layout: 0.3
     max_edits_inventory: 0.8
@@ -86,6 +89,8 @@ domains:
     lambda_ewc: 10 #20000.0
     validation_metric: "mse"
     reward:
+      # Crafter MAC replaces instantaneous WM difficulty with held-out LP.
+      learning_progress: 1.0
       ce: 6.0
       inv: 3.0
       div: 1

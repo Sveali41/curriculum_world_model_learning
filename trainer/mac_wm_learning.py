@@ -52,6 +52,7 @@ from generator.generator_interface import GeneratorInterface
 from trainer.common.paths import RESULTS_ROOT
 from trainer.common.utils import (
     MINIGRID_VAL_LOSS_FIELDS,
+    CRAFTER_FOCAL_VAL_METRICS,
     set_seed,
     validate_on_target_task,
     save_validation_csv,
@@ -262,6 +263,10 @@ def adversarial_ued_training(cfg: DictConfig):
             f"minigrid_ued_results_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
             f"_focal_reservoir_sa{ablation_suffix}.csv"
         )
+    elif env_type == "crafter":
+        summary_csv_path = log_dir / (
+            f"mac_crafter_results{ablation_suffix}{metric_suffix}.csv"
+        )
     else:
         summary_csv_path = log_dir / f"{env_type}_ued_results{mask_suffix}{ablation_suffix}{metric_suffix}.csv"
     if ablation_suffix or metric_suffix or env_type != "crafter":
@@ -345,11 +350,14 @@ def adversarial_ued_training(cfg: DictConfig):
         ]
     else:
         csv_header = [
-            "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
-            "gen_val_val_inv_loss", "gen_val_val_ce_loss", "gen_val_avg_val_loss_wm",
-            "target_val_val_inv_loss", "target_val_val_ce_loss", "target_val_avg_val_loss_wm",
-            "target_val_changed_nll", "target_val_changed_count",
-            "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len", "Inv_Change_Ratio",
+            "Seed", "Iter", "New_Data_Size", "Cumulative_Transitions", "Buffer_Size",
+            "target_val_valid_count", "target_val_avg_val_loss_wm",
+            "target_val_changed_focal_loss",
+            "target_val_layout_changed_focal_loss", "target_val_layout_false_set_rate", "target_val_layout_changed_count",
+            "target_val_inventory_changed_focal_loss", "target_val_inventory_false_set_rate", "target_val_inventory_changed_count",
+            "target_val_joint_accuracy", "target_val_position_accuracy", "target_val_direction_accuracy",
+            "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
+            "Learning_Progress", "Solvable_Count", "Avg_Path_Len", "Inv_Change_Ratio",
         ]
 
     file_exists = _ensure_csv_header_compatible(summary_csv_path, csv_header)
@@ -444,6 +452,7 @@ def adversarial_ued_training(cfg: DictConfig):
         print(f"[System] No existing checkpoint found at {ckpt_path}. Starting from scratch.")
 
     total_iterations = cfg.generator_agent.total_iterations
+    cumulative_transitions = 0
     corpus_writer = None
     if is_minigrid:
         explorer_ab_cfg = getattr(domain_cfg, "explorer_ab", None)
@@ -620,6 +629,7 @@ def adversarial_ued_training(cfg: DictConfig):
 
         if new_batch is not None:
             new_data_size = len(new_batch['obs'])
+            cumulative_transitions += int(new_data_size)
             buffer_input = {
                 "obs": new_batch["obs"],
                 "obs_next": new_batch["obs_next"],
@@ -645,7 +655,7 @@ def adversarial_ued_training(cfg: DictConfig):
                         if torch.is_tensor(inv_nxt):
                             inv_nxt = inv_nxt.detach().cpu().numpy()
                         delta = np.abs(inv_nxt.astype(np.float32) - inv_cur.astype(np.float32))
-                        inv_change_ratio = float((delta > 1e-6).mean())
+                        inv_change_ratio = float((delta[:, 4:16] > 1e-6).mean())
                 except Exception as e:
                     print(f"[Warning] Failed to compute Inv_Change_Ratio: {e}")
                     inv_change_ratio = 0.0
@@ -813,6 +823,8 @@ def adversarial_ued_training(cfg: DictConfig):
                 f"Entropy: {gen_entropy:.4f} | Mean reward: {gen_mean_reward:.4f}"
             )
         else:
+            if is_crafter:
+                gen_interface.finalize_crafter_learning_progress(apply_rewards=not is_warmup_for_wm)
             gen_loss, gen_entropy, gen_mean_reward = gen_interface.update(iteration=iteration)
             print(
                 f"[Generator] Policy Updated. Loss: {gen_loss:.4f} | "
@@ -856,6 +868,7 @@ def adversarial_ued_training(cfg: DictConfig):
         target_val_changed_count = 0.0
         target_val_crafter_changed_nll = 0.0
         target_val_crafter_changed_count = 0.0
+        target_val_crafter_focal = {name: float("nan") for name in CRAFTER_FOCAL_VAL_METRICS}
         # Validation policy:
         # 1. Skip validation during early warmup to save time.
         # 2. Validate every step afterward to track progress.
@@ -880,6 +893,7 @@ def adversarial_ued_training(cfg: DictConfig):
             target_changed_counts = []
             target_crafter_changed_nlls = []
             target_crafter_changed_counts = []
+            target_crafter_focal_values = {name: [] for name in CRAFTER_FOCAL_VAL_METRICS}
             
             # Temporarily switch to validation mode.
             old_freeze = cfg.attention_model.freeze_weight
@@ -922,6 +936,10 @@ def adversarial_ued_training(cfg: DictConfig):
                         target_inv_losses.append(res_dict.get('inventory_loss', 0.0))
                         target_crafter_changed_nlls.append(res_dict.get('changed_nll', 0.0))
                         target_crafter_changed_counts.append(res_dict.get('changed_count', 0.0))
+                        for name in CRAFTER_FOCAL_VAL_METRICS:
+                            value = res_dict.get(name)
+                            if value is not None and np.isfinite(float(value)):
+                                target_crafter_focal_values[name].append(float(value))
             
             # Restore configuration values.
             cfg.attention_model.freeze_weight = old_freeze
@@ -940,6 +958,7 @@ def adversarial_ued_training(cfg: DictConfig):
                     target_val_val_inv_loss = float(np.mean(target_inv_losses))
                     target_val_crafter_changed_nll = float(np.mean(target_crafter_changed_nlls)) if target_crafter_changed_nlls else 0.0
                     target_val_crafter_changed_count = float(np.mean(target_crafter_changed_counts)) if target_crafter_changed_counts else 0.0
+                    target_val_crafter_focal = {name: (float(np.mean(values)) if values else float("nan")) for name, values in target_crafter_focal_values.items()}
                     print(
                         f"[Metrics] Combined Target Loss -> Total: "
                         f"{target_val_avg_val_loss_wm:.4f} | "
@@ -1110,25 +1129,27 @@ def adversarial_ued_training(cfg: DictConfig):
                             }
                         else:
                             row_data = {
-                                "Seed": seed,
-                                "Iter": iteration + 1,
-                                "Gen_Mean_Reward": f"{gen_mean_reward:.4f}",
-                                "Gen_Loss": f"{gen_loss:.4f}",
-                                "Gen_Entropy": f"{gen_entropy:.4f}",
-                                "Gen_Div_Reward": f"{gen_div_reward_val:.4f}",
-                                "gen_val_val_inv_loss": f"{gen_val_val_inv_loss:.6f}",
-                                "gen_val_val_ce_loss": f"{gen_val_aux_metric:.6f}",
-                                "gen_val_avg_val_loss_wm": f"{gen_val_avg_val_loss_wm:.6f}",
-                                "target_val_val_inv_loss": f"{target_val_val_inv_loss:.6f}",
-                                "target_val_val_ce_loss": f"{target_val_val_ce_loss:.6f}",
-                                "target_val_avg_val_loss_wm": f"{target_val_avg_val_loss_wm:.6f}",
-                                "target_val_changed_nll": f"{target_val_crafter_changed_nll:.6f}",
-                                "target_val_changed_count": f"{target_val_crafter_changed_count:.2f}",
+                                "Seed": seed, "Iter": iteration + 1,
                                 "New_Data_Size": new_data_size,
+                                "Cumulative_Transitions": cumulative_transitions,
                                 "Buffer_Size": len(fisher_buffer),
-                                "Solvable_Count": f"{gen_solvable_count}",
-                                "Avg_Path_Len": f"{gen_avg_ep_len:.2f}",
-                                "Inv_Change_Ratio": f"{inv_change_ratio:.6f}"
+                                "target_val_valid_count": target_val_valid_count,
+                                "target_val_avg_val_loss_wm": f"{target_val_avg_val_loss_wm:.6f}",
+                                "target_val_changed_focal_loss": f"{target_val_crafter_focal['changed_focal_loss']:.6f}",
+                                "target_val_layout_changed_focal_loss": f"{target_val_crafter_focal['layout_changed_focal_loss']:.6f}",
+                                "target_val_layout_false_set_rate": f"{target_val_crafter_focal['layout_false_set_rate']:.6f}",
+                                "target_val_layout_changed_count": f"{target_val_crafter_focal['layout_changed_count']:.2f}",
+                                "target_val_inventory_changed_focal_loss": f"{target_val_crafter_focal['inventory_changed_focal_loss']:.6f}",
+                                "target_val_inventory_false_set_rate": f"{target_val_crafter_focal['inventory_false_set_rate']:.6f}",
+                                "target_val_inventory_changed_count": f"{target_val_crafter_focal['inventory_changed_count']:.2f}",
+                                "target_val_joint_accuracy": f"{target_val_crafter_focal['joint_accuracy']:.6f}",
+                                "target_val_position_accuracy": f"{target_val_crafter_focal['position_accuracy']:.6f}",
+                                "target_val_direction_accuracy": f"{target_val_crafter_focal['direction_accuracy']:.6f}",
+                                "Gen_Mean_Reward": f"{gen_mean_reward:.4f}", "Gen_Loss": f"{gen_loss:.4f}",
+                                "Gen_Entropy": f"{gen_entropy:.4f}", "Gen_Div_Reward": f"{gen_div_reward_val:.4f}",
+                                "Learning_Progress": f"{getattr(gen_interface, 'last_crafter_metrics', {}).get('Learning_Progress', float('nan')):.6f}",
+                                "Solvable_Count": f"{gen_solvable_count}", "Avg_Path_Len": f"{gen_avg_ep_len:.2f}",
+                                "Inv_Change_Ratio": f"{inv_change_ratio:.6f}",
                             }
 
                     writer = csv.writer(f)

@@ -99,11 +99,12 @@ class RandomGeneratorAgent:
             # Crafter uses 32 piano keys: +1 and +5 for each of 16 slots.
             num_keys = 32
             current_p = np.random.uniform(0.0, max_stats_edit_ratio)
+            editable = torch.ones(num_keys, device=self.device, dtype=torch.bool)
+            editable[0:4] = False
+            editable[16:20] = False
             rand_tensor = torch.rand((B, num_keys), device=self.device)
-            stats_action = (rand_tensor < current_p).float()
-            topk_stats_mask = torch.ones(
-                (B, num_keys), device=self.device, dtype=torch.bool
-            )
+            stats_action = ((rand_tensor < current_p) & editable.unsqueeze(0)).float()
+            topk_stats_mask = editable.unsqueeze(0).expand(B, -1).clone()
             
         # --- 3. Dummies ---
         logprob = torch.zeros(B, device=self.device)

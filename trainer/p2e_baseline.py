@@ -29,7 +29,7 @@ from modelBased.common.support import Support
 from domain.minigrid import minigrid_support as minigrid_utils
 from domain.minigrid.minigrid_support import ColRowCanl_to_CanlRowCol
 from trainer.common.utils import (
-    set_seed, validate_on_all_targets
+    CRAFTER_FOCAL_VAL_METRICS, MINIGRID_TARGET_VAL_METRICS, set_seed, validate_on_all_targets
 )
 from trainer.common.paths import RESULTS_ROOT, VISUALIZATIONS_ROOT
 from modelBased.data.data_collect import visualize_agent_coverage
@@ -310,6 +310,10 @@ def p2e_baseline_experiment(cfg: DictConfig):
             return True
         # Legacy schema exists: back it up and start a fresh CSV.
         backup_path = csv_path + ".legacy_backup"
+        suffix = 1
+        while os.path.exists(backup_path):
+            backup_path = csv_path + f".legacy_backup{suffix}"
+            suffix += 1
         os.replace(csv_path, backup_path)
         print(f"[CSV] Existing summary with mismatched schema moved to: {backup_path}")
         return False
@@ -363,7 +367,8 @@ def p2e_baseline_experiment(cfg: DictConfig):
     if domain == "minigrid":
         summary_header = [
             "seed", "Iter", "P2E_Mean_Reward", "P2E_Ensemble_Loss",
-            "mode", "phase", "transitions", "avg_target_loss"
+            "mode", "phase", "transitions", "avg_target_loss",
+            *[f"target_val_{name}" for name in MINIGRID_TARGET_VAL_METRICS]
         ]
         file_non_empty = _ensure_summary_csv_schema(summary_csv_path, summary_header)
     elif is_bipedal:
@@ -376,10 +381,11 @@ def p2e_baseline_experiment(cfg: DictConfig):
     else:
         summary_header = [
             "Seed", "Iter", "P2E_Mean_Reward", "P2E_Ensemble_Loss",
-            "target_val_val_inv_loss", "target_val_val_ce_loss", "target_val_avg_val_loss_wm",
+            "target_val_valid_count", "target_val_avg_val_loss_wm",
+            *[f"target_val_{name}" for name in CRAFTER_FOCAL_VAL_METRICS],
             "New_Data_Size", "Buffer_Size", "Cumulative_Transitions", "TargetIdx", "CycleIdx", "TargetName"
         ]
-        file_non_empty = os.path.exists(summary_csv_path) and os.path.getsize(summary_csv_path) > 0
+        file_non_empty = _ensure_summary_csv_schema(summary_csv_path, summary_header)
 
     if not file_non_empty:
         with open(summary_csv_path, mode='w', newline='') as f:
@@ -674,6 +680,12 @@ def p2e_baseline_experiment(cfg: DictConfig):
                     if domain == "minigrid":
                         phase_name = f"P2E_T{target_idx + 1}_C{cycle_idx + 1}"
                         iter_idx = target_idx * updates_per_target + cycle_idx + 1
+                        minigrid_val_values = [
+                            int(val_summary.get(name, 0))
+                            if name == "valid_count"
+                            else float(val_summary.get(name, np.nan))
+                            for name in MINIGRID_TARGET_VAL_METRICS
+                        ]
                         csv.writer(f).writerow([
                             seed,
                             iter_idx,
@@ -683,6 +695,7 @@ def p2e_baseline_experiment(cfg: DictConfig):
                             phase_name,
                             cumulative_transitions,
                             m_v,
+                            *minigrid_val_values,
                         ])
                     elif is_bipedal:
                         csv.writer(f).writerow([
@@ -701,14 +714,18 @@ def p2e_baseline_experiment(cfg: DictConfig):
                             target_task,
                         ])
                     else:
+                        crafter_focal_values = [
+                            float(val_summary.get(name, np.nan))
+                            for name in CRAFTER_FOCAL_VAL_METRICS
+                        ]
                         csv.writer(f).writerow([
                             seed,
                             target_idx * updates_per_target + cycle_idx + 1,
                             float(np.mean(rew_n)) if len(rew_n) > 0 else np.nan,
                             e_loss,
-                            m_inv_v,
-                            m_ce_v,
+                            int(val_summary["valid_count"]),
                             m_v,
+                            *crafter_focal_values,
                             batch_transitions,
                             len(fisher_buffer),
                             cumulative_transitions,

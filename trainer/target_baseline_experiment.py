@@ -42,7 +42,9 @@ from modelBased.world_model.AttentionWM import AttentionWorldModel
 from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
 from modelBased.common.utils import TRAINER_PATH
 from modelBased.common.artifacts import align_world_model_artifact_path
-from trainer.common.utils import set_seed, validate_on_all_targets
+from trainer.common.utils import (
+    CRAFTER_FOCAL_VAL_METRICS, MINIGRID_TARGET_VAL_METRICS, set_seed, validate_on_all_targets,
+)
 from trainer.common.paths import RESULTS_ROOT, VISUALIZATIONS_ROOT
 
 
@@ -100,72 +102,67 @@ def _extract_map_hw(obs_arr) -> tuple[int, int] | None:
     return None
 
 
+def _next_backup_path(csv_out_path: Path, label: str) -> Path:
+    candidate = csv_out_path.with_name(f"{csv_out_path.stem}_{label}{csv_out_path.suffix}")
+    index = 1
+    while candidate.exists():
+        candidate = csv_out_path.with_name(
+            f"{csv_out_path.stem}_{label}{index}{csv_out_path.suffix}"
+        )
+        index += 1
+    return candidate
+
+
 def _ensure_baseline_csv(csv_out_path: Path, csv_columns: list) -> bool:
-    """
-    Ensure output CSV has a valid header schema.
-    Returns True if file exists with valid header, else False.
-    """
-    if not csv_out_path.exists():
+    """Reuse only an exactly matching header; preserve every other schema."""
+    if not csv_out_path.exists() or csv_out_path.stat().st_size == 0:
         return False
-
-    with open(csv_out_path, "r", encoding="utf-8") as f:
-        first_line = f.readline().strip()
-
-    if not first_line:
-        return False
-
-    first_col = first_line.split(",")[0].strip() if "," in first_line else first_line
-    if first_col in csv_columns:
+    with csv_out_path.open("r", encoding="utf-8") as handle:
+        first_line = handle.readline().strip()
+    expected = [str(column) for column in csv_columns]
+    actual = [token.strip() for token in first_line.split(",")]
+    if actual == expected:
         return True
 
-    # Legacy no-header file. Try to recover and rewrite with header.
-    legacy_backup = csv_out_path.with_name(f"{csv_out_path.stem}_no_header_backup{csv_out_path.suffix}")
+    # A headered CSV must never be interpreted as a headerless result row.
+    # The legacy repair path is reserved for lines whose first cell is numeric.
+    try:
+        float(actual[0])
+        headerless = True
+    except (IndexError, ValueError):
+        headerless = False
+    if not headerless:
+        backup = _next_backup_path(csv_out_path, "schema_backup")
+        os.replace(csv_out_path, backup)
+        print(f"[Repair] CSV schema changed; old file moved to {backup}")
+        return False
+
+    legacy_backup = _next_backup_path(csv_out_path, "no_header_backup")
     legacy_df = pd.read_csv(csv_out_path, header=None)
     legacy_df.to_csv(legacy_backup, index=False, header=False)
-
     if legacy_df.shape[1] == len(csv_columns):
         legacy_df.columns = csv_columns
         legacy_df.to_csv(csv_out_path, index=False)
-        print(f"[Repair] Added header for existing CSV. Backup: {legacy_backup}")
+        print(f"[Repair] Added header for headerless CSV. Backup: {legacy_backup}")
         return True
-
-    # Legacy 7-col rows seen in current workflow:
     if legacy_df.shape[1] == 7:
         legacy_df.columns = [
-            "Seed",
-            "Iter",
-            "Phase",
-            "Trained_On",
-            "target_val_val_ce_loss",
-            "target_val_val_inv_loss",
+            "Seed", "Iter", "Phase", "Trained_On",
+            "target_val_val_ce_loss", "target_val_val_inv_loss",
             "target_val_avg_val_loss_wm",
         ]
         legacy_df["data_size"] = np.nan
         legacy_df["cumulative_data_size"] = np.nan
-        if "target_val_contact_acc" in csv_columns:
-            legacy_df["target_val_contact_acc"] = np.nan
-            legacy_df["target_val_contact_bce"] = np.nan
-        if "Avg_Val_CE" in csv_columns:
-            legacy_df["Avg_Val_CE"] = legacy_df["target_val_val_ce_loss"]
-            legacy_df["Avg_Val_INV"] = legacy_df["target_val_val_inv_loss"]
-        legacy_df["Avg_Val_Total"] = legacy_df["target_val_avg_val_loss_wm"]
-        
-        # Keep only required columns filling empty ones with Nan
-        for col in csv_columns:
-            if col not in legacy_df.columns:
-                legacy_df[col] = np.nan
-        legacy_df = legacy_df[csv_columns]
-        legacy_df.to_csv(csv_out_path, index=False)
-        print(f"[Repair] Upgraded legacy 7-column CSV with header. Backup: {legacy_backup}")
+        for column in csv_columns:
+            if column not in legacy_df.columns:
+                legacy_df[column] = np.nan
+        legacy_df[csv_columns].to_csv(csv_out_path, index=False)
+        print(f"[Repair] Upgraded headerless legacy CSV. Backup: {legacy_backup}")
         return True
 
-    # Unknown schema: preserve old file and start a fresh CSV.
-    broken_path = csv_out_path.with_name(f"{csv_out_path.stem}_broken_schema{csv_out_path.suffix}")
-    os.replace(csv_out_path, broken_path)
-    print(
-        f"[Repair] Unexpected CSV schema ({legacy_df.shape[1]} cols). "
-        f"Moved old CSV to {broken_path}. Backup: {legacy_backup}"
-    )
+    backup = _next_backup_path(csv_out_path, "broken_schema")
+    os.replace(csv_out_path, backup)
+    print(f"[Repair] Headerless CSV has incompatible width; moved it to {backup}")
     return False
 
 
@@ -221,13 +218,22 @@ def run_target_baseline_experiment(cfg: DictConfig):
             "Avg_Val_Total", "Buffer_Size",
         ]
         csv_domain_name = "bipedalwalker"
+    elif is_crafter:
+        csv_columns = [
+            "Seed", "Iter", "Phase", "Trained_On", "data_size", "cumulative_data_size", "Buffer_Size",
+            "target_val_valid_count", "target_val_avg_val_loss_wm",
+            *[f"target_val_{name}" for name in CRAFTER_FOCAL_VAL_METRICS],
+        ]
+        csv_domain_name = "crafter"
     else:
         csv_columns = [
             "Seed", "Iter", "Phase", "Trained_On", "data_size", "cumulative_data_size",
-            "target_val_val_ce_loss", "target_val_val_inv_loss", "target_val_avg_val_loss_wm",
+            "target_val_val_ce_loss", "target_val_val_inv_loss",
+            *[f"target_val_{name}" for name in MINIGRID_TARGET_VAL_METRICS],
+            "target_val_avg_val_loss_wm",
             "Avg_Val_CE", "Avg_Val_INV", "Avg_Val_Total", "Buffer_Size",
         ]
-        csv_domain_name = "crafter" if is_crafter else "minigrid"
+        csv_domain_name = "minigrid"
 
     mask_suffix = f"_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
     csv_out_path = log_dir / f"target_baseline_{csv_domain_name}{mask_suffix}.csv"
@@ -419,15 +425,31 @@ def run_target_baseline_experiment(cfg: DictConfig):
 
                 if val_summary["valid_count"] > 0:
                     phase_metrics["target_val_avg_val_loss_wm"] = val_summary["avg_val_loss_wm"]
-                    phase_metrics["Avg_Val_Total"] = val_summary["avg_val_loss_wm"]
+                    phase_metrics["target_val_valid_count"] = int(val_summary["valid_count"])
+                    if not is_crafter:
+                        phase_metrics["Avg_Val_Total"] = val_summary["avg_val_loss_wm"]
                     
                     if is_bipedal:
                         phase_metrics["target_val_contact_acc"] = val_summary.get("contact_acc", 0.0)
                         phase_metrics["target_val_contact_bce"] = val_summary.get("contact_bce", 0.0)
                         print(f"    -> Results: Avg C_ACC = {phase_metrics['target_val_contact_acc']:.5f}, Avg C_BCE = {phase_metrics['target_val_contact_bce']:.5f}, Avg Total = {phase_metrics['Avg_Val_Total']:.5f}")
+                    elif is_crafter:
+                        phase_metrics.update({
+                            f"target_val_{name}": val_summary.get(name, np.nan)
+                            for name in CRAFTER_FOCAL_VAL_METRICS
+                        })
+                        print(f"    -> Results: Avg Total = {phase_metrics['target_val_avg_val_loss_wm']:.5f}")
                     else:
                         phase_metrics["target_val_val_ce_loss"] = val_summary.get("terrain_loss", 0.0)
                         phase_metrics["target_val_val_inv_loss"] = val_summary.get("inventory_loss", 0.0)
+                        phase_metrics.update({
+                            f"target_val_{name}": (
+                                int(val_summary.get(name, 0))
+                                if name == "valid_count"
+                                else float(val_summary.get(name, 0.0))
+                            )
+                            for name in MINIGRID_TARGET_VAL_METRICS
+                        })
                         phase_metrics["Avg_Val_CE"] = val_summary.get("terrain_loss", 0.0)
                         phase_metrics["Avg_Val_INV"] = val_summary.get("inventory_loss", 0.0)
                         print(f"    -> Results: Avg CE = {phase_metrics['Avg_Val_CE']:.5f}, Avg INV = {phase_metrics['Avg_Val_INV']:.5f}, Avg Total = {phase_metrics['Avg_Val_Total']:.5f}")
