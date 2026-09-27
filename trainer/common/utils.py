@@ -537,6 +537,38 @@ def _relocated_minigrid_target_layout(metadata, data_save_dir):
     )
 
 
+def _relocated_crafter_target_layout(metadata, data_save_dir):
+    """Find the same Crafter target layout after moving the workspace."""
+    task_name = str(metadata.get("task_name", "")).strip()
+    expected_hash = metadata.get("layout_hash")
+    if not task_name or not expected_hash:
+        raise RuntimeError(
+            "Crafter target dataset references a missing layout path, but its "
+            "metadata lacks task_name or layout_hash; restore the original layout."
+        )
+
+    roots = []
+    configured_trainer = os.environ.get("TRAINER_PATH")
+    if configured_trainer:
+        roots.append(Path(configured_trainer).expanduser())
+    roots.append(Path(TRAINER_PATH))
+    if data_save_dir:
+        data_root = Path(data_save_dir).expanduser()
+        roots.extend((data_root, *data_root.parents))
+
+    candidates = []
+    for root in dict.fromkeys(root.resolve() for root in roots):
+        candidate = root / "level" / "crafter" / "target_tasks" / f"{task_name}.txt"
+        candidates.append(candidate)
+        if candidate.is_file() and layout_hash(candidate) == expected_hash:
+            return candidate
+    raise RuntimeError(
+        "Crafter target layout could not be found with the archived layout_hash "
+        f"for {task_name!r}. Checked: {', '.join(map(str, candidates))}. "
+        "Restore the matching layout or recollect the target dataset."
+    )
+
+
 def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, phase_name="validation", VALID_TIMES=1, validation_sweep=None):
     """
     Run WM validation on the fixed target task, return avg loss.
@@ -604,6 +636,13 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
                 and not metadata_layout_path.is_file()
             ):
                 metadata_layout_path = _relocated_minigrid_target_layout(
+                    metadata, data_save_dir
+                )
+            elif selected_domain == "crafter" and (
+                not metadata_layout_path.is_file()
+                or layout_hash(metadata_layout_path) != metadata.get("layout_hash")
+            ):
+                metadata_layout_path = _relocated_crafter_target_layout(
                     metadata, data_save_dir
                 )
             domain_cfg.layout_path = str(metadata_layout_path)
