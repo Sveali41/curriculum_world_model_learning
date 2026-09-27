@@ -39,3 +39,9 @@ my_research_project.egg-info/
 Curriculum_Learning_World_Models_AAMAS_2027_without_bipedal_continual_appendix/
 trainer/data
 wm/tests
+
+# Keep experiment launch code in Git while excluding generated test results.
+test/*
+!test/crafter_dr_mac_50/
+test/crafter_dr_mac_50/results/
+*.resume.pt

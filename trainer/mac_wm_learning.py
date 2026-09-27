@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import csv
 import subprocess
 ROOT_DIR =os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WM_ROOT = os.path.join(ROOT_DIR, "wm")
@@ -39,6 +40,8 @@ import torch
 import numpy as np
 import copy
 import math
+import time
+import gc
 
 from modelBased.common.utils import TRAINER_PATH
 from modelBased.world_model import AttentionWM_training
@@ -49,16 +52,204 @@ from modelBased.common.artifacts import align_world_model_artifact_path
 from modelBased.exploration.minigrid_corpus import MiniGridCorpusWriter
 
 from generator.generator_interface import GeneratorInterface
+from trainer.common.run_resume import (
+    config_digest, generator_state, guard_fresh_results, load_state, replay_state, restore_generator,
+    restore_replay, restore_rng, rng_state, save_state, validate_sidecars,
+)
+from trainer.common.wm_snapshots import save_wm_update_snapshot
 from trainer.common.paths import RESULTS_ROOT
 from trainer.common.utils import (
     MINIGRID_VAL_LOSS_FIELDS,
     CRAFTER_FOCAL_VAL_METRICS,
+    CRAFTER_INVENTORY_VAL_METRICS,
     set_seed,
     validate_on_target_task,
     save_validation_csv,
     convert_trajectories_to_batch,
     minigrid_changed_fraction,
 )
+from modelBased.world_model.crafter_event_audit import (
+    inventory_event_episode_age_rows, inventory_event_rows,
+)
+
+
+CRAFTER_INVENTORY_EVENT_AUDIT_HEADER = (
+    "Seed", "Iter", "Source", "Event_ID", "Delta_Vector", "Count",
+    "Changed_Slot_Count", "Changed_Slots",
+)
+CRAFTER_TARGET_EVENT_CONFUSION_HEADER = (
+    "Seed", "Iter", "Target", "True_Event_ID", "True_Delta_Vector",
+    "True_Count", "Predicted_Exact_Count", "Predicted_KEEP_Count",
+    "Predicted_Other_Count", "True_KEEP_False_Positive_Count",
+    "True_Change_Margin_Count", "True_Change_Margin_Mean",
+)
+CRAFTER_TARGET_EVENT_SUMMARY_HEADER = (
+    "Seed", "Iter", "Target", "Sample_Count", "True_KEEP_Count",
+    "True_KEEP_False_Positive_Count", "Slot_TP", "Slot_FN", "Slot_FP",
+    "Slot_KEEP_Count", "Unknown_Event_Count",
+)
+
+
+def _append_inventory_event_audit(csv_path: Path, seed: int, iteration: int, source: str, rows):
+    if not rows:
+        return
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("a", newline="") as handle:
+        writer = csv.writer(handle)
+        if handle.tell() == 0:
+            writer.writerow(CRAFTER_INVENTORY_EVENT_AUDIT_HEADER)
+        writer.writerows((
+            seed, iteration, source, row["event_id"], row["delta_vector"],
+            row["count"], row["changed_slot_count"], row["changed_slots"],
+        ) for row in rows)
+
+
+def _append_episode_age_event_audit(csv_path: Path, seed: int, iteration: int, rollouts):
+    header = ("Seed", "Iter", "Rollout", "Episode_Age_Bin", "Bin_Transition_Count",
+              "Episodes_With_Transitions_In_Bin", "Event_ID", "Delta_Vector",
+              "Event_Count", "Rate_Per_1000", "Changed_Slot_Count", "Changed_Slots")
+    rows = []
+    for rollout_index, rollout in enumerate(rollouts):
+        if not all(rollout.get(key) is not None for key in ("inv", "inv_next", "done")):
+            raise ValueError(f"Crafter rollout {rollout_index} lacks inventory/done fields for episode-age audit")
+        rows.extend((rollout_index, row) for row in inventory_event_episode_age_rows(
+            rollout["inv"], rollout["inv_next"], rollout["done"]
+        ))
+    if not rows:
+        return
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("a", newline="") as handle:
+        writer = csv.writer(handle)
+        if handle.tell() == 0:
+            writer.writerow(header)
+        for rollout_index, row in rows:
+            writer.writerow((seed, iteration, rollout_index, row["episode_age_bin"],
+                             row["bin_transition_count"], row["episodes_with_transitions_in_bin"],
+                             row["event_id"], row["delta_vector"], row["event_count"],
+                             f"{row['rate_per_1000']:.8f}", row["changed_slot_count"], row["changed_slots"]))
+
+
+def _append_target_event_confusion(csv_path: Path, summary_csv_path: Path, seed: int, iteration: int, target: str, payload):
+    if not payload:
+        return
+    if isinstance(payload, dict):
+        rows = []
+        keep_count = int(payload.get("true_keep_count", 0))
+        keep_false_positive = int(payload.get("true_keep_false_positive", 0))
+        rows.append({
+            "true_event_id": 0,
+            "true_delta_vector": json.dumps([0] * 12, separators=(",", ":")),
+            "true_count": keep_count,
+            "predicted_exact_count": keep_count - keep_false_positive,
+            "predicted_keep_count": keep_count - keep_false_positive,
+            "predicted_other_count": keep_false_positive,
+            "true_keep_false_positive_count": keep_false_positive,
+            "true_change_margin_count": 0,
+            "true_change_margin_mean": float("nan"),
+        })
+        for event in payload.get("events", []):
+            margin_count = int(event.get("margin_count", 0))
+            event_id = -1 if event.get("event_id") is None else int(event["event_id"])
+            rows.append({
+                "true_event_id": event_id,
+                "true_delta_vector": json.dumps(event.get("delta", ()), separators=(",", ":")),
+                "true_count": int(event.get("count", 0)),
+                "predicted_exact_count": int(event.get("exact", 0)),
+                "predicted_keep_count": int(event.get("predicted_keep", 0)),
+                "predicted_other_count": int(event.get("predicted_other", 0)),
+                "true_keep_false_positive_count": (
+                    int(payload.get("true_keep_false_positive", 0))
+                    if event_id == 0 else 0
+                ),
+                "true_change_margin_count": margin_count,
+                "true_change_margin_mean": (
+                    float(event.get("margin_sum", 0.0)) / margin_count
+                    if margin_count else float("nan")
+                ),
+            })
+    else:
+        rows = payload
+    if isinstance(payload, dict):
+        summary_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with summary_csv_path.open("a", newline="") as handle:
+            writer = csv.writer(handle)
+            if handle.tell() == 0:
+                writer.writerow(CRAFTER_TARGET_EVENT_SUMMARY_HEADER)
+            slot_tp = int(payload.get("slot_true_positive", 0))
+            slot_fn = int(payload.get("slot_false_negative", 0))
+            slot_fp = int(payload.get("slot_false_positive", 0))
+            writer.writerow((
+                seed, iteration, target, int(payload.get("sample_count", 0)),
+                int(payload.get("true_keep_count", 0)),
+                int(payload.get("true_keep_false_positive", 0)),
+                slot_tp, slot_fn, slot_fp, int(payload.get("slot_keep_count", 0)),
+                int(payload.get("unknown_event_count", 0)),
+            ))
+    if not rows:
+        return
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("a", newline="") as handle:
+        writer = csv.writer(handle)
+        if handle.tell() == 0:
+            writer.writerow(CRAFTER_TARGET_EVENT_CONFUSION_HEADER)
+        for row in rows:
+            writer.writerow((
+                seed, iteration, target, row["true_event_id"], row["true_delta_vector"],
+                row["true_count"], row["predicted_exact_count"], row["predicted_keep_count"],
+                row["predicted_other_count"], row.get("true_keep_false_positive_count", 0),
+                row.get("true_change_margin_count", 0), row.get("true_change_margin_mean", float("nan")),
+            ))
+
+
+
+CRAFTER_STAGE_PROBE_CSV_HEADER = [
+    "Seed", "Iter", "Map_Index", "Stage_Token", "Environment_Valid",
+    "Probe_Valid", "Layout_Learning_Progress", "Inventory_Learning_Progress",
+    "Layout_LP_Scale", "Inventory_LP_Scale", "Normalized_Layout_LP",
+    "Normalized_Inventory_LP", "Layout_Reward_Layout_LP",
+    "Layout_Reward_Inventory_LP", "Stage_Reward_Layout_LP",
+    "Stage_Reward_Inventory_LP", "Layout_Reward_Layout_LP_Share",
+    "Layout_Reward_Inventory_LP_Share", "Layout_Reward_Novelty_Share",
+    "Stage_Reward_Layout_LP_Share", "Stage_Reward_Inventory_LP_Share",
+    "Stage_Reward_Novelty_Share", "Inventory_Changed_Slots",
+    "Inventory_Changed_Count_Pre", "Stage_Reward",
+]
+
+def _append_crafter_stage_probe_rows(csv_path: Path, seed: int, iteration: int, probe_rows):
+    """Append per-generated-environment inventory LP diagnostics."""
+    import csv
+
+    if not probe_rows:
+        return 0
+    with Path(csv_path).open("a", newline="") as probe_file:
+        writer = csv.writer(probe_file)
+        for row in probe_rows:
+            writer.writerow([
+                seed, iteration, row.get("map_index", -1),
+                row.get("stage_token", -1),
+                int(bool(row.get("environment_valid", False))),
+                int(bool(row.get("valid", False))),
+                row.get("layout_learning_progress", float("nan")),
+                row.get("inventory_learning_progress", float("nan")),
+                row.get("layout_lp_scale", float("nan")),
+                row.get("inventory_lp_scale", float("nan")),
+                row.get("normalized_layout_lp", float("nan")),
+                row.get("normalized_inventory_lp", float("nan")),
+                row.get("layout_reward_layout_lp", float("nan")),
+                row.get("layout_reward_inventory_lp", float("nan")),
+                row.get("stage_reward_layout_lp", float("nan")),
+                row.get("stage_reward_inventory_lp", float("nan")),
+                row.get("layout_reward_layout_lp_share", float("nan")),
+                row.get("layout_reward_inventory_lp_share", float("nan")),
+                row.get("layout_reward_novelty_share", float("nan")),
+                row.get("stage_reward_layout_lp_share", float("nan")),
+                row.get("stage_reward_inventory_lp_share", float("nan")),
+                row.get("stage_reward_novelty_share", float("nan")),
+                row.get("inventory_changed_slots", 0),
+                row.get("inventory_changed_count_pre", 0),
+                row.get("reward_stage", float("nan")),
+            ])
+    return len(probe_rows)
 
 
 def _ensure_csv_header_compatible(csv_path: Path, expected_columns):
@@ -256,6 +447,15 @@ def adversarial_ued_training(cfg: DictConfig):
         
     # Always construct the path so default and overridden cases share one code path.
     env_type = getattr(cfg.attention_model, "env_type", "minigrid")
+    resume_training = env_type == "crafter" and bool(getattr(cfg, "resume_training", False))
+    if resume_training and bool(getattr(cfg, "force_fresh_start", False)):
+        raise ValueError("resume_training=true requires force_fresh_start=false")
+    transition_replay_cfg = getattr(cfg.attention_model, "crafter_transition_replay", None)
+    if env_type == "crafter" and bool(getattr(transition_replay_cfg, "enabled", False)):
+        raise ValueError(
+            "Crafter MAC uses the ordinary FisherReplayBuffer; set "
+            "attention_model.crafter_transition_replay.enabled=false."
+        )
     mask_suffix = f"_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
 
     if env_type == "minigrid":
@@ -265,7 +465,7 @@ def adversarial_ued_training(cfg: DictConfig):
         )
     elif env_type == "crafter":
         summary_csv_path = log_dir / (
-            f"mac_crafter_results{ablation_suffix}{metric_suffix}.csv"
+            f"mac_crafter_lp_layout_stage_novelty_results{ablation_suffix}{metric_suffix}.csv"
         )
     else:
         summary_csv_path = log_dir / f"{env_type}_ued_results{mask_suffix}{ablation_suffix}{metric_suffix}.csv"
@@ -278,6 +478,38 @@ def adversarial_ued_training(cfg: DictConfig):
         f"{summary_csv_path.stem}.seed{int(seed)}.manifest.json"
     )
     map_diagnostics_path = summary_csv_path.with_suffix(".maps.jsonl")
+    resume_state_path = log_dir / f"crafter_mac_seed{seed}.resume.pt"
+    stage_probe_csv_path = None
+    stage_probe_csv_header = CRAFTER_STAGE_PROBE_CSV_HEADER
+    if (env_type == "crafter" and str(getattr(cfg.generator_agent, "crafter_credit_mode", "joint"))
+            in {"split", "split_balanced_global"}):
+        stage_probe_csv_path = summary_csv_path.with_name(
+            f"{summary_csv_path.stem}.stage_probe_rows.csv"
+        )
+    event_audit_cfg = getattr(cfg, "crafter_inventory_event_audit", None)
+    event_audit_enabled = bool(
+        event_audit_cfg.get("enabled", False) if isinstance(event_audit_cfg, dict)
+        else getattr(event_audit_cfg, "enabled", False)
+    ) and env_type == "crafter"
+    event_audit_csv_path = summary_csv_path.with_name(
+        f"{summary_csv_path.stem}.inventory_events.csv"
+    ) if event_audit_enabled else None
+    episode_age_audit_csv_path = summary_csv_path.with_name(
+        f"{summary_csv_path.stem}.inventory_events_by_episode_age.csv"
+    ) if event_audit_enabled else None
+    target_event_confusion_csv_path = summary_csv_path.with_name(
+        f"{summary_csv_path.stem}.target_event_confusion.csv"
+    ) if event_audit_enabled else None
+    target_event_summary_csv_path = summary_csv_path.with_name(
+        f"{summary_csv_path.stem}.target_event_summary.csv"
+    ) if event_audit_enabled else None
+    if event_audit_enabled and not bool(
+        getattr(cfg.attention_model, "crafter_event_confusion_enabled", False)
+    ):
+        raise ValueError(
+            "Crafter inventory event audit requires "
+            "attention_model.crafter_event_confusion_enabled=true"
+        )
 
     data_save_dir = Path(getattr(cfg.env.collect, "data_folder", str(TRAINER_PATH / "data")))
     
@@ -316,6 +548,7 @@ def adversarial_ued_training(cfg: DictConfig):
     # MiniGrid's latent/transition diagnostics are part of its new schema.
     is_bipedal = (env_type == "bipedalwalker")
     is_minigrid = (env_type == "minigrid")
+    is_crafter = (env_type == "crafter")
     if is_bipedal:
         csv_header = [
             "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
@@ -350,20 +583,60 @@ def adversarial_ued_training(cfg: DictConfig):
         ]
     else:
         csv_header = [
-            "Seed", "Iter", "New_Data_Size", "Cumulative_Transitions", "Buffer_Size",
-            "target_val_valid_count", "target_val_avg_val_loss_wm",
-            "target_val_changed_focal_loss",
-            "target_val_layout_changed_focal_loss", "target_val_layout_false_set_rate", "target_val_layout_changed_count",
-            "target_val_inventory_changed_focal_loss", "target_val_inventory_false_set_rate", "target_val_inventory_changed_count",
-            "target_val_joint_accuracy", "target_val_position_accuracy", "target_val_direction_accuracy",
+            "Seed", "Iter",
             "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
-            "Learning_Progress", "Solvable_Count", "Avg_Path_Len", "Inv_Change_Ratio",
+            "Novelty_Total_Mean", "Novelty_Total_Std",
+            "Pre_Changed_Focal_Loss", "Post_Changed_Focal_Loss", "Learning_Progress",
+            "Pre_Layout_Changed_Focal_Loss", "Post_Layout_Changed_Focal_Loss", "Layout_Learning_Progress", "Layout_Paired_Probe_Count",
+            "Pre_Inventory_Changed_Focal_Loss", "Post_Inventory_Changed_Focal_Loss", "Inventory_Learning_Progress", "Inventory_Paired_Probe_Count",
+            "Reward_LP_Mean", "Reward_Novelty_Mean",
+            "Layout_LP_Scale", "Inventory_LP_Scale",
+            "Normalized_Layout_LP_Abs_Mean", "Normalized_Inventory_LP_Abs_Mean",
+            "Layout_Reward_Layout_LP_Abs_Mean", "Layout_Reward_Inventory_LP_Abs_Mean",
+            "Layout_Reward_Layout_LP_Share", "Layout_Reward_Inventory_LP_Share",
+            "Layout_Reward_Novelty_Abs_Mean", "Layout_Reward_Novelty_Share",
+            "Stage_Reward_Layout_LP_Abs_Mean", "Stage_Reward_Inventory_LP_Abs_Mean",
+            "Stage_Reward_Layout_LP_Share", "Stage_Reward_Inventory_LP_Share",
+            "Stage_Reward_Novelty_Abs_Mean", "Stage_Reward_Novelty_Share",
+            "Final_Reward_Mean", "Final_Reward_Std", "Valid_Probe_Count", "Paired_Probe_Count",
+            "PPO_Updated", "PPO_Num_Samples", "PPO_Policy_Loss", "PPO_Value_Loss",
+            "PPO_Approx_KL", "PPO_Clip_Fraction", "PPO_Ratio_Mean", "PPO_Ratio_Min",
+            "PPO_Ratio_Max", "PPO_Reward_Std", "PPO_Advantage_Std",
+            "PPO_Initial_Logprob_Error", "PPO_Grad_Norm", "PPO_Param_Delta",
+            "Layout_Reward_Mean", "Layout_Reward_Std", "Stage_Reward_Mean", "Stage_Reward_Std",
+            "Stage_No_Inventory_Event_Count", "PPO_Layout_Policy_Loss", "PPO_Stage_Policy_Loss",
+            "PPO_Layout_Initial_Logprob_Error", "PPO_Stage_Initial_Logprob_Error",
+            "PPO_Shared_Actor_Gradient_Cosine", "PPO_Shared_Actor_Gradient_Conflict",
+            "PPO_Shared_Actor_Gradient_Conflict_Ratio",
+            "PPO_Shared_Layout_Gradient_Norm", "PPO_Shared_Stage_Gradient_Norm",
+            "PPO_Stage_Head_Policy_Gradient_Norm", "PPO_Stage_Head_Param_Delta",
+            "PPO_Stage_Policy_KL_Pre_Post", "PPO_Stage_Entropy_Pre",
+            "PPO_Stage_Entropy_Post",
+            "Inventory_KEEP_Ratio", "Inventory_Stage_0_Count", "Inventory_Stage_0_Mean_LP", "Inventory_Stage_0_Reward_Std", "Inventory_Stage_1_Count", "Inventory_Stage_1_Mean_LP", "Inventory_Stage_1_Reward_Std", "Inventory_Stage_2_Count", "Inventory_Stage_2_Mean_LP", "Inventory_Stage_2_Reward_Std", "Inventory_Stage_3_Count", "Inventory_Stage_3_Mean_LP", "Inventory_Stage_3_Reward_Std", "Inventory_Stage_4_Count", "Inventory_Stage_4_Mean_LP", "Inventory_Stage_4_Reward_Std",
+            "Inv_Changed_Slots_Mean", "Inv_Change_Ratio", "Solvable_Count", "Avg_Path_Len",
+            "New_Data_Size", "Cumulative_Transitions", "Buffer_Size",
+            "target_val_valid_count", "target_val_sample_count", "target_val_avg_val_loss_wm",
+            "target_val_layout_changed_focal_loss", "target_val_inventory_changed_focal_loss",
+            "target_val_changed_focal_loss",
+            "target_val_layout_false_set_rate", "target_val_layout_changed_count",
+            "target_val_inventory_false_set_rate", "target_val_inventory_changed_count",
+            "target_val_inventory_effect_false_positive_rate",
+            "target_val_inventory_effect_change_recall",
+            "target_val_inventory_effect_change_precision",
+            "target_val_inventory_effect_row_exact",
+            "target_val_joint_accuracy", "target_val_position_accuracy", "target_val_direction_accuracy",
         ]
 
-    file_exists = _ensure_csv_header_compatible(summary_csv_path, csv_header)
-    if strict_results:
+    if env_type == "crafter" and not resume_training and bool(getattr(cfg, "save_iteration_state", True)):
+        guard_fresh_results(summary_csv_path, resume_state_path, seed)
+    file_exists = (
+        summary_csv_path.is_file()
+        if resume_training else _ensure_csv_header_compatible(summary_csv_path, csv_header)
+    )
+    if strict_results and not resume_training:
         _validate_existing_result_rows(summary_csv_path, csv_header, seed)
-    _write_run_manifest(run_manifest_path, cfg)
+    if not resume_training:
+        _write_run_manifest(run_manifest_path, cfg)
     if not file_exists:
         with open(summary_csv_path, mode='w', newline='') as f:
             writer = csv.writer(f)
@@ -372,6 +645,18 @@ def adversarial_ued_training(cfg: DictConfig):
     else:
         print(f"[Logger] Reusing existing summary CSV: {summary_csv_path}")
     print(f"[Logger] Experiment summary will be saved to {summary_csv_path}")
+    if stage_probe_csv_path is not None:
+        if stage_probe_csv_path.exists():
+            with stage_probe_csv_path.open(newline="") as probe_file:
+                existing_header = next(csv.reader(probe_file), None)
+            if existing_header != stage_probe_csv_header:
+                raise ValueError(
+                    f"Stage probe CSV schema mismatch: {stage_probe_csv_path}"
+                )
+        else:
+            with stage_probe_csv_path.open("w", newline="") as probe_file:
+                csv.writer(probe_file).writerow(stage_probe_csv_header)
+        print(f"[Logger] Stage probe rows will be saved to {stage_probe_csv_path}")
     
     # === Domain-aware single-rollout transition cap for MAC/DR ===
     _apply_domain_collection_budget(cfg, env_type)
@@ -435,7 +720,9 @@ def adversarial_ued_training(cfg: DictConfig):
     # === D. Training state variables ===
     old_params, fisher = None, None
     
-    if os.path.exists(ckpt_path):
+    if resume_training:
+        pass  # The full iteration state is loaded after all state holders exist.
+    elif os.path.exists(ckpt_path):
         print(f"[System] Found existing checkpoint at {ckpt_path}. Loading for resume...")
         try:
             # Fix for PyTorch 2.6 security change compatibility
@@ -491,6 +778,24 @@ def adversarial_ued_training(cfg: DictConfig):
     )
     wm_train_frequency = cfg.generator_agent.wm_train_frequency  
     warmup_cleanup_done = False
+    start_iteration = 0
+    if resume_training:
+        state = load_state(resume_state_path, cfg, "crafter_mac", summary_csv_path, csv_header)
+        validate_sidecars(
+            tuple(path for path in (stage_probe_csv_path, event_audit_csv_path,
+                 episode_age_audit_csv_path, target_event_confusion_csv_path,
+                 target_event_summary_csv_path) if path is not None),
+            (map_diagnostics_path,), seed, state["completed_iteration"],
+        )
+        wm_instance.load_state_dict(state["wm"])
+        old_params, fisher = state["old_params"], state["fisher"]
+        restore_replay(fisher_buffer, state["replay"])
+        restore_generator(gen_interface, state["generator"], include_policy=True)
+        cumulative_transitions = state["cumulative_transitions"]
+        warmup_cleanup_done = state["warmup_cleanup_done"]
+        start_iteration = state["completed_iteration"]
+        restore_rng(state["rng"])
+        print(f"[Resume] Crafter MAC completed iteration {start_iteration}; continuing at {start_iteration + 1}")
 
     # === E. Validation set definition (fixed target tasks) ===
     if domain_cfg is not None and (
@@ -540,11 +845,16 @@ def adversarial_ued_training(cfg: DictConfig):
     # --------------------------------------
     # 2. Main loop
     # --------------------------------------
-    for iteration in range(total_iterations):
+    for iteration in range(start_iteration, total_iterations):
         print(
             f"\n=== Iteration {iteration + 1}/{total_iterations} ==="
         )
         inv_change_ratio = 0.0
+        wm_train_seconds = 0.0
+        target_val_seconds = 0.0
+        train_res = {}
+        current_inventory_event_rows = []
+        current_episode_age_rollouts = []
 
         # --------------------------------------------------------
         # Step 0: Transition Handling (Warmup -> Adversarial)
@@ -599,6 +909,8 @@ def adversarial_ued_training(cfg: DictConfig):
         gen_avg_bfs = step_res[8]
         gen_avg_ep_len = step_res[9] if len(step_res) > 9 else 0.0
         num_valid_trajs = len(valid_trajectories)
+        if event_audit_enabled:
+            current_episode_age_rollouts = valid_trajectories
         print(
             f"[Generator] Collected {num_valid_trajs} valid trajectories. Solvable: {gen_solvable_count} | Avg BFS: {gen_avg_bfs:.2f}"
         )
@@ -629,6 +941,10 @@ def adversarial_ued_training(cfg: DictConfig):
 
         if new_batch is not None:
             new_data_size = len(new_batch['obs'])
+            if event_audit_enabled and new_batch.get("inv") is not None and new_batch.get("inv_next") is not None:
+                current_inventory_event_rows = inventory_event_rows(
+                    new_batch["inv"], new_batch["inv_next"]
+                )
             cumulative_transitions += int(new_data_size)
             buffer_input = {
                 "obs": new_batch["obs"],
@@ -677,6 +993,11 @@ def adversarial_ued_training(cfg: DictConfig):
         is_warmup_for_wm = (iteration < warmup_iterations)
         
         if (not is_warmup_for_wm) and (iteration % wm_train_frequency == 0) and (new_batch is not None):
+            if bool(getattr(cfg, "wm_train_seed_per_update", False)):
+                set_seed(int(seed) + iteration - warmup_iterations)
+            if env_type == "crafter" and device.type == "cuda":
+                torch.cuda.synchronize(device)
+            wm_train_start = time.perf_counter()
             print("[World Model] Retraining on current + replay data...")
             
             # Train on the full batch. Filtering is only applied during buffer updates.
@@ -792,6 +1113,8 @@ def adversarial_ued_training(cfg: DictConfig):
                 else:
                     wm_instance.load_state_dict(ckpt)
             except Exception as e:
+                if env_type == "crafter" and bool(getattr(cfg, "save_wm_update_checkpoints", False)):
+                    raise RuntimeError(f"Cannot snapshot MAC iteration {iteration + 1}; WM checkpoint reload failed: {ckpt_path}") from e
                 print(f"[Warning] Failed to reload model: {e}. Using potentially dirty instance.")
                 if isinstance(old_params, dict):
                      wm_instance.load_state_dict(old_params)
@@ -800,6 +1123,13 @@ def adversarial_ued_training(cfg: DictConfig):
 
             # Resynchronize the generator with the updated world model.
             gen_interface.sync_world_model(wm_instance.state_dict())
+            if env_type == "crafter" and bool(getattr(cfg, "save_wm_update_checkpoints", False)):
+                snapshot = save_wm_update_snapshot(ckpt_path, log_dir, iteration + 1)
+                print(f"[Checkpoint] Saved WM update snapshot: {snapshot}")
+            if env_type == "crafter":
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                wm_train_seconds = time.perf_counter() - wm_train_start
 
             print(
                 "[System] World Model updated, reloaded, and synced to Generator."
@@ -869,6 +1199,7 @@ def adversarial_ued_training(cfg: DictConfig):
         target_val_crafter_changed_nll = 0.0
         target_val_crafter_changed_count = 0.0
         target_val_crafter_focal = {name: float("nan") for name in CRAFTER_FOCAL_VAL_METRICS}
+        target_val_crafter_inventory = {name: float("nan") for name in CRAFTER_INVENTORY_VAL_METRICS}
         # Validation policy:
         # 1. Skip validation during early warmup to save time.
         # 2. Validate every step afterward to track progress.
@@ -878,6 +1209,9 @@ def adversarial_ued_training(cfg: DictConfig):
             name="generator_agent.warmup_iterations",
         )
         if target_files and iteration >= (warmup_iters - 1): 
+            if env_type == "crafter" and device.type == "cuda":
+                torch.cuda.synchronize(device)
+            target_val_start = time.perf_counter()
             print(f"\n>>> Validating on Target Tasks...")
             target_ce_losses = []
             target_inv_losses = []
@@ -894,6 +1228,7 @@ def adversarial_ued_training(cfg: DictConfig):
             target_crafter_changed_nlls = []
             target_crafter_changed_counts = []
             target_crafter_focal_values = {name: [] for name in CRAFTER_FOCAL_VAL_METRICS}
+            target_crafter_inventory_values = {name: [] for name in CRAFTER_INVENTORY_VAL_METRICS}
             
             # Temporarily switch to validation mode.
             old_freeze = cfg.attention_model.freeze_weight
@@ -902,6 +1237,10 @@ def adversarial_ued_training(cfg: DictConfig):
             # Disable W&B during validation to avoid hook errors and run spam.
             old_use_wandb = cfg.attention_model.use_wandb
             cfg.attention_model.use_wandb = False
+            validation_sweep = (
+                AttentionWM_training.CrafterTargetValidationSweep()
+                if env_type == "crafter" else None
+            )
 
             for t_name, t_file in zip(target_tasks, target_files):
                 full_target_path = os.path.join(str(target_data_dir), t_file)
@@ -914,10 +1253,17 @@ def adversarial_ued_training(cfg: DictConfig):
                     data_save_dir=str(target_data_dir), 
                     target_file=t_file, 
                     phase_name=f"Iter_{iteration}",
-                    VALID_TIMES=1
+                    VALID_TIMES=1,
+                    validation_sweep=validation_sweep,
                 )
                 
                 if res_dict:
+                    if event_audit_enabled:
+                        _append_target_event_confusion(
+                            target_event_confusion_csv_path, target_event_summary_csv_path,
+                            seed, iteration + 1, Path(t_file).stem,
+                            res_dict.get("crafter_event_confusion", []),
+                        )
                     target_avg_losses.append(res_dict['avg_val_loss_wm'])
                     if is_minigrid:
                         target_focal_losses.append(float(res_dict.get("focal_loss", 0.0)))
@@ -940,7 +1286,19 @@ def adversarial_ued_training(cfg: DictConfig):
                             value = res_dict.get(name)
                             if value is not None and np.isfinite(float(value)):
                                 target_crafter_focal_values[name].append(float(value))
+                        for name in CRAFTER_INVENTORY_VAL_METRICS:
+                            value = res_dict.get(name)
+                            if value is not None and np.isfinite(float(value)):
+                                target_crafter_inventory_values[name].append(float(value))
             
+            if validation_sweep is not None:
+                validation_sweep.trainer = None
+                torch.cuda.empty_cache()
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                target_val_seconds = time.perf_counter() - target_val_start
+
             # Restore configuration values.
             cfg.attention_model.freeze_weight = old_freeze
             cfg.attention_model.use_wandb = old_use_wandb
@@ -959,6 +1317,10 @@ def adversarial_ued_training(cfg: DictConfig):
                     target_val_crafter_changed_nll = float(np.mean(target_crafter_changed_nlls)) if target_crafter_changed_nlls else 0.0
                     target_val_crafter_changed_count = float(np.mean(target_crafter_changed_counts)) if target_crafter_changed_counts else 0.0
                     target_val_crafter_focal = {name: (float(np.mean(values)) if values else float("nan")) for name, values in target_crafter_focal_values.items()}
+                    target_val_crafter_inventory = {
+                        name: float(np.mean(values)) if values else float("nan")
+                        for name, values in target_crafter_inventory_values.items()
+                    }
                     print(
                         f"[Metrics] Combined Target Loss -> Total: "
                         f"{target_val_avg_val_loss_wm:.4f} | "
@@ -1013,8 +1375,12 @@ def adversarial_ued_training(cfg: DictConfig):
         # --------------------------------------------------------
         if summary_csv_path is not None:
             try:
-                if is_minigrid and bool(getattr(diagnostics_cfg, "enabled", False)):
-                    map_records = getattr(gen_interface, "last_minigrid_map_diagnostics", [])
+                if (is_minigrid and bool(getattr(diagnostics_cfg, "enabled", False))) or is_crafter:
+                    map_records = getattr(
+                        gen_interface,
+                        "last_minigrid_map_diagnostics" if is_minigrid else "last_crafter_map_diagnostics",
+                        [],
+                    )
                     if map_records:
                         with open(map_diagnostics_path, mode="a", encoding="utf-8") as handle:
                             for record in map_records:
@@ -1134,7 +1500,12 @@ def adversarial_ued_training(cfg: DictConfig):
                                 "Cumulative_Transitions": cumulative_transitions,
                                 "Buffer_Size": len(fisher_buffer),
                                 "target_val_valid_count": target_val_valid_count,
+                                "target_val_sample_count": target_val_valid_count * int(cfg.attention_model.target_validation_max_samples),
                                 "target_val_avg_val_loss_wm": f"{target_val_avg_val_loss_wm:.6f}",
+                                "target_val_inventory_effect_false_positive_rate": f"{target_val_crafter_inventory['inventory_effect_false_positive_rate']:.6f}",
+                                "target_val_inventory_effect_change_recall": f"{target_val_crafter_inventory['inventory_effect_change_recall']:.6f}",
+                                "target_val_inventory_effect_change_precision": f"{target_val_crafter_inventory['inventory_effect_change_precision']:.6f}",
+                                "target_val_inventory_effect_row_exact": f"{target_val_crafter_inventory['inventory_effect_row_exact']:.6f}",
                                 "target_val_changed_focal_loss": f"{target_val_crafter_focal['changed_focal_loss']:.6f}",
                                 "target_val_layout_changed_focal_loss": f"{target_val_crafter_focal['layout_changed_focal_loss']:.6f}",
                                 "target_val_layout_false_set_rate": f"{target_val_crafter_focal['layout_false_set_rate']:.6f}",
@@ -1147,16 +1518,105 @@ def adversarial_ued_training(cfg: DictConfig):
                                 "target_val_direction_accuracy": f"{target_val_crafter_focal['direction_accuracy']:.6f}",
                                 "Gen_Mean_Reward": f"{gen_mean_reward:.4f}", "Gen_Loss": f"{gen_loss:.4f}",
                                 "Gen_Entropy": f"{gen_entropy:.4f}", "Gen_Div_Reward": f"{gen_div_reward_val:.4f}",
+                                "Pre_Changed_Focal_Loss": f"{getattr(gen_interface, 'last_crafter_metrics', {}).get('Pre_Changed_Focal_Loss', float('nan')):.6f}",
+                                "Post_Changed_Focal_Loss": f"{getattr(gen_interface, 'last_crafter_metrics', {}).get('Post_Changed_Focal_Loss', float('nan')):.6f}",
                                 "Learning_Progress": f"{getattr(gen_interface, 'last_crafter_metrics', {}).get('Learning_Progress', float('nan')):.6f}",
+                                **{key: f"{getattr(gen_interface, 'last_crafter_metrics', {}).get(key, float('nan')):.6f}" for key in (
+                                    "Pre_Layout_Changed_Focal_Loss", "Post_Layout_Changed_Focal_Loss", "Layout_Learning_Progress",
+                                    "Pre_Inventory_Changed_Focal_Loss", "Post_Inventory_Changed_Focal_Loss", "Inventory_Learning_Progress",
+                                )},
+                                **{key: int(getattr(gen_interface, "last_crafter_metrics", {}).get(key, 0)) for key in (
+                                    "Layout_Paired_Probe_Count", "Inventory_Paired_Probe_Count",
+                                )},
                                 "Solvable_Count": f"{gen_solvable_count}", "Avg_Path_Len": f"{gen_avg_ep_len:.2f}",
                                 "Inv_Change_Ratio": f"{inv_change_ratio:.6f}",
+                                "Valid_Probe_Count": int(getattr(gen_interface, "last_crafter_metrics", {}).get("valid_probe_count", 0)),
+                                "Paired_Probe_Count": int(getattr(gen_interface, "last_crafter_metrics", {}).get("paired_probe_count", 0)),
+                                **{key: f"{getattr(gen_interface, 'last_crafter_metrics', {}).get(key, float('nan')):.6f}" for key in (
+                                    "Novelty_Total_Mean", "Novelty_Total_Std", "Reward_LP_Mean",
+                                    "Reward_Novelty_Mean", "Layout_LP_Scale", "Inventory_LP_Scale",
+                                    "Normalized_Layout_LP_Abs_Mean", "Normalized_Inventory_LP_Abs_Mean",
+                                    "Layout_Reward_Layout_LP_Abs_Mean", "Layout_Reward_Inventory_LP_Abs_Mean",
+                                    "Layout_Reward_Layout_LP_Share", "Layout_Reward_Inventory_LP_Share",
+                                    "Layout_Reward_Novelty_Abs_Mean", "Layout_Reward_Novelty_Share",
+                                    "Stage_Reward_Layout_LP_Abs_Mean", "Stage_Reward_Inventory_LP_Abs_Mean",
+                                    "Stage_Reward_Layout_LP_Share", "Stage_Reward_Inventory_LP_Share",
+                                    "Stage_Reward_Novelty_Abs_Mean", "Stage_Reward_Novelty_Share",
+                                    "Final_Reward_Mean", "Final_Reward_Std", "Inv_Changed_Slots_Mean",
+                                )},
+                                "PPO_Reward_Std": f"{ppo_value('reward_std'):.6f}",
+                                "PPO_Param_Delta": f"{ppo_value('param_delta'):.9f}",
+                                **{key: f"{getattr(gen_interface, 'last_crafter_metrics', {}).get(key, float('nan')):.6f}" for key in (
+                                    "Layout_Reward_Mean", "Layout_Reward_Std", "Stage_Reward_Mean",
+                                    "Stage_Reward_Std",
+                                )},
+                                "Stage_No_Inventory_Event_Count": int(getattr(gen_interface, "last_crafter_metrics", {}).get("Stage_No_Inventory_Event_Count", 0)),
+                                "PPO_Layout_Policy_Loss": f"{ppo_value('layout_policy_loss'):.6f}",
+                                "PPO_Stage_Policy_Loss": f"{ppo_value('stage_policy_loss'):.6f}",
+                                "PPO_Layout_Initial_Logprob_Error": f"{ppo_value('initial_layout_logprob_max_error'):.9f}",
+                                "PPO_Stage_Initial_Logprob_Error": f"{ppo_value('initial_stage_logprob_max_error'):.9f}",
+                                "PPO_Shared_Actor_Gradient_Cosine": f"{ppo_value('shared_actor_gradient_cosine', float('nan')):.6f}",
+                                "PPO_Shared_Actor_Gradient_Conflict": f"{ppo_value('shared_actor_gradient_conflict', float('nan')):.0f}",
+                                "PPO_Shared_Actor_Gradient_Conflict_Ratio": f"{ppo_value('shared_actor_gradient_conflict_ratio', float('nan')):.6f}",
+                                "PPO_Shared_Layout_Gradient_Norm": f"{ppo_value('shared_layout_gradient_norm', float('nan')):.9f}",
+                                "PPO_Shared_Stage_Gradient_Norm": f"{ppo_value('shared_stage_gradient_norm', float('nan')):.9f}",
+                                "PPO_Stage_Head_Policy_Gradient_Norm": f"{ppo_value('stage_head_policy_gradient_norm', float('nan')):.9f}",
+                                "PPO_Stage_Head_Param_Delta": f"{ppo_value('stage_head_parameter_delta', float('nan')):.9f}",
+                                "PPO_Stage_Policy_KL_Pre_Post": f"{ppo_value('stage_policy_kl_pre_post', float('nan')):.9f}",
+                                "PPO_Stage_Entropy_Pre": f"{ppo_value('stage_entropy_pre', float('nan')):.9f}",
+                                "PPO_Stage_Entropy_Post": f"{ppo_value('stage_entropy_post', float('nan')):.9f}",
+                                "PPO_Updated": int(bool(ppo_metrics.get("updated", False))),
+                                "PPO_Num_Samples": int(ppo_value("num_samples", 0)),
+                                "PPO_Policy_Loss": f"{ppo_value('policy_loss'):.6f}",
+                                "PPO_Value_Loss": f"{ppo_value('value_loss'):.6f}",
+                                "PPO_Approx_KL": f"{ppo_value('approx_kl'):.6f}",
+                                "PPO_Clip_Fraction": f"{ppo_value('clip_fraction'):.6f}",
+                                "PPO_Ratio_Mean": f"{ppo_value('ratio_mean'):.6f}",
+                                "PPO_Ratio_Min": f"{ppo_value('ratio_min'):.6f}",
+                                "PPO_Ratio_Max": f"{ppo_value('ratio_max'):.6f}",
+                                "PPO_Advantage_Std": f"{ppo_value('advantage_std'):.6f}",
+                                "PPO_Initial_Logprob_Error": f"{ppo_value('initial_logprob_error'):.9f}",
+                                "PPO_Grad_Norm": f"{ppo_value('grad_norm'):.6f}",
+                                **{key: f"{getattr(gen_interface, 'last_crafter_metrics', {}).get(key, 0.0):.6f}" for key in ("Inventory_KEEP_Ratio", *(f"Inventory_Stage_{stage}_{metric}" for stage in range(5) for metric in ("Count", "Mean_LP", "Reward_Std")))},
                             }
 
                     writer = csv.writer(f)
-                    writer.writerow(list(row_data.values()))
+                    writer.writerow([row_data[column] for column in csv_header] if is_crafter else list(row_data.values()))
+
+                if stage_probe_csv_path is not None:
+                    probe_rows = getattr(gen_interface, "last_crafter_map_diagnostics", [])
+                    _append_crafter_stage_probe_rows(
+                        stage_probe_csv_path, seed, iteration + 1, probe_rows
+                    )
+                if event_audit_enabled:
+                    _append_inventory_event_audit(
+                        event_audit_csv_path, seed, iteration + 1, "new_batch",
+                        current_inventory_event_rows,
+                    )
+                    _append_inventory_event_audit(
+                        event_audit_csv_path, seed, iteration + 1, "replay_selected",
+                        train_res.get("replay_inventory_event_rows", []),
+                    )
+                    _append_episode_age_event_audit(
+                        episode_age_audit_csv_path, seed, iteration + 1,
+                        current_episode_age_rollouts,
+                    )
 
             except Exception as e:
                 print(f"[Error] Failed to write CSV log: {e}")
+                if is_crafter:
+                    raise
+
+        if env_type == "crafter":
+            timing = gen_interface.crafter_timing
+            print(
+                "[Timing] "
+                f"collection={timing['collection']:.3f}s "
+                f"lp_pre={timing['lp_pre']:.3f}s "
+                f"wm_train={wm_train_seconds:.3f}s "
+                f"lp_post={timing['lp_post']:.3f}s "
+                f"target_val={target_val_seconds:.3f}s"
+            )
 
         # --------------------------------------------------------
         # Step 7: Cleanup Temporary Data
@@ -1173,6 +1633,18 @@ def adversarial_ued_training(cfg: DictConfig):
                 except Exception as e:
                     print(f"[Warning] Could not delete {f}: {e}")
             print(f"[Cleanup] Done.")
+
+        if env_type == "crafter" and bool(getattr(cfg, "save_iteration_state", True)):
+            save_state(resume_state_path, {
+                "version": 1, "kind": "crafter_mac", "config_digest": config_digest(cfg),
+                "completed_iteration": iteration + 1,
+                "cumulative_transitions": cumulative_transitions,
+                "warmup_cleanup_done": warmup_cleanup_done,
+                "wm": wm_instance.state_dict(), "old_params": old_params, "fisher": fisher,
+                "replay": replay_state(fisher_buffer),
+                "generator": generator_state(gen_interface, include_policy=True),
+                "rng": rng_state(),
+            })
 
     if corpus_writer is not None:
         corpus_path = corpus_writer.finalize()

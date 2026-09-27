@@ -11,7 +11,7 @@ domain: 'crafter'             # Options: 'crafter' or 'minigrid' or 'bipedal'
 # --- Force Random Exploration (DR core) ---
 generator_agent:
   agent_type: 'random'         # No adversarial, just random maps
-  total_iterations: 100 # 30 minigrid 50 bipedal
+  total_iterations: 50 # 30 minigrid 50 bipedal
   wm_train_frequency: 1
   warmup_iterations: 0         # No need to warm up random
 
@@ -61,9 +61,9 @@ attention_model:
 
 domains:
   crafter:
-    # DR validation uses the newly collected controlled coverage benchmark.
-    # Keep the shared MAC/default Crafter suffix on the legacy uniform data.
-    val_suffix: "_coverage_v3.npz"
+    # DR/WM validation uses the newly collected broad-coverage uniform data.
+    # Generator inventory stages are sampled from code-defined ranges.
+    val_suffix: "_uniform.npz"
   minigrid:
     rmax_like:
       backend: ppo
@@ -75,4 +75,8 @@ env:
     env_visualize_save_path: ${domains.${domain}.env_visualize_folder}dr/${ablation.type}/seed${seed}/
 
 seed: 0
+# New Crafter runs save a full completed-iteration state in their results directory.
+# Resume only from that file, with the same CSV and configuration.
+save_iteration_state: true
+resume_training: false
 force_fresh_start: true         # Set to true to delete old model and start from scratch

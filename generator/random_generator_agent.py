@@ -41,7 +41,7 @@ class RandomGeneratorAgent:
         
         returns:
             action: [B, H, W]  <-- Terrain actions
-            stats_action: [B, 32] <-- Inventory actions (32 piano keys)
+            stats_action: [B, 1] for Crafter stages; [B, 32] zeros for Bipedal; [B, 1] for MiniGrid
             logprob: [B]
             value: [B]
             topk_mask: [B, H, W] actual sampled edit mask
@@ -58,7 +58,7 @@ class RandomGeneratorAgent:
             else torch.zeros((B, H, W), dtype=torch.bool, device=self.device)
         )
         edit_ratio = float(np.clip(max_edits_layout, 0.0, 1.0))
-        if self.env_type == "minigrid":
+        if self.env_type in {"minigrid", "crafter"}:
             # Match MAC's fixed MiniGrid edit budget while keeping DR's
             # location sampling random.  The previous Bernoulli mask gave DR
             # an additional edit-count variance that MAC did not have.
@@ -95,16 +95,16 @@ class RandomGeneratorAgent:
                 1, 5, (int(edit_inventory.sum()),), device=self.device
             )
             topk_stats_mask = edit_inventory.unsqueeze(1)
+        elif self.env_type == "crafter":
+            # KEEP and all five Crafter stages form one uniform six-way action.
+            # max_stats_edit_ratio remains in the shared interface but is
+            # intentionally ignored for this domain.
+            stats_action = torch.randint(0, 6, (B, 1), device=self.device)
+            topk_stats_mask = stats_action.ne(0)
         else:
-            # Crafter uses 32 piano keys: +1 and +5 for each of 16 slots.
-            num_keys = 32
-            current_p = np.random.uniform(0.0, max_stats_edit_ratio)
-            editable = torch.ones(num_keys, device=self.device, dtype=torch.bool)
-            editable[0:4] = False
-            editable[16:20] = False
-            rand_tensor = torch.rand((B, num_keys), device=self.device)
-            stats_action = ((rand_tensor < current_p) & editable.unsqueeze(0)).float()
-            topk_stats_mask = editable.unsqueeze(0).expand(B, -1).clone()
+            # Bipedal retains its unused 32-stat compatibility tensor.
+            stats_action = torch.zeros((B, 32), dtype=torch.long, device=self.device)
+            topk_stats_mask = torch.zeros((B, 32), dtype=torch.bool, device=self.device)
             
         # --- 3. Dummies ---
         logprob = torch.zeros(B, device=self.device)

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.distributions import Categorical
 from collections import deque
 
 from generator.generator_network import MapEditorActorCritic
@@ -32,12 +33,13 @@ class GeneratorPPO:
         update_every_rounds=1,
         num_actions=11,
         # ratio=0.25, # removed
-        top_k_features=16,
         ablation_type="none",
         env_type="minigrid",
         initial_edit_ratio=0.3,
         initial_inventory_edit_ratio=0.0,
         edit_action_group_sizes=None,
+        crafter_credit_mode="joint",
+        warmup_iterations=0,
 
     ):
         self.gamma = gamma
@@ -53,15 +55,16 @@ class GeneratorPPO:
         self.update_every_rounds = max(1, int(update_every_rounds))
         self.context_dim = context_dim
         self.env_type = str(env_type).lower()
+        if crafter_credit_mode not in ("joint", "split", "split_balanced_global"):
+            raise ValueError(
+                "crafter_credit_mode must be 'joint', 'split', or 'split_balanced_global'"
+            )
+        self.crafter_credit_mode = crafter_credit_mode
+        self.warmup_iterations = max(0, int(warmup_iterations))
         # self.ratio = ratio # removed
-        self.top_k_features = top_k_features
         self.is_bipedal = (self.env_type == "bipedalwalker")
         self.is_minigrid = (self.env_type == "minigrid")
-        self.policy_context_dim = (
-            context_dim
-            if self.is_bipedal or self.is_minigrid
-            else context_dim * 2
-        )
+        self.policy_context_dim = context_dim
 
         # history encoder
         
@@ -154,6 +157,9 @@ class GeneratorPPO:
             "stats_logprob": [],  # Inventory logprobs (summed vector)
             "value": [],
             "reward": [],
+            "layout_reward": [],
+            "stage_reward": [],
+            "stage_logprob": [],
             "topk_mask": [],
             "location_order": [],
             "stats_topk_mask": [],
@@ -163,6 +169,8 @@ class GeneratorPPO:
         self.last_entropy_coef = float(self.entropy_coef_start)
         self.round_lengths = deque()
         self.current_round_count = 0
+        self._shared_actor_gradient_conflict_updates = 0
+        self._shared_actor_gradient_measure_count = 0
         self.last_diagnostics = self._empty_diagnostics()
 
     @staticmethod
@@ -181,6 +189,22 @@ class GeneratorPPO:
             "entropy_loss": 0.0,
             "total_loss": 0.0,
             "initial_logprob_max_error": 0.0,
+            "initial_layout_logprob_max_error": 0.0,
+            "initial_stage_logprob_max_error": 0.0,
+            "layout_policy_loss": 0.0,
+            "stage_policy_loss": 0.0,
+            "stage_reward_mean": 0.0,
+            "stage_reward_std": 0.0,
+            "shared_actor_gradient_cosine": float("nan"),
+            "shared_actor_gradient_conflict": float("nan"),
+            "shared_actor_gradient_conflict_ratio": float("nan"),
+            "shared_layout_gradient_norm": float("nan"),
+            "shared_stage_gradient_norm": float("nan"),
+            "stage_head_policy_gradient_norm": float("nan"),
+            "stage_head_parameter_delta": float("nan"),
+            "stage_policy_kl_pre_post": float("nan"),
+            "stage_entropy_pre": float("nan"),
+            "stage_entropy_post": float("nan"),
             "ratio_mean": 1.0,
             "ratio_min": 1.0,
             "ratio_max": 1.0,
@@ -221,6 +245,66 @@ class GeneratorPPO:
                     squared_norm += parameter.grad.detach().float().pow(2).sum().item()
         return squared_norm ** 0.5
 
+    def _crafter_shared_actor_parameters(self):
+        """Parameters used by both Crafter layout and stage policy losses."""
+        shared = []
+        seen = set()
+        modules = (
+            getattr(self.policy, name, None)
+            for name in ("emb_obj", "emb_color", "emb_state", "stem", "res_blocks", "history_fusion")
+        )
+        if self.encoder is not None:
+            modules = (*modules, self.encoder)
+        for module in modules:
+            if module is None:
+                continue
+            for parameter in module.parameters():
+                if parameter.requires_grad and id(parameter) not in seen:
+                    shared.append(parameter)
+                    seen.add(id(parameter))
+        return shared
+
+    @staticmethod
+    def _shared_gradient_similarity(layout_grads, stage_grads):
+        """Return cosine and norms over parameters receiving both actor gradients."""
+        paired = [
+            (layout.detach().reshape(-1), stage.detach().reshape(-1))
+            for layout, stage in zip(layout_grads, stage_grads)
+            if layout is not None and stage is not None
+        ]
+        if not paired:
+            return float("nan"), float("nan"), float("nan")
+        layout_vector = torch.cat([pair[0] for pair in paired])
+        stage_vector = torch.cat([pair[1] for pair in paired])
+        layout_norm = torch.linalg.vector_norm(layout_vector)
+        stage_norm = torch.linalg.vector_norm(stage_vector)
+        norm_product = layout_norm * stage_norm
+        if not torch.isfinite(norm_product) or norm_product.item() <= 1e-12:
+            return float("nan"), float(layout_norm.item()), float(stage_norm.item())
+        cosine = torch.dot(layout_vector, stage_vector) / norm_product
+        return (
+            float(cosine.clamp(-1.0, 1.0).item()),
+            float(layout_norm.item()),
+            float(stage_norm.item()),
+        )
+
+    @staticmethod
+    def _gradient_list_norm(gradients):
+        squared_norm = sum(
+            gradient.detach().float().pow(2).sum().item()
+            for gradient in gradients
+            if gradient is not None
+        )
+        return squared_norm ** 0.5
+
+    @staticmethod
+    def _parameter_list_delta(parameters, before):
+        squared_delta = sum(
+            (parameter.detach().float() - previous.float()).pow(2).sum().item()
+            for parameter, previous in zip(parameters, before)
+        )
+        return squared_delta ** 0.5
+
     def _get_entropy_coef(self, iteration=None):
         if iteration is None or self.entropy_anneal_iters <= 0:
             return float(self.entropy_coef)
@@ -236,40 +320,10 @@ class GeneratorPPO:
     # ------------------------------------------------------------------
     # Context
     # ------------------------------------------------------------------
-    def _compute_global_context_dual(self, prev_map, terrain_heat, stats_heat, top_k_features=None):
-        """
-        Aggregate spatial failure features and inventory failure features.
-        Crafter keeps both:
-        - local per-sample history context
-        - global batch summary context
-
-        MiniGrid keeps only its per-sample semantic context. Broadcasting a
-        batch-wise max makes every generated map chase the same dominant
-        pattern and is unnecessary once absolute coordinates are removed.
-        """
-        top_k_features = self.top_k_features if top_k_features is None else int(top_k_features)
-        # Use the HistoryEncoder to extract per-sample failure features.
-        ctx = self.encoder(prev_map, terrain_heat, stats_heat) # [B, context_dim]
-
-        if self.is_bipedal or self.is_minigrid:
-            return F.normalize(ctx, p=2, dim=1)
-        
-        local_ctx = F.normalize(ctx, p=2, dim=1)
-
-        # Aggregate across the batch with max pooling.
-        v_ctx, _ = torch.max(ctx, dim=0, keepdim=True) # [1, context_dim]
-
-        # Keep only the most salient features via top-k sparsification.
-        if v_ctx.size(1) > top_k_features:
-            top_val, _ = torch.topk(v_ctx, k=top_k_features, dim=1)
-            min_val = top_val[:, -1:]
-            mask = (v_ctx >= min_val).float()
-            v_ctx = v_ctx * mask
-
-        # Normalize feature magnitudes.
-        global_ctx = F.normalize(v_ctx, p=2, dim=1)
-        global_ctx = global_ctx.expand(local_ctx.size(0), -1)
-        return torch.cat([local_ctx, global_ctx], dim=1)
+    def _compute_global_context_dual(self, prev_map, terrain_heat, stats_heat):
+        """Encode each generated environment's own previous probe feedback."""
+        ctx = self.encoder(prev_map, terrain_heat, stats_heat)
+        return F.normalize(ctx, p=2, dim=1)
 
     # ------------------------------------------------------------------
     # Rollout
@@ -287,7 +341,7 @@ class GeneratorPPO:
                 H, W = base_map.size(2), base_map.size(3)
                 # pm: prev_map, pht: prev_heat_terrain, phs: prev_heat_stats
                 pm = torch.zeros((1, 3, H, W), device=device)
-                feedback_channels = 2 if self.env_type == "minigrid" else 1
+                feedback_channels = 2 if self.env_type in ("minigrid", "crafter") else 1
                 pht = torch.zeros((1, feedback_channels, H, W), device=device)
                 phs = None if self.env_type == "minigrid" else torch.zeros(
                     (1, 26 if self.env_type == "bipedalwalker" else 16), device=device
@@ -307,16 +361,27 @@ class GeneratorPPO:
             if phs is not None and phs.size(0) == 1 and B > 1:
                 phs = phs.repeat(B, 1)
 
-        (
-            action, stats_act, map_logp, location_logp, stats_logp, value,
-            topk_mask, location_order, topk_stats_mask,
-        ) = self.policy_old.act(
-            base_map, ctx, mask, max_edits_layout, max_stats_edit_ratio=max_edits_stats, stats_heat=phs
+        act_result = self.policy_old.act(
+            base_map, ctx, mask, max_edits_layout,
+            max_stats_edit_ratio=max_edits_stats, stats_heat=phs,
+            return_stage_diagnostics=self.env_type == "crafter",
         )
+        if self.env_type == "crafter":
+            (
+                action, stats_act, map_logp, location_logp, stats_logp, value,
+                topk_mask, location_order, topk_stats_mask,
+                self.last_stage_probabilities, _stage_entropy,
+            ) = act_result
+        else:
+            (
+                action, stats_act, map_logp, location_logp, stats_logp, value,
+                topk_mask, location_order, topk_stats_mask,
+            ) = act_result
 
         # The fixed-budget MiniGrid action has two learned factors: the
         # ordered location set and the categorical type at each location.
         total_logprob = map_logp.sum(dim=(1, 2)) + location_logp + stats_logp
+        self.last_stage_logprob = stats_logp.detach()
         return (
             action, stats_act, total_logprob, value, topk_mask,
             location_order, topk_stats_mask, global_ctx,
@@ -328,6 +393,7 @@ class GeneratorPPO:
     def save_buffer(
         self, curr_map, prev_data, mask, action, stats_action, logprob, value,
         reward, topk_mask, location_order, stats_topk_mask,
+        stage_logprob=None, layout_reward=None, stage_reward=None,
     ):
         self.buffer["curr_map"].append(curr_map.cpu())
         self.buffer["mask"].append(mask.cpu())
@@ -336,6 +402,11 @@ class GeneratorPPO:
         self.buffer["logprob"].append(logprob.cpu())
         self.buffer["value"].append(value.cpu())
         self.buffer["reward"].append(float(reward))
+        self.buffer["layout_reward"].append(float(reward if layout_reward is None else layout_reward))
+        self.buffer["stage_reward"].append(float(reward if stage_reward is None else stage_reward))
+        self.buffer["stage_logprob"].append(
+            torch.zeros_like(logprob).cpu() if stage_logprob is None else stage_logprob.detach().cpu()
+        )
         self.buffer["topk_mask"].append(topk_mask.cpu())
         self.buffer["location_order"].append(location_order.cpu())
         self.buffer["stats_topk_mask"].append(stats_topk_mask.cpu())
@@ -343,7 +414,7 @@ class GeneratorPPO:
         if prev_data is None:
             B, _, H, W = curr_map.shape
             self.buffer["prev_map"].append(torch.zeros((B, 3, H, W)))
-            feedback_channels = 2 if self.env_type == "minigrid" else 1
+            feedback_channels = 2 if self.env_type in ("minigrid", "crafter") else 1
             self.buffer["prev_heat"].append(
                 torch.zeros((B, feedback_channels, H, W))
             )
@@ -421,7 +492,16 @@ class GeneratorPPO:
                 f"({round_count} > {self.update_every_rounds})."
             )
 
+        split_active = (
+            self.env_type == "crafter"
+            and self.crafter_credit_mode in {"split", "split_balanced_global"}
+            and iteration is not None and iteration >= self.warmup_iterations
+        )
         raw_rewards = torch.tensor(self.buffer["reward"], device=device)
+        raw_stage_rewards = torch.tensor(self.buffer["stage_reward"], device=device)
+        stage_reward_std = raw_stage_rewards.std(unbiased=False).item() if len(raw_stage_rewards) > 1 else 0.0
+        if split_active and (len(raw_stage_rewards) != len(raw_rewards) or len(self.buffer["stage_logprob"]) != len(raw_rewards)):
+            raise ValueError("Crafter split credit requires one stage reward and log probability per rollout")
         self.last_mean_reward = raw_rewards.mean().item()
         current_entropy_coef = self._get_entropy_coef(iteration)
         self.last_entropy_coef = current_entropy_coef
@@ -441,6 +521,13 @@ class GeneratorPPO:
         action = torch.cat(self.buffer["action"]).to(device)
         stats_action = torch.cat(self.buffer["stats_action"]).to(device)
         old_logprob = torch.cat(self.buffer["logprob"]).to(device)
+        if split_active:
+            old_stage_logprob = torch.cat(self.buffer["stage_logprob"]).to(device)
+            old_layout_logprob = old_logprob - old_stage_logprob
+            if len(raw_stage_rewards) > 1 and stage_reward_std > 1e-4:
+                stage_advantages = (raw_stage_rewards - raw_stage_rewards.mean()) / (stage_reward_std + 1e-8)
+            else:
+                stage_advantages = torch.zeros_like(raw_stage_rewards)
         old_value = torch.cat(self.buffer["value"]).to(device).reshape(-1)
         topk_mask = torch.cat(self.buffer["topk_mask"]).to(device)
         location_order = torch.cat(self.buffer["location_order"]).to(device)
@@ -457,6 +544,22 @@ class GeneratorPPO:
         parameter_before = self._parameter_snapshot()
         last_metrics = None
         initial_logprob_max_error = 0.0
+        initial_layout_logprob_max_error = 0.0
+        initial_stage_logprob_max_error = 0.0
+        shared_gradient_cosine = float("nan")
+        shared_layout_gradient_norm = float("nan")
+        shared_stage_gradient_norm = float("nan")
+        stage_head_policy_gradient_norm = float("nan")
+        stage_head_parameters = list(self.policy.stats_actor.parameters()) if split_active else []
+        stage_head_before = [parameter.detach().clone() for parameter in stage_head_parameters]
+        stage_pre_prob_parts = []
+        stage_pre_entropy_parts = []
+        stage_context_parts = []
+        stage_diagnostic_ranges = []
+        stage_policy_kl_pre_post = float("nan")
+        stage_entropy_pre = float("nan")
+        stage_entropy_post = float("nan")
+        shared_actor_parameters = self._crafter_shared_actor_parameters() if split_active else []
         for epoch in range(self.K_epochs):
             # Evaluate each rollout round with the same batch shape used when
             # its log-probability was collected. This avoids harmless but
@@ -464,7 +567,7 @@ class GeneratorPPO:
             # convolution kernels when update_every_rounds > 1.
             round_ranges = []
             offset = 0
-            if self.is_minigrid:
+            if self.is_minigrid or self.env_type == "crafter":
                 for round_length in self.round_lengths:
                     end = offset + int(round_length)
                     round_ranges.append((offset, end))
@@ -486,19 +589,27 @@ class GeneratorPPO:
                     if ctx_part.size(0) != end - start:
                         ctx_part = ctx_part.repeat(end - start, 1)
 
-                eval_parts.append(
-                    self.policy.evaluate(
-                        curr_map[start:end],
-                        ctx_part,
-                        (action[start:end], stats_action[start:end]),
-                        mask[start:end],
-                        target_topk_mask=topk_mask[start:end],
-                        target_location_order=location_order[start:end],
-                        target_stats_topk_mask=stats_topk_mask[start:end],
-                        stats_heat=prev_heat_stats[start:end],
-                    )
+                stage_diagnostics_requested = split_active and epoch == 0
+                evaluation = self.policy.evaluate(
+                    curr_map[start:end],
+                    ctx_part,
+                    (action[start:end], stats_action[start:end]),
+                    mask[start:end],
+                    target_topk_mask=topk_mask[start:end],
+                    target_location_order=location_order[start:end],
+                    target_stats_topk_mask=stats_topk_mask[start:end],
+                    stats_heat=prev_heat_stats[start:end],
+                    return_stage_diagnostics=stage_diagnostics_requested,
                 )
+                eval_parts.append(evaluation[:5])
                 entropy_parts.append(eval_parts[-1][-1])
+                if stage_diagnostics_requested:
+                    stage_pre_prob_parts.append(evaluation[5])
+                    stage_pre_entropy_parts.append(evaluation[6])
+                    stage_context_parts.append(
+                        ctx_part.detach() if torch.is_tensor(ctx_part) else None
+                    )
+                    stage_diagnostic_ranges.append((start, end))
 
             logp_terrain = torch.cat([part[0] for part in eval_parts], dim=0)
             logp_location = torch.cat([part[1] for part in eval_parts], dim=0)
@@ -520,9 +631,57 @@ class GeneratorPPO:
                     total_logp.detach() - old_logprob.detach()
                 ).max().item()
             ratio = torch.exp(logprob_delta)
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-            loss_policy = -torch.min(surr1, surr2).mean()
+            if split_active:
+                layout_logp = logp_terrain.sum(dim=(1, 2)) + logp_location
+                layout_delta = layout_logp - old_layout_logprob.detach()
+                stage_delta = logp_stats - old_stage_logprob.detach()
+                if epoch == 0:
+                    initial_layout_logprob_max_error = layout_delta.detach().abs().max().item()
+                    initial_stage_logprob_max_error = stage_delta.detach().abs().max().item()
+                layout_ratio = torch.exp(layout_delta)
+                stage_ratio = torch.exp(stage_delta)
+                loss_layout_policy = -torch.min(
+                    layout_ratio * advantages,
+                    torch.clamp(layout_ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantages,
+                ).mean()
+                loss_stage_policy = -torch.min(
+                    stage_ratio * stage_advantages,
+                    torch.clamp(stage_ratio, 1 - self.eps_clip, 1 + self.eps_clip) * stage_advantages,
+                ).mean()
+                loss_policy = loss_layout_policy + loss_stage_policy
+                if epoch == 0 and shared_actor_parameters:
+                    layout_shared_grads = torch.autograd.grad(
+                        loss_layout_policy,
+                        shared_actor_parameters,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )
+                    stage_shared_grads = torch.autograd.grad(
+                        loss_stage_policy,
+                        shared_actor_parameters,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )
+                    (
+                        shared_gradient_cosine,
+                        shared_layout_gradient_norm,
+                        shared_stage_gradient_norm,
+                    ) = self._shared_gradient_similarity(layout_shared_grads, stage_shared_grads)
+                    stage_head_grads = torch.autograd.grad(
+                        loss_stage_policy,
+                        stage_head_parameters,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )
+                    stage_head_policy_gradient_norm = self._gradient_list_norm(
+                        stage_head_grads
+                    )
+            else:
+                surr1 = ratio * advantages
+                surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+                loss_policy = -torch.min(surr1, surr2).mean()
+                loss_layout_policy = loss_policy
+                loss_stage_policy = torch.zeros_like(loss_policy)
             loss_value = 0.5 * self.mse(value, rewards)
             loss_entropy = -current_entropy_coef * entropy.mean()
             total_loss = loss_policy + loss_value + loss_entropy
@@ -542,6 +701,8 @@ class GeneratorPPO:
 
             last_metrics = {
                 "policy_loss": loss_policy.item(),
+                "layout_policy_loss": loss_layout_policy.item(),
+                "stage_policy_loss": loss_stage_policy.item(),
                 "value_loss": loss_value.item(),
                 "entropy_loss": loss_entropy.item(),
                 "total_loss": total_loss.item(),
@@ -553,10 +714,61 @@ class GeneratorPPO:
                 "preclip_grad_norm": preclip_grad_norm,
             }
         parameter_delta = self._parameter_delta(parameter_before)
+        if split_active:
+            stage_head_parameter_delta = self._parameter_list_delta(
+                stage_head_parameters, stage_head_before
+            )
+            with torch.no_grad():
+                stage_post_prob_parts = []
+                stage_post_entropy_parts = []
+                for (start, end), ctx_part in zip(
+                    stage_diagnostic_ranges, stage_context_parts
+                ):
+                    edited_map = self.policy._crafter_materialize_layout(
+                        curr_map[start:end], action[start:end]
+                    )
+                    stage_logits = self.policy._crafter_stage_logits(
+                        edited_map, ctx_part, prev_heat_stats[start:end]
+                    )
+                    stage_dist = Categorical(logits=stage_logits)
+                    stage_post_prob_parts.append(stage_dist.probs)
+                    stage_post_entropy_parts.append(
+                        stage_dist.entropy().reshape(end - start, -1).mean(dim=-1)
+                    )
+                pre_probs = torch.cat(stage_pre_prob_parts, dim=0)
+                post_probs = torch.cat(stage_post_prob_parts, dim=0)
+                pre_log_probs = torch.log(pre_probs.clamp_min(1e-8))
+                post_log_probs = torch.log(post_probs.clamp_min(1e-8))
+                stage_policy_kl_pre_post = float(
+                    (pre_probs * (pre_log_probs - post_log_probs))
+                    .sum(dim=-1)
+                    .mean()
+                    .clamp_min(0.0)
+                    .item()
+                )
+                stage_entropy_pre = float(
+                    torch.cat(stage_pre_entropy_parts, dim=0).mean().item()
+                )
+                stage_entropy_post = float(
+                    torch.cat(stage_post_entropy_parts, dim=0).mean().item()
+                )
+        else:
+            stage_head_parameter_delta = float("nan")
         self.policy_old.load_state_dict(self.policy.state_dict())
         self.clear_buffer()
 
         self.last_diagnostics.update(last_metrics)
+        if split_active and shared_gradient_cosine == shared_gradient_cosine:
+            conflict = int(shared_gradient_cosine < 0.0)
+            self._shared_actor_gradient_conflict_updates += conflict
+            self._shared_actor_gradient_measure_count += 1
+            conflict_ratio = (
+                self._shared_actor_gradient_conflict_updates
+                / self._shared_actor_gradient_measure_count
+            )
+        else:
+            conflict = float("nan")
+            conflict_ratio = float("nan")
         self.last_diagnostics.update({
             "updated": True,
             "sample_count": sample_count,
@@ -565,6 +777,20 @@ class GeneratorPPO:
             "advantage_std": advantage_std,
             "parameter_delta": parameter_delta,
             "initial_logprob_max_error": initial_logprob_max_error,
+            "initial_layout_logprob_max_error": initial_layout_logprob_max_error,
+            "initial_stage_logprob_max_error": initial_stage_logprob_max_error,
+            "stage_reward_mean": raw_stage_rewards.mean().item(),
+            "stage_reward_std": stage_reward_std,
+            "shared_actor_gradient_cosine": shared_gradient_cosine,
+            "shared_actor_gradient_conflict": conflict,
+            "shared_actor_gradient_conflict_ratio": conflict_ratio,
+            "shared_layout_gradient_norm": shared_layout_gradient_norm,
+            "shared_stage_gradient_norm": shared_stage_gradient_norm,
+            "stage_head_policy_gradient_norm": stage_head_policy_gradient_norm,
+            "stage_head_parameter_delta": stage_head_parameter_delta,
+            "stage_policy_kl_pre_post": stage_policy_kl_pre_post,
+            "stage_entropy_pre": stage_entropy_pre,
+            "stage_entropy_post": stage_entropy_post,
         })
         return last_metrics["total_loss"], entropy.mean().item()
 

@@ -108,27 +108,8 @@ def check_solvability(grid_obj_np, color_np=None, state_np=None, inventory_token
 # ==========================================
 # 2. Diversity scoring (RND + archive)
 # ==========================================
-class _CrafterArchiveView:
-    """Compatibility view: clearing the legacy archive clears all components."""
-
-    def __init__(self, module):
-        self._module = module
-
-    def clear(self):
-        self._module.map_archive.clear()
-        self._module.start_position_archive.clear()
-        self._module.inventory_archive.clear()
-
-    def __len__(self):
-        return len(self._module.map_archive)
-
-    def __iter__(self):
-        return iter(self._module.map_archive)
-
-
 class DiversityModule(nn.Module):
-    def __init__(self, input_h=15, input_w=15, k=10, max_archive_size=1000, device=None, env_type='minigrid',
-                 crafter_map_weight=1.0, crafter_start_weight=0.1, crafter_inventory_weight=0.2):
+    def __init__(self, input_h=15, input_w=15, k=10, max_archive_size=1000, device=None, env_type='minigrid'):
         super().__init__()
         self.k = k
         self.max_size = max_archive_size
@@ -146,14 +127,7 @@ class DiversityModule(nn.Module):
             self.inv_size = 16     # Crafter inventory stats
             self.inv_encoder = None
             self.joint_dim = 64
-            self.crafter_map_weight = float(crafter_map_weight)
-            self.crafter_start_weight = float(crafter_start_weight)
-            self.crafter_inventory_weight = float(crafter_inventory_weight)
-            self.map_archive = []
-            self.start_position_archive = []
-            self.inventory_archive = []
-            # Keep ``archive.clear()`` working for callers from the old API.
-            self.archive = _CrafterArchiveView(self)
+            self.archive = []
         elif self.env_type == 'bipedalwalker':
             self.num_obj_types = 10
             self.num_colors = 0
@@ -196,6 +170,12 @@ class DiversityModule(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
+        if self.env_type == 'crafter':
+            with torch.no_grad():
+                zero_edit = torch.zeros((1, 2, input_h, input_w), dtype=torch.long, device=self.device)
+                background = self.encoder(self._one_hot_crafter(zero_edit))
+            self.register_buffer("_crafter_zero_edit_embedding", background, persistent=False)
+
     def _preprocess(self, map_tensor):
         """
         [1, 2, H, W] -> [1, Oh_Obj+Oh_Col, H, W]
@@ -206,8 +186,7 @@ class DiversityModule(nn.Module):
         
         obj_ids_clean = obj_ids.clone()
         if self.env_type == 'crafter':
-            # Crafter is handled in ``_crafter_reward`` so the start position
-            # can be measured separately from the edited layout.
+            # Crafter preprocessing excludes the agent from the layout edit.
             raise RuntimeError("Crafter preprocessing requires _crafter_reward")
         elif self.env_type != 'bipedalwalker':
             obj_ids_clean[obj_ids_clean == 10] = 1 # MiniGrid Agent (10) -> Empty (1)
@@ -227,81 +206,75 @@ class DiversityModule(nn.Module):
         if len(archive) > self.max_size:
             archive.pop(0)
 
-    def _crafter_reward(self, map_vec_tensor, inventory_vec):
+    def _crafter_reward(self, map_vec_tensor, inventory_vec, start_position=None, stage_token=None):
         if map_vec_tensor.ndim != 4 or map_vec_tensor.shape[0] != 1 or map_vec_tensor.shape[1] < 2:
             raise ValueError("Crafter diversity expects map tensor [1, >=2, H, W]")
-        if inventory_vec is None:
-            raise ValueError("Crafter diversity requires a 16-dimensional inventory vector")
+        if inventory_vec is None and stage_token is None:
+            raise ValueError("Crafter diversity requires a stage token or a 16-dimensional inventory vector")
 
         obj_ids = map_vec_tensor[0, 0].long()
         direction_ids = map_vec_tensor[0, 1].long()
         agent_positions = torch.nonzero(obj_ids == 13, as_tuple=False)
-        if len(agent_positions) != 1:
-            raise ValueError(
-                f"Crafter diversity requires exactly one agent (ID 13), found {len(agent_positions)}"
-            )
-        y, x = (int(agent_positions[0, 0]), int(agent_positions[0, 1]))
+        if start_position is None:
+            if len(agent_positions) != 1:
+                raise ValueError(
+                    f"Crafter diversity requires exactly one agent (ID 13), found {len(agent_positions)}"
+                )
+            y, x = (int(agent_positions[0, 0]), int(agent_positions[0, 1]))
+        else:
+            y, x = map(int, start_position)
+            if len(agent_positions):
+                raise ValueError("Crafter effective edit map must exclude the agent")
         height, width = obj_ids.shape
+        if not (0 <= y < height and 0 <= x < width):
+            raise ValueError(f"Crafter start position {(y, x)} is outside the map")
         map_obj = obj_ids.clone()
         map_dir = direction_ids.clone()
-        map_obj[y, x] = 2  # grass; exclude start position from layout novelty
-        map_dir[y, x] = 0
+        if start_position is None:
+            map_obj[y, x] = 2  # Legacy full-map diversity path.
+            map_dir[y, x] = 0
         map_input = torch.stack([map_obj, map_dir]).unsqueeze(0)
 
-        if not isinstance(inventory_vec, torch.Tensor):
-            inventory_vec = torch.as_tensor(inventory_vec, dtype=torch.float32)
-        inventory_vec = inventory_vec.to(self.device, dtype=torch.float32).reshape(-1)
-        if inventory_vec.numel() != self.inv_size:
-            raise ValueError(
-                f"Crafter diversity requires inventory with {self.inv_size} values, got {inventory_vec.numel()}"
-            )
+        if stage_token is None:
+            if not isinstance(inventory_vec, torch.Tensor):
+                inventory_vec = torch.as_tensor(inventory_vec, dtype=torch.float32)
+            inventory_vec = inventory_vec.to(self.device, dtype=torch.float32).reshape(-1)
+            if inventory_vec.numel() != self.inv_size:
+                raise ValueError(
+                    f"Crafter diversity requires inventory with {self.inv_size} values, got {inventory_vec.numel()}"
+                )
+            inventory_representation = torch.clamp(inventory_vec, 0.0, 9.0).div(9.0).cpu().numpy()
+        else:
+            token = int(stage_token)
+            if not 0 <= token <= 5:
+                raise ValueError(f"Crafter stage token must be 0..5, got {token}")
+            # KEEP and STAGE_0 both represent the empty item inventory.
+            inventory_representation = np.eye(5, dtype=np.float32)[max(token - 1, 0)]
 
         with torch.no_grad():
             emb_map = self.encoder(self._one_hot_crafter(map_input))
-            map_representation = F.normalize(emb_map, p=2, dim=1).cpu().numpy().flatten()
+            edit_embedding = emb_map - self._crafter_zero_edit_embedding
+            map_representation = F.normalize(edit_embedding, p=2, dim=1).cpu().numpy().flatten()
+        # Keep the no-edit map distinct while giving every map block unit norm.
+        map_representation = np.append(
+            map_representation, float(not torch.any(map_input))
+        ).astype(np.float32)
 
-        start_representation = np.array([
-            y / max(height - 1, 1), x / max(width - 1, 1)
-        ], dtype=np.float32)
-        inventory_representation = torch.clamp(inventory_vec, 0.0, 9.0).div(9.0).cpu().numpy()
-
-        if not self.map_archive:
-            map_score = start_score = inventory_score = total = 0.0
+        # One representation for the layout edit and inventory stage pair.
+        # The random agent start and sampled item quantities do not enter it.
+        joint_representation = np.concatenate(
+            [map_representation, inventory_representation]
+        ).astype(np.float32)
+        joint_representation /= max(float(np.linalg.norm(joint_representation)), 1e-8)
+        if not self.archive:
+            total = 0.0
         else:
-            # Select neighbours with one aligned, weighted distance.  Choosing
-            # a different nearest neighbour for each component would score a
-            # never-before-seen map/start/inventory combination as non-novel.
-            map_distances = np.linalg.norm(
-                np.stack(self.map_archive) - map_representation, axis=1
+            joint_distances = np.linalg.norm(
+                np.stack(self.archive) - joint_representation, axis=1
             )
-            start_distances = np.linalg.norm(
-                np.stack(self.start_position_archive) - start_representation,
-                axis=1,
-            ) / np.sqrt(2.0)
-            inventory_distances = np.linalg.norm(
-                np.stack(self.inventory_archive) - inventory_representation,
-                axis=1,
-            ) / np.sqrt(self.inv_size)
-            total_distances = (
-                self.crafter_map_weight * map_distances
-                + self.crafter_start_weight * start_distances
-                + self.crafter_inventory_weight * inventory_distances
-            )
-            neighbour_count = min(len(total_distances), self.k)
-            neighbour_indices = np.argsort(total_distances)[:neighbour_count]
-            map_score = float(np.mean(map_distances[neighbour_indices]))
-            start_score = float(np.mean(start_distances[neighbour_indices]))
-            inventory_score = float(np.mean(inventory_distances[neighbour_indices]))
-            total = float(np.mean(total_distances[neighbour_indices]))
-        self.last_components = {
-            "map_edit_novelty": float(map_score),
-            "start_position_novelty": float(start_score),
-            "inventory_novelty": float(inventory_score),
-            "total_novelty": float(total),
-        }
-        self._append_fifo(self.map_archive, map_representation)
-        self._append_fifo(self.start_position_archive, start_representation)
-        self._append_fifo(self.inventory_archive, inventory_representation)
+            total = float(np.mean(np.sort(joint_distances)[:min(len(joint_distances), self.k)]))
+        self.last_components = {"total_novelty": total}
+        self._append_fifo(self.archive, joint_representation)
         return float(total)
 
     def _one_hot_crafter(self, map_tensor):
@@ -309,16 +282,17 @@ class DiversityModule(nn.Module):
         direction_oh = F.one_hot(map_tensor[:, 1].long(), num_classes=self.num_colors).permute(0, 3, 1, 2).float()
         return torch.cat([obj_oh, direction_oh], dim=1)
 
-    def get_reward(self, map_vec_tensor, inventory_vec=None):
+    def get_reward(self, map_vec_tensor, inventory_vec=None, start_position=None, stage_token=None):
         """
         Inputs:
-            map_vec_tensor: [1, 2, H, W] 
-            inventory_vec: [1, 16] (Numpy or Tensor)
-        Output: float
+            map_vec_tensor: [1, 2, H, W]
+            inventory_vec: optional 16-value vector for legacy callers
+            stage_token: Crafter inventory stage action (0..5)
+        Output: novelty distance to the nearest archived environments
         """
         map_vec_tensor = map_vec_tensor.to(self.device)
         if self.env_type == 'crafter':
-            return self._crafter_reward(map_vec_tensor, inventory_vec)
+            return self._crafter_reward(map_vec_tensor, inventory_vec, start_position, stage_token)
         
         with torch.no_grad():
             # 1. Map feature [1, 64]

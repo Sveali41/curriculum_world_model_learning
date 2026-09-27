@@ -205,6 +205,7 @@ def collect_data_general(
     policy=None,
     intrinsic_reward_fn=None,
     store_intrinsic_reward: bool = True,
+    crafter_seed=None,
 ):
     """
     General environment data-collection function.
@@ -244,7 +245,13 @@ def collect_data_general(
             # Multi-line string with layout + stats
             print(f"\n[Environment] Generating Crafter Task:\n{env_source}")
             from domain.crafter.crafter_custom_env import CustomCrafterEnv as CrafterEnv
-            env = CrafterEnv(layout_str=env_source, max_steps=max_steps)
+            env = CrafterEnv(
+                layout_str=env_source, max_steps=max_steps,
+                **({"seed": int(crafter_seed), "deterministic_world_rng": True}
+                   if crafter_seed is not None else {}),
+            )
+            if crafter_seed is not None:
+                env.action_space.seed(int(crafter_seed))
 
     elif not is_crafter and isinstance(env_source, (str, os.PathLike)) and str(env_source).endswith(".txt"):
         # MiniGrid/Bipedal from text file (resolved by Support)
@@ -530,7 +537,7 @@ def _relocated_minigrid_target_layout(metadata, data_save_dir):
     )
 
 
-def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, phase_name="validation", VALID_TIMES=1):
+def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, phase_name="validation", VALID_TIMES=1, validation_sweep=None):
     """
     Run WM validation on the fixed target task, return avg loss.
     Returns: (avg_mse_loss, avg_weighted_loss)
@@ -621,12 +628,7 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
             # the strict dataset identity check compares the same protocol
             # and episode horizon.  Keep the caller's config unchanged.
             collection_policy = str(metadata.get("collection_policy", "")).lower()
-            if selected_domain == "crafter" and (
-                "coverage_v2" in collection_policy or "coverage_v3" in collection_policy
-            ):
-                validation_cfg.env.collect.data_type = (
-                    "coverage_v3" if "coverage_v3" in collection_policy else "coverage_v2"
-                )
+            if selected_domain == "crafter":
                 episode_max_steps = metadata.get("episode_max_steps")
                 if episode_max_steps is not None:
                     episode_max_steps = int(episode_max_steps)
@@ -636,6 +638,22 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
                         }
                     else:
                         domain_cfg.data_collection.max_steps = episode_max_steps
+                if "coverage_v2" in collection_policy or "coverage_v3" in collection_policy:
+                    validation_cfg.env.collect.data_type = (
+                        "coverage_v3" if "coverage_v3" in collection_policy else "coverage_v2"
+                    )
+                elif collection_policy == "crafter_rmax_count_local5_inv12_v1":
+                    rmax_metadata = metadata.get("rmax_like")
+                    if not isinstance(rmax_metadata, dict):
+                        raise RuntimeError(
+                            "Crafter RMax target metadata is missing the rmax_like configuration: "
+                            f"{validation_path}"
+                        )
+                    validation_cfg.env.collect.data_type = "rmax"
+                    validation_cfg.rmax_like = {
+                        "enabled": True,
+                        **rmax_metadata,
+                    }
 
     losses = []
     inv_losses = []
@@ -654,14 +672,18 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
     crafter_changed_counts = []
     crafter_inventory_metrics = {name: [] for name in CRAFTER_INVENTORY_VAL_METRICS}
     crafter_focal_metrics = {name: [] for name in CRAFTER_FOCAL_VAL_METRICS}
+    crafter_event_confusions = []
 
     for v in range(VALID_TIMES):
         # train_api in validation mode returns a dict where "avg_val_loss" holds the Lightning metrics
         val_res, _, model = AttentionWM_training.train_api(
-            validation_cfg, net, old_params, None
+            validation_cfg, net, old_params, None,
+            validation_sweep=validation_sweep,
         )
 
         actual_val_out = val_res.get("avg_val_loss", {})
+        if is_crafter and "crafter_event_confusion" in val_res:
+            crafter_event_confusions.append(val_res["crafter_event_confusion"])
 
         if isinstance(actual_val_out, list) and len(actual_val_out) > 0:
              metrics = actual_val_out[0]
@@ -714,8 +736,9 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
                     crafter_focal_metrics[name].append(float(value))
 
         del model
-        torch.cuda.empty_cache()
-        gc.collect()
+        if validation_sweep is None:
+            torch.cuda.empty_cache()
+            gc.collect()
 
     result = {
         'avg_val_loss_wm': float(np.mean(losses)),
@@ -729,6 +752,32 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
             result[name] = float(np.mean(values)) if values else 0.0
         for name, values in crafter_focal_metrics.items():
             result[name] = float(np.mean(values)) if values else float("nan")
+        if crafter_event_confusions:
+            merged = {name: 0 for name in (
+                "sample_count", "true_keep_count", "true_keep_false_positive",
+                "unknown_event_count", "slot_true_positive", "slot_false_negative",
+                "slot_false_positive", "slot_keep_count",
+            )}
+            events = {}
+            for confusion in crafter_event_confusions:
+                for name in merged:
+                    merged[name] += confusion[name]
+                for row in confusion["events"]:
+                    delta = tuple(row["delta"])
+                    target = events.setdefault(delta, {
+                        "delta": row["delta"], "event_id": row["event_id"],
+                        "count": 0, "exact": 0, "predicted_keep": 0,
+                        "predicted_other": 0, "margin_sum": 0.0, "margin_count": 0,
+                    })
+                    for name in ("count", "exact", "predicted_keep", "predicted_other",
+                                 "margin_sum", "margin_count"):
+                        target[name] += row[name]
+            merged["events"] = sorted(
+                events.values(),
+                key=lambda row: (row["event_id"] is None,
+                                 row["event_id"] if row["event_id"] is not None else row["delta"]),
+            )
+            result["crafter_event_confusion"] = merged
     if is_bipedal:
         result['contact_acc'] = float(np.mean(contact_accs))
         result['contact_bce'] = float(np.mean(contact_bces))
@@ -779,6 +828,9 @@ def validate_on_all_targets(
     valid_count = 0
     is_bipedal = (getattr(cfg.attention_model, "env_type", "") == "bipedalwalker")
     is_crafter = (getattr(cfg.attention_model, "env_type", "") == "crafter")
+    validation_sweep = (
+        AttentionWM_training.CrafterTargetValidationSweep() if is_crafter else None
+    )
 
     try:
         for task_name in target_names:
@@ -796,6 +848,7 @@ def validate_on_all_targets(
                 val_file,
                 phase_name=phase_name,
                 VALID_TIMES=VALID_TIMES,
+                validation_sweep=validation_sweep,
             )
             if not res:
                 continue
@@ -833,6 +886,8 @@ def validate_on_all_targets(
                             and (count_name is None or (count is not None and float(count) > 0))):
                         crafter_focal_metrics[name].append(float(value))
             per_target[task_base] = {
+                **({"crafter_event_confusion": res["crafter_event_confusion"]}
+                   if is_crafter and "crafter_event_confusion" in res else {}),
                 "avg_val_loss_wm": l_val,
                 "focal_loss": float(res.get("focal_loss", 0.0)),
                 "changed_focal_loss": float(res.get("changed_focal_loss", 0.0)),
@@ -850,6 +905,10 @@ def validate_on_all_targets(
             }
             valid_count += 1
     finally:
+        if validation_sweep is not None:
+            validation_sweep.trainer = None
+            torch.cuda.empty_cache()
+            gc.collect()
         if disable_wandb:
             cfg.attention_model.use_wandb = old_use_wandb
 

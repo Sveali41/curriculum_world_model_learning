@@ -10,14 +10,14 @@ class HistoryEncoder(nn.Module):
     History encoder that maps past state grids, error heatmaps, and
     auxiliary features into a global context vector for the generator.
 
-    MiniGrid history is encoded as a translation-invariant semantic failure
-    pattern. Other domains keep their existing coordinate-aware path.
+    MiniGrid and Crafter encode translation-invariant semantic failure
+    patterns. Crafter also includes item prediction errors.
     '''
 
     def __init__(self, context_dim=64, emb_dim=16, env_type="minigrid"):
         super().__init__()
         self.env_type = env_type
-        self.spatial_feedback_channels = 2 if self.env_type == "minigrid" else 1
+        self.spatial_feedback_channels = 2 if self.env_type in ("minigrid", "crafter") else 1
 
         if self.env_type == "bipedalwalker":
             self.layout_emb = nn.Embedding(10, emb_dim)
@@ -67,33 +67,31 @@ class HistoryEncoder(nn.Module):
         self.emb_color = nn.Embedding(max_color_id + 1, emb_dim)
         self.emb_cell_state = nn.Embedding(max_cell_state_id + 1, emb_dim)
 
-        # MiniGrid keeps prediction error and spatial coverage separate and
-        # deliberately omits absolute coordinates. The next generated map is
-        # a fresh random layout, so a previous failure coordinate has no stable
-        # meaning across rounds.
-        coord_channels = 0 if self.env_type == "minigrid" else 2
+        # Both domains generate fresh maps, so previous absolute error
+        # coordinates have no stable meaning across rounds.
+        semantic_history = self.env_type in ("minigrid", "crafter")
+        coord_channels = 0 if semantic_history else 2
         in_channels = emb_dim * 3 + self.spatial_feedback_channels + coord_channels
 
         # 3. CNN Backbone
         self.net = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 32) if self.env_type == "minigrid" else nn.BatchNorm2d(32),
+            nn.GroupNorm(8, 32) if semantic_history else nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64) if self.env_type == "minigrid" else nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64) if semantic_history else nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64) if self.env_type == "minigrid" else nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64) if semantic_history else nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
 
-        # Non-MiniGrid domains retain the legacy coordinate-aware max pooling.
+        # Other domains retain their coordinate-aware max pooling.
         self.pool = nn.AdaptiveMaxPool2d((1, 1))
 
-        if self.env_type == "minigrid":
-            # error-weighted mean + max local pattern, coverage ratio, and
-            # mean error over observed cells
-            projection_input = 64 * 2 + 2
+        if semantic_history:
+            # Error-weighted mean and max, coverage ratio, observed-cell error.
+            projection_input = 64 * 2 + 2 + (16 if self.env_type == "crafter" else 0)
         else:
             projection_input = 64 + 16
 
@@ -114,8 +112,8 @@ class HistoryEncoder(nn.Module):
     def forward(self, state_grid, error_heatmap, stats_error=None):
         """
         state_grid: [B, 3, H, W]
-        error_heatmap: [B, 2, H, W] for MiniGrid (loss, coverage), otherwise
-            [B, 1, H, W]
+        error_heatmap: [B, 2, H, W] for MiniGrid/Crafter (loss, coverage),
+            [B, 1, H, W] for BipedalWalker
         stats_error: [B, 16] (Inventory errors)
         """
         B, _, H, W = state_grid.shape
@@ -149,16 +147,14 @@ class HistoryEncoder(nn.Module):
         feat_col = self.emb_color(state_grid[:, 1].long()).permute(0, 3, 1, 2)
         feat_sta = self.emb_cell_state(state_grid[:, 2].long()).permute(0, 3, 1, 2)
 
-        # 2. Concatenate spatial features. MiniGrid intentionally has no
-        # absolute coordinate channels; the convolution still preserves local
-        # relative object/color/state combinations.
+        # The convolution retains local relative object combinations.
         x = torch.cat([feat_obj, feat_col, feat_sta, error_heatmap], dim=1)
-        if self.env_type != "minigrid":
+        if self.env_type not in ("minigrid", "crafter"):
             x = self._add_coords(x)
 
         features = self.net(x)
 
-        if self.env_type == "minigrid":
+        if self.env_type in ("minigrid", "crafter"):
             error = error_heatmap[:, 0:1].clamp_min(0.0)
             coverage = error_heatmap[:, 1:2].clamp(0.0, 1.0)
             hardness = error * coverage
@@ -178,6 +174,10 @@ class HistoryEncoder(nn.Module):
             semantic_features = torch.cat(
                 [hard_mean, hard_max, coverage_ratio, mean_error], dim=1
             )
+            if self.env_type == "crafter":
+                if stats_error is None:
+                    stats_error = torch.zeros(B, 16, device=state_grid.device)
+                semantic_features = torch.cat([semantic_features, stats_error], dim=1)
             return self.fc(semantic_features)
 
         spatial_features = self.pool(features).flatten(1)

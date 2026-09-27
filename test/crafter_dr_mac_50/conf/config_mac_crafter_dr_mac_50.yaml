@@ -1,0 +1,76 @@
+# EWC=20 arm: 10 novelty warmup rounds, then 50 WM updates.
+# DR uses the same ordinary replay sampler and WM training seed rule.
+defaults:
+  - config_dr
+  - _self_
+
+domain: crafter
+seed: 0
+mac_quick_run_id: mac_balanced_ewc20_epoch10_seed${seed}
+mac_quick_output_root: ${oc.env:TRAINER_ROOT,${oc.env:PROJECT_ROOT}}/test/crafter_dr_mac_50/results/mac/${mac_quick_run_id}
+
+paths:
+  outputs: ${mac_quick_output_root}
+
+generator_agent:
+  agent_type: ppo
+  crafter_credit_mode: split_balanced_global
+  total_iterations: 60
+  warmup_iterations: 10
+
+domains:
+  crafter:
+    lambda_ewc: 20
+    iter_transition_budget: 8000
+    # Independent probes supply the MAC generator reward; DR skips them.
+    learning_progress_probe_budget: 1000
+    val_start_idx: 1
+    val_n_phases: 4
+    target_validation_max_samples: 500
+    target_validation_seed: ${seed}
+    crafter_wm:
+      inventory_value_mode: categorical_delta
+      inventory_output_mode: categorical_effect
+      inventory_effect_reduction: sqrt_balanced
+      inventory_effect_keep_weight: 0.95
+      inventory_architecture: slot_attention_v1
+      event_residual:
+        enabled: true
+        hidden_dims: [64]
+        action_embed_dim: 8
+        change_bias: 0
+        loss_weight: 1.0
+        correct_keep_fraction: 0.25
+        keep_weight: 0.90
+      pose:
+        enabled: true
+        mode: learned_detached
+      artifact_suffix: _effect5keep095_residualkeep090_pose_eventresidual64_slotattn
+
+attention_model:
+  n_epochs: 10
+  crafter_event_confusion_enabled: true
+  crafter_transition_replay:
+    enabled: false
+    inventory_replay_fraction: 0.25
+  model_save_path: ${mac_quick_output_root}/model/wm.ckpt
+
+mac_results_dir: ${mac_quick_output_root}
+mac_temp_data_dir: ${mac_quick_output_root}/temp
+force_fresh_start: true
+save_iteration_state: true
+save_wm_update_checkpoints: true
+wm_train_seed_per_update: true
+
+env:
+  collect:
+    env_visualize_save_path: ${mac_quick_output_root}/env_visualize
+
+hydra:
+  searchpath:
+    - file://trainer/conf
+  run:
+    dir: ${mac_quick_output_root}/hydra
+
+crafter_inventory_event_audit:
+  enabled: true

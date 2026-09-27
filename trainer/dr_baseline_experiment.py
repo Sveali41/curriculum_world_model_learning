@@ -1,3 +1,4 @@
+import csv
 import os
 import sys
 import tempfile
@@ -9,7 +10,10 @@ import hydra
 from omegaconf import DictConfig, open_dict
 from pathlib import Path
 import glob
+import json
 import shutil
+import hashlib
+import time
 
 # Add project root
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -40,11 +44,19 @@ os.environ.setdefault("TRAINER_PATH", os.path.join(ROOT_DIR, "trainer"))
 
 from modelBased.common.utils import TRAINER_PATH
 from modelBased.world_model.AttentionWM import AttentionWorldModel
+from modelBased.world_model.crafter_event_audit import (
+    inventory_event_episode_age_rows, inventory_event_rows,
+)
 from modelBased.world_model import AttentionWM_training
 from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
 from modelBased.continue_learning.reservoir_buffer import ReservoirReplayBuffer
 from modelBased.common.artifacts import align_world_model_artifact_path
 from generator.generator_interface import GeneratorInterface
+from trainer.common.run_resume import (
+    config_digest, generator_state, guard_fresh_results, load_state, replay_state, restore_generator,
+    restore_replay, restore_rng, rng_state, save_state, validate_sidecars,
+)
+from trainer.common.wm_snapshots import save_wm_update_snapshot
 from trainer.common.utils import (
     CRAFTER_INVENTORY_VAL_METRICS,
     CRAFTER_FOCAL_VAL_METRICS,
@@ -119,6 +131,111 @@ def _apply_domain_collection_budget(cfg: DictConfig, domain_name: str):
         f"iter_budget={iter_budget} | batch_size={batch_size} | "
         f"per_rollout_max={per_rollout_max} | expected_iter_total={expected_total}"
     )
+
+
+def _paired_batch_hash(batch):
+    """Hash the transition fields consumed by WM training and replay."""
+    digest = hashlib.sha256()
+    for name in ("obs", "obs_next", "act", "rew", "done", "inv", "inv_next"):
+        value = batch.get(name)
+        digest.update(name.encode("utf-8"))
+        if value is None:
+            digest.update(b"<none>")
+            continue
+        array = np.ascontiguousarray(value)
+        digest.update(str(array.dtype).encode("ascii"))
+        digest.update(repr(array.shape).encode("ascii"))
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _save_paired_batch(path: Path, batch):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        name: batch[name]
+        for name in ("obs", "obs_next", "act", "rew", "done", "info", "inv", "inv_next")
+        if batch.get(name) is not None
+    }
+    payload["batch_hash"] = np.asarray(_paired_batch_hash(batch))
+    np.savez_compressed(path, **payload)
+    return str(payload["batch_hash"].item())
+
+
+def _load_paired_batch(path: Path):
+    if not path.is_file():
+        raise FileNotFoundError(f"Paired DR batch is missing: {path}")
+    with np.load(path, allow_pickle=True) as data:
+        batch = {name: data[name] if name in data.files else None for name in ("obs", "obs_next", "act", "rew", "done", "info", "inv", "inv_next")}
+        recorded_hash = str(data["batch_hash"].item()) if "batch_hash" in data.files else ""
+    actual_hash = _paired_batch_hash(batch)
+    if not recorded_hash or actual_hash != recorded_hash:
+        raise ValueError(f"Paired DR batch hash mismatch for {path}: recorded={recorded_hash}, actual={actual_hash}")
+    batch.update({"a": batch["obs"], "b": batch["obs_next"], "c": batch["act"], "d": batch["rew"], "e": batch["done"], "f": batch["info"], "g": batch["inv"], "h": batch["inv_next"]})
+    return batch, actual_hash
+
+
+def _append_crafter_event_rows(path: Path, seed: int, iteration: int, source: str, rows):
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", newline="") as handle:
+        writer = csv.writer(handle)
+        if handle.tell() == 0:
+            writer.writerow(("Seed", "Iter", "Source", "Event_ID", "Delta_Vector",
+                             "Count", "Changed_Slot_Count", "Changed_Slots"))
+        writer.writerows((seed, iteration, source, row["event_id"], row["delta_vector"],
+                          row["count"], row["changed_slot_count"], row["changed_slots"])
+                         for row in rows)
+
+def _append_crafter_episode_age_rows(path: Path, seed: int, iteration: int, rollouts):
+    rows = []
+    for rollout_index, rollout in enumerate(rollouts):
+        if not all(rollout.get(key) is not None for key in ("inv", "inv_next", "done")):
+            raise ValueError(f"Crafter rollout {rollout_index} lacks inventory/done fields for episode-age audit")
+        rows.extend((rollout_index, row) for row in inventory_event_episode_age_rows(
+            rollout["inv"], rollout["inv_next"], rollout["done"]
+        ))
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", newline="") as handle:
+        writer = csv.writer(handle)
+        if handle.tell() == 0:
+            writer.writerow(("Seed", "Iter", "Rollout", "Episode_Age_Bin",
+                             "Bin_Transition_Count", "Episodes_With_Transitions_In_Bin",
+                             "Event_ID", "Delta_Vector", "Event_Count", "Rate_Per_1000",
+                             "Changed_Slot_Count", "Changed_Slots"))
+        for rollout_index, row in rows:
+            writer.writerow((seed, iteration, rollout_index, row["episode_age_bin"],
+                             row["bin_transition_count"], row["episodes_with_transitions_in_bin"],
+                             row["event_id"], row["delta_vector"], row["event_count"],
+                             f"{row['rate_per_1000']:.8f}", row["changed_slot_count"], row["changed_slots"]))
+
+def _append_crafter_target_confusion(path: Path, seed: int, iteration: int, payload):
+    if not payload:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", newline="") as handle:
+        writer = csv.writer(handle)
+        if handle.tell() == 0:
+            writer.writerow(("Seed", "Iter", "True_Event_ID", "True_Delta_Vector",
+                             "True_Count", "Predicted_Exact_Count", "Predicted_KEEP_Count",
+                             "Predicted_Other_Count", "True_Change_Margin_Mean"))
+        keep_count = int(payload.get("true_keep_count", 0))
+        keep_false_positive = int(payload.get("true_keep_false_positive", 0))
+        writer.writerow((seed, iteration, 0, json.dumps([0] * 12, separators=(",", ":")),
+                         keep_count, keep_count - keep_false_positive,
+                         keep_count - keep_false_positive, keep_false_positive, float("nan")))
+        for event in payload.get("events", []):
+            event_id = event.get("event_id")
+            if event_id is None:
+                event_id = -1
+            writer.writerow((seed, iteration, event_id,
+                             json.dumps(event.get("delta", ()), separators=(",", ":")),
+                             event["count"], event["exact"], event["predicted_keep"],
+                             event["predicted_other"],
+                             event["margin_sum"] / event["margin_count"]
+                             if event["margin_count"] else float("nan")))
 
 
 def _ensure_csv_header_compatible(csv_path: Path, expected_columns):
@@ -308,6 +425,9 @@ def run_dr_baseline_experiment(cfg: DictConfig):
     # Optionally start from a clean checkpoint state.
     ckpt_path = cfg.attention_model.model_save_path
     force_fresh_start = bool(getattr(cfg, "force_fresh_start", False))
+    resume_training = is_crafter and bool(getattr(cfg, "resume_training", False))
+    if resume_training and force_fresh_start:
+        raise ValueError("resume_training=true requires force_fresh_start=false")
     uses_minigrid_rmax = (
         domain_name == "minigrid"
         and str(d_cfg.exploration_policy).lower() == "rmax"
@@ -320,6 +440,13 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         raise ValueError(
             "force_fresh_start=true is incompatible with "
             "domains.minigrid.rmax_like.resume=true"
+        )
+    if is_crafter and not resume_training and bool(getattr(cfg, "save_iteration_state", True)):
+        ablation_type_for_guard = str(getattr(getattr(cfg, "ablation", None), "type", "none"))
+        ablation_suffix_for_guard = "" if ablation_type_for_guard == "none" else f"_{ablation_type_for_guard}"
+        guard_fresh_results(
+            Path(cfg.dr_log_dir) / f"dr_crafter_results{ablation_suffix_for_guard}.csv",
+            Path(cfg.dr_log_dir) / f"crafter_dr_seed{seed}.resume.pt", seed,
         )
     if force_fresh_start:
         checkpoint_paths = [ckpt_path]
@@ -389,6 +516,7 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         log_dir / f"dr_crafter_replay{ablation_suffix}_seed{seed}.csv"
         if transition_replay_enabled else None
     )
+    resume_state_path = log_dir / f"crafter_dr_seed{seed}.resume.pt"
     file_exists = False
 
     old_params, fisher = None, None
@@ -417,6 +545,12 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             for slot, count in (row or {}).items():
                 result[int(slot)] = result.get(int(slot), 0) + int(count)
         return result
+    quick_target_loss_csv = is_crafter and bool(
+        getattr(getattr(cfg, "dr_fast_ablation", None), "target_loss_csv", False)
+    )
+    quick_ewc_diagnostics_csv = is_crafter and bool(
+        getattr(getattr(cfg, "dr_fast_ablation", None), "ewc_diagnostics_csv", False)
+    )
     validation_slot_counts = {}
     if is_crafter and getattr(cfg.attention_model, "dr_validation_archive", None) and os.path.isfile(str(cfg.attention_model.dr_validation_archive)):
         validation_archive = np.load(str(cfg.attention_model.dr_validation_archive), allow_pickle=True)
@@ -445,13 +579,20 @@ def run_dr_baseline_experiment(cfg: DictConfig):
     elif not is_bipedal: # Crafter or others
         csv_columns = [
             "Seed", "Iter", "New_Data_Size", "Cumulative_Transitions", "Buffer_Size",
-            "target_val_valid_count", "target_val_avg_val_loss_wm",
+            "target_val_valid_count", "target_val_sample_count", "target_val_avg_val_loss_wm",
             "target_val_changed_focal_loss",
+            "target_val_inventory_effect_false_positive_rate",
+            "target_val_inventory_effect_change_recall",
+            "target_val_inventory_effect_change_precision",
+            "target_val_inventory_effect_row_exact",
+            "paired_batch_hash",
             "target_val_layout_changed_focal_loss", "target_val_layout_false_set_rate", "target_val_layout_changed_count",
             "target_val_inventory_changed_focal_loss", "target_val_inventory_false_set_rate", "target_val_inventory_changed_count",
             "target_val_joint_accuracy", "target_val_position_accuracy", "target_val_direction_accuracy",
             "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward", "Inv_Change_Ratio",
-            "Learning_Progress", "Solvable_Count", "Avg_Path_Len",
+            "Pre_Changed_Focal_Loss", "Post_Changed_Focal_Loss", "Learning_Progress",
+            "Solvable_Count", "Avg_Path_Len",
+            "Inventory_KEEP_Ratio", "Inventory_Stage_0_Count", "Inventory_Stage_0_Mean_LP", "Inventory_Stage_0_Reward_Std", "Inventory_Stage_1_Count", "Inventory_Stage_1_Mean_LP", "Inventory_Stage_1_Reward_Std", "Inventory_Stage_2_Count", "Inventory_Stage_2_Mean_LP", "Inventory_Stage_2_Reward_Std", "Inventory_Stage_3_Count", "Inventory_Stage_3_Mean_LP", "Inventory_Stage_3_Reward_Std", "Inventory_Stage_4_Count", "Inventory_Stage_4_Mean_LP", "Inventory_Stage_4_Reward_Std",
         ]
     elif is_bipedal:
         csv_columns = [
@@ -460,11 +601,42 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             "target_val_contact_acc", "target_val_contact_bce", "target_val_avg_val_loss_wm",
             "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
         ]
-    file_exists = _ensure_csv_header_compatible(summary_csv_path, csv_columns)
+    if quick_target_loss_csv:
+        insert_at = csv_columns.index("target_val_changed_focal_loss")
+        csv_columns[insert_at:insert_at] = [
+            "target_val_terrain_loss", "target_val_inventory_loss",
+            "target_val_changed_nll",
+        ]
+    if quick_ewc_diagnostics_csv:
+        csv_columns.extend((
+            "train_ewc_raw_epoch", "train_ewc_weighted_epoch",
+            "train_ewc_to_wm_ratio_epoch",
+        ))
+    file_exists = (
+        summary_csv_path.is_file()
+        if resume_training else _ensure_csv_header_compatible(summary_csv_path, csv_columns)
+    )
+    event_audit_cfg = getattr(cfg, "crafter_inventory_event_audit", None)
+    event_audit_enabled = bool(
+        event_audit_cfg.get("enabled", False) if isinstance(event_audit_cfg, dict)
+        else getattr(event_audit_cfg, "enabled", False)
+    ) and is_crafter
+    event_audit_csv_path = summary_csv_path.with_name(f"{summary_csv_path.stem}.inventory_events.csv")
+    episode_age_audit_csv_path = summary_csv_path.with_name(
+        f"{summary_csv_path.stem}.inventory_events_by_episode_age.csv"
+    )
+    target_confusion_csv_path = summary_csv_path.with_name(
+        f"{summary_csv_path.stem}.target_event_confusion.csv"
+    )
+    if event_audit_enabled and not bool(getattr(cfg.attention_model, "crafter_event_confusion_enabled", False)):
+        raise ValueError("Crafter inventory event audit requires attention_model.crafter_event_confusion_enabled=true")
 
     # 1.5 Load existing model if available (Resume logic)
     ckpt_path = cfg.attention_model.model_save_path
-    if force_fresh_start:
+    require_resume_checkpoint = bool(getattr(getattr(cfg, "dr_fast_ablation", None), "require_resume_checkpoint", False))
+    if resume_training:
+        pass  # Load the full iteration state after all state holders exist.
+    elif force_fresh_start:
         print("[System] Fresh-start mode enabled. Skipping checkpoint resume.")
     else:
         if os.path.exists(ckpt_path):
@@ -478,59 +650,120 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                 old_params = wm.save_old_params()
                 print("[System] Model weights loaded successfully.")
             except Exception as e:
+                if require_resume_checkpoint:
+                    raise RuntimeError(f"Quick DR initial checkpoint could not be loaded: {ckpt_path}") from e
                 print(f"[Warning] Failed to load existing model: {e}. Starting from scratch.")
         else:
+            if require_resume_checkpoint:
+                raise FileNotFoundError(f"Quick DR initial checkpoint is missing: {ckpt_path}")
             print(f"[System] No existing checkpoint found at {ckpt_path}. Starting from scratch.")
+
+    fast_cfg = getattr(cfg, "dr_fast_ablation", None)
+    paired_data_mode = str(getattr(fast_cfg, "paired_data_mode", "off")).lower()
+    if paired_data_mode not in {"off", "write", "read"}:
+        raise ValueError("dr_fast_ablation.paired_data_mode must be off, write, or read")
+    if paired_data_mode != "off" and not is_crafter:
+        raise ValueError("Paired batch mode is only supported for Crafter DR")
+    paired_data_dir = Path(str(getattr(fast_cfg, "paired_data_dir", ""))) if paired_data_mode != "off" else None
+    paired_train_seed = bool(getattr(fast_cfg, "paired_train_seed", False))
+    if paired_train_seed and paired_data_mode == "off":
+        raise ValueError("dr_fast_ablation.paired_train_seed requires paired_data_mode=write or read")
 
     # 2. Main Loop
     cumulative_transitions = 0
-    for iteration in range(cfg.generator_agent.total_iterations):
+    start_iteration = 0
+    if resume_training:
+        state = load_state(resume_state_path, cfg, "crafter_dr", summary_csv_path, csv_columns)
+        validate_sidecars(
+            (event_audit_csv_path, episode_age_audit_csv_path, target_confusion_csv_path,
+             *([transition_stats_csv_path] if transition_stats_csv_path is not None else [])),
+            (), seed, state["completed_iteration"],
+        )
+        wm.load_state_dict(state["wm"])
+        old_params, fisher = state["old_params"], state["fisher"]
+        restore_replay(fisher_buffer, state["replay"])
+        restore_generator(generator, state["generator"], include_policy=False)
+        global_best_selection = state["global_best_selection"]
+        global_best_iteration = state["global_best_iteration"]
+        cumulative_transitions = state["cumulative_transitions"]
+        start_iteration = state["completed_iteration"]
+        restore_rng(state["rng"])
+        print(f"[Resume] Crafter DR completed iteration {start_iteration}; continuing at {start_iteration + 1}")
+    for iteration in range(start_iteration, cfg.generator_agent.total_iterations):
         print(f"\n>>> DR Iteration {iteration + 1}/{cfg.generator_agent.total_iterations}")
-        
-        # A. Collect Data from Random Maps
-        # (generator.step uses agent_type='random' for both map generation and action)
-        trajs = generator.step(old_params=old_params, iteration=iteration)
-        
-        # GeneratorInterface.step() returns a 9-tuple:
-        # (.., raw_loss, ce_loss, inv_loss, div_reward, valid_trajs, solved_count, avg_bfs)
-        if isinstance(trajs, tuple) and len(trajs) >= 7:
-            gen_val_avg_val_loss_wm = float(trajs[2])
-            aux_metric = float(trajs[3])
-            inv_loss_or_bce = float(trajs[4])
-            if is_bipedal:
-                gen_val_contact_acc = aux_metric
-                gen_val_contact_bce = inv_loss_or_bce
-                gen_val_val_ce_loss = 0.0
-                gen_val_val_inv_loss = 0.0
-            else:
-                gen_val_val_ce_loss = aux_metric
-                gen_val_val_inv_loss = inv_loss_or_bce
-                gen_val_contact_acc = 0.0
-                gen_val_contact_bce = 0.0
-            gen_div_reward = float(trajs[5])
-            valid_trajs = trajs[6]
-            solvable_count = int(trajs[7]) if len(trajs) > 7 else 0
-            avg_path_len = float(trajs[8]) if len(trajs) > 8 else 0.0
-            if not isinstance(valid_trajs, list):
-                valid_trajs = []
-        else:
-            gen_val_avg_val_loss_wm = 0.0
-            gen_val_val_ce_loss = 0.0
-            gen_val_val_inv_loss = 0.0
+        wm_train_seconds = 0.0
+        target_val_seconds = 0.0
+
+        # A. Collect or reuse the exact same transition batch for both bias arms.
+        paired_batch_hash = ""
+        new_batch = None
+        if paired_data_mode == "read":
+            batch_path = paired_data_dir / f"seed{seed}_iter{iteration + 1:02d}.npz"
+            new_batch, paired_batch_hash = _load_paired_batch(batch_path)
+            print(f"  [Paired Data] Reused {len(new_batch['obs'])} rows from {batch_path}; hash={paired_batch_hash[:12]}")
+            gen_val_avg_val_loss_wm = float("nan")
+            gen_val_val_ce_loss = float("nan")
+            gen_val_val_inv_loss = float("nan")
             gen_val_contact_acc = 0.0
             gen_val_contact_bce = 0.0
             gen_div_reward = 0.0
             valid_trajs = []
             solvable_count = 0
             avg_path_len = 0.0
+        else:
+            trajs = generator.step(old_params=old_params, iteration=iteration)
+            # GeneratorInterface.step() returns a 9-tuple.
+            if isinstance(trajs, tuple) and len(trajs) >= 7:
+                gen_val_avg_val_loss_wm = float(trajs[2])
+                aux_metric = float(trajs[3])
+                inv_loss_or_bce = float(trajs[4])
+                if is_bipedal:
+                    gen_val_contact_acc = aux_metric
+                    gen_val_contact_bce = inv_loss_or_bce
+                    gen_val_val_ce_loss = 0.0
+                    gen_val_val_inv_loss = 0.0
+                else:
+                    gen_val_val_ce_loss = aux_metric
+                    gen_val_val_inv_loss = inv_loss_or_bce
+                    gen_val_contact_acc = 0.0
+                    gen_val_contact_bce = 0.0
+                gen_div_reward = float(trajs[5])
+                valid_trajs = trajs[6]
+                solvable_count = int(trajs[7]) if len(trajs) > 7 else 0
+                avg_path_len = float(trajs[8]) if len(trajs) > 8 else 0.0
+                if not isinstance(valid_trajs, list):
+                    valid_trajs = []
+            else:
+                gen_val_avg_val_loss_wm = 0.0
+                gen_val_val_ce_loss = 0.0
+                gen_val_val_inv_loss = 0.0
+                gen_val_contact_acc = 0.0
+                gen_val_contact_bce = 0.0
+                gen_div_reward = 0.0
+                valid_trajs = []
+                solvable_count = 0
+                avg_path_len = 0.0
 
-        print(f"  [Generator] Collected {len(valid_trajs)} valid trajectories.")
+            print(f"  [Generator] Collected {len(valid_trajs)} valid trajectories.")
+            if not valid_trajs:
+                print("  [Skip] No valid trajectories collected.")
+                continue
+            new_batch = convert_trajectories_to_batch(valid_trajs)
+            if event_audit_enabled:
+                _append_crafter_event_rows(
+                    event_audit_csv_path, seed, iteration + 1, "new_batch",
+                    inventory_event_rows(new_batch["inv"], new_batch["inv_next"]),
+                )
+                _append_crafter_episode_age_rows(
+                    episode_age_audit_csv_path, seed, iteration + 1, valid_trajs,
+                )
+            if paired_data_mode == "write":
+                batch_path = paired_data_dir / f"seed{seed}_iter{iteration + 1:02d}.npz"
+                paired_batch_hash = _save_paired_batch(batch_path, new_batch)
+                print(f"  [Paired Data] Saved batch hash={paired_batch_hash[:12]} to {batch_path}")
 
-        if not valid_trajs:
-            print("  [Skip] No valid trajectories collected.")
-            continue
-
-        new_batch = convert_trajectories_to_batch(valid_trajs)
+        if new_batch is None or new_batch.get("obs") is None:
+            raise RuntimeError(f"No transition batch available for DR iteration {iteration + 1}")
         current_transitions = len(new_batch["obs"]) if new_batch is not None and new_batch.get("obs") is not None else 0
         inv_change_ratio = 0.0
         if is_crafter:
@@ -564,6 +797,13 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         )
         is_warmup = (iteration < warmup_iters_wm)
         if (not is_warmup) and (iteration % cfg.generator_agent.wm_train_frequency == 0):
+            if paired_train_seed:
+                # Collection consumes RNG only in the write arm. Reset immediately
+                # before WM training so both arms use the same split and batch order.
+                set_seed(int(seed) + iteration)
+            if is_crafter and device.type == "cuda":
+                torch.cuda.synchronize(device)
+            wm_train_start = time.perf_counter()
             print("  [Training] Updating World Model...")
             replay_data = fisher_buffer.export_dict() if len(fisher_buffer) > 0 else None
             replay_size = len(replay_data["obs"]) if replay_data is not None and replay_data.get("obs") is not None else 0
@@ -615,6 +855,11 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                     cfg, net=wm, old_params=old_params, fisher=fisher,
                     replay_data=replay_data
                 )
+                if event_audit_enabled:
+                    _append_crafter_event_rows(
+                        event_audit_csv_path, seed, iteration + 1, "replay_selected",
+                        res_train.get("replay_inventory_event_rows", []),
+                    )
                 if is_crafter and protected_enabled:
                     phase_path = Path(str(cfg.attention_model.model_save_path))
                     last_path = phase_path.with_name(phase_path.stem + "_last" + phase_path.suffix)
@@ -658,12 +903,21 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                 else:
                     wm.load_state_dict(ckpt)
             except Exception as e:
+                if is_crafter and bool(getattr(cfg, "save_wm_update_checkpoints", False)):
+                    raise RuntimeError(f"Cannot snapshot DR iteration {iteration + 1}; WM checkpoint reload failed: {ckpt_path}") from e
                 print(f"  [Warning] Failed to reload model: {e}")
                 if isinstance(old_params, dict):
                     wm.load_state_dict(old_params)
                 else:
                     wm.load_state_dict(old_params.state_dict())
             generator.sync_world_model(wm.state_dict())
+            if is_crafter and bool(getattr(cfg, "save_wm_update_checkpoints", False)):
+                snapshot = save_wm_update_snapshot(ckpt_path, cfg.dr_log_dir, iteration + 1)
+                print(f"  [Checkpoint] Saved WM update snapshot: {snapshot}")
+            if is_crafter:
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                wm_train_seconds = time.perf_counter() - wm_train_start
 
         # Keep DR's held-out LP diagnostics aligned with MAC. DR has no PPO
         # update, but the reward components remain comparable.
@@ -696,6 +950,9 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             print(f"  [Validation] Running zero-shot test on all {val_n_phases} targets...")
             task_indices = range(val_start_idx, val_start_idx + val_n_phases)
             task_names = [f"{val_task_prefix}{v_idx}" for v_idx in task_indices]
+            if is_crafter and device.type == "cuda":
+                torch.cuda.synchronize(device)
+            target_val_start = time.perf_counter()
             val_summary = validate_on_all_targets(
                 cfg,
                 wm,
@@ -705,6 +962,15 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                 phase_name=f"dr_iter_{iteration+1}",
                 VALID_TIMES=1,
             )
+            if event_audit_enabled:
+                _append_crafter_target_confusion(
+                    target_confusion_csv_path, seed, iteration + 1,
+                    val_summary.get("crafter_event_confusion"),
+                )
+            if is_crafter:
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                target_val_seconds = time.perf_counter() - target_val_start
 
             if val_summary["valid_count"] > 0:
                 target_val_valid_count = int(val_summary["valid_count"])
@@ -852,7 +1118,15 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                 "Cumulative_Transitions": cumulative_transitions,
                 "Buffer_Size": len(fisher_buffer),
                 "target_val_valid_count": target_val_valid_count,
+                "target_val_sample_count": target_val_valid_count * int(
+                    getattr(cfg.attention_model, "target_validation_max_samples", 0)
+                ),
                 "target_val_avg_val_loss_wm": target_val_avg_val_loss_wm,
+                "target_val_inventory_effect_false_positive_rate": target_val_crafter_inventory_metrics.get("inventory_effect_false_positive_rate", float("nan")),
+                "target_val_inventory_effect_change_recall": target_val_crafter_inventory_metrics.get("inventory_effect_change_recall", float("nan")),
+                "target_val_inventory_effect_change_precision": target_val_crafter_inventory_metrics.get("inventory_effect_change_precision", float("nan")),
+                "target_val_inventory_effect_row_exact": target_val_crafter_inventory_metrics.get("inventory_effect_row_exact", float("nan")),
+                "paired_batch_hash": paired_batch_hash,
                 "target_val_changed_focal_loss": target_val_crafter_focal["changed_focal_loss"],
                 "target_val_layout_changed_focal_loss": target_val_crafter_focal["layout_changed_focal_loss"],
                 "target_val_layout_false_set_rate": target_val_crafter_focal["layout_false_set_rate"],
@@ -865,9 +1139,49 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                 "target_val_direction_accuracy": target_val_crafter_focal["direction_accuracy"],
                 "Gen_Mean_Reward": 0.0, "Gen_Loss": 0.0, "Gen_Entropy": 0.0,
                 "Gen_Div_Reward": gen_div_reward, "Inv_Change_Ratio": inv_change_ratio,
+                "Pre_Changed_Focal_Loss": getattr(generator, "last_crafter_metrics", {}).get("Pre_Changed_Focal_Loss", float("nan")),
+                "Post_Changed_Focal_Loss": getattr(generator, "last_crafter_metrics", {}).get("Post_Changed_Focal_Loss", float("nan")),
                 "Learning_Progress": getattr(generator, "last_crafter_metrics", {}).get("Learning_Progress", float("nan")),
+                **{
+                    key: getattr(generator, "last_crafter_metrics", {}).get(
+                        key,
+                        float("nan") if getattr(generator, "skip_crafter_learning_progress", False) else 0.0,
+                    )
+                    for key in (
+                        "Inventory_KEEP_Ratio",
+                        *(f"Inventory_Stage_{stage}_{metric}" for stage in range(5) for metric in ("Count", "Mean_LP", "Reward_Std")),
+                    )
+                },
                 "Solvable_Count": solvable_count, "Avg_Path_Len": avg_path_len,
             }
+            if quick_target_loss_csv:
+                row_data.update({
+                    "target_val_terrain_loss": target_val_val_ce_loss,
+                    "target_val_inventory_loss": target_val_val_inv_loss,
+                    "target_val_changed_nll": target_val_crafter_changed_nll,
+                })
+                for loss_name, changed_count in (
+                    ("target_val_changed_focal_loss", target_val_crafter_changed_count),
+                    ("target_val_layout_changed_focal_loss", target_val_crafter_focal["layout_changed_count"]),
+                    ("target_val_inventory_changed_focal_loss", target_val_crafter_focal["inventory_changed_count"]),
+                ):
+                    if changed_count == 0 and not np.isfinite(row_data[loss_name]):
+                        row_data[loss_name] = 0.0
+            if quick_ewc_diagnostics_csv:
+                row_data.update({
+                    "train_ewc_raw_epoch": train_ewc_raw_epoch,
+                    "train_ewc_weighted_epoch": train_ewc_weighted_epoch,
+                    "train_ewc_to_wm_ratio_epoch": train_ewc_to_wm_ratio_epoch,
+                })
+            if generator.skip_crafter_learning_progress:
+                skipped_lp_columns = (
+                    "Pre_Changed_Focal_Loss", "Post_Changed_Focal_Loss",
+                    "Learning_Progress", "Inventory_KEEP_Ratio",
+                    *(f"Inventory_Stage_{stage}_{metric}"
+                      for stage in range(5)
+                      for metric in ("Count", "Mean_LP", "Reward_Std")),
+                )
+                row_data.update({name: 0.0 for name in skipped_lp_columns})
 
         pd.DataFrame([row_data], columns=csv_columns).to_csv(
             summary_csv_path,
@@ -918,6 +1232,16 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                     transition_stats_csv_path, mode="a",
                     header=not transition_stats_csv_path.exists(), index=False,
                 )
+        if is_crafter:
+            timing = generator.crafter_timing
+            print(
+                "  [Timing] "
+                f"collection={timing['collection']:.3f}s "
+                f"lp_pre={timing['lp_pre']:.3f}s "
+                f"wm_train={wm_train_seconds:.3f}s "
+                f"lp_post={timing['lp_post']:.3f}s "
+                f"target_val={target_val_seconds:.3f}s"
+            )
         torch.cuda.empty_cache()
 
         # E. Cleanup Temporary Data
@@ -928,6 +1252,19 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             for f in temp_files:
                 try: os.remove(f)
                 except: pass
+
+        if is_crafter and bool(getattr(cfg, "save_iteration_state", True)):
+            save_state(resume_state_path, {
+                "version": 1, "kind": "crafter_dr", "config_digest": config_digest(cfg),
+                "completed_iteration": iteration + 1,
+                "cumulative_transitions": cumulative_transitions,
+                "wm": wm.state_dict(), "old_params": old_params, "fisher": fisher,
+                "replay": replay_state(fisher_buffer),
+                "generator": generator_state(generator, include_policy=False),
+                "global_best_selection": global_best_selection,
+                "global_best_iteration": global_best_iteration,
+                "rng": rng_state(),
+            })
 
     print(f"\n[DR DONE] Log: {summary_csv_path}")
 

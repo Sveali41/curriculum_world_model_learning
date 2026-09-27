@@ -59,48 +59,48 @@ domains:
       - {name: layout_object_effect, distribution: categorical_effect, prediction_slice: [0, 21], target_index: 0, classes: 20, label_smoothing: 0.0}
       - {name: layout_direction_effect, distribution: categorical_effect, prediction_slice: [21, 27], target_index: 1, classes: 5, label_smoothing: 0.0}
       - {name: inventory, distribution: categorical_inventory_effect, prediction_source: auxiliary, target_source: inventory, target_mode: categorical_effect, classes: 10, effect_classes: 5}
-    # Authoritative Crafter WM settings recovered from the run that produced
-    # dr_attention_world_model_crafter_none_seed0_best.ckpt.
+    # Crafter WM uses the quick20-selected slot decoder and explicit
+    # KEEP/CHANGE calibration for both the base and residual event losses.
     crafter_wm:
       inventory_value_mode: categorical_delta
       inventory_output_mode: categorical_effect
+      # Retained as the null-weight fallback; the explicit weight below is
+      # authoritative when non-null.
       inventory_effect_reduction: sqrt_balanced
-      inventory_architecture: shared_pool_v1
+      inventory_effect_keep_weight: 0.95
+      inventory_architecture: slot_attention_v1
       event_residual:
         enabled: true
         hidden_dims: [64]
         action_embed_dim: 8
-        change_bias: 1.875
+        change_bias: 0
         loss_weight: 1.0
+        correct_keep_fraction: 0.25
+        keep_weight: 0.90
       pose:
         enabled: true
         mode: learned_detached
-      artifact_suffix: _effect5sqrt_pose_eventresidual64
+      artifact_suffix: _effect5keep095_residualkeep090_pose_eventresidual64_slotattn
     # Data collection budget for MAC/DR (per training iteration).
     # Runtime will split this by generator_batch_size to get per-rollout max transitions.
     iter_transition_budget: 8000
     # Held-out transitions per iteration for identical pre/post WM probes.
     # These never enter training or replay.
     learning_progress_probe_budget: 1000
+    target_validation_max_samples: 500
     generator_batch_size: 8
     max_edits_layout: 0.3
-    max_edits_inventory: 0.8
+    # Shared-schema placeholder; ignored by Crafter MAC/DR stage policies.
+    max_edits_inventory: 0.0
     replay_frac: 0.8
-    lambda_ewc: 10 #20000.0
+    lambda_ewc: 5 #20000.0
     validation_metric: "mse"
     reward:
       # Crafter MAC replaces instantaneous WM difficulty with held-out LP.
       learning_progress: 1.0
       ce: 6.0
       inv: 3.0
-      div: 1
-      map_edit_novelty: 1.0
-      start_position_novelty: 0.1
-      inventory_novelty: 0.2
-      inv_change: 2
-      layout_change: 0         # Auxiliary reward for dynamic terrain interactions
-      inv_change_norm_slots: 3.0
-      bias: 0.5
+      div: 0.01
       clip: 20.0
   
   minigrid:
@@ -211,12 +211,13 @@ domains:
       inventory_value_mode: categorical_absolute
       inventory_output_mode: categorical_gate
       inventory_effect_reduction: balanced_mean
+      inventory_effect_keep_weight: null
       inventory_architecture: shared_pool_v1
       event_residual:
         enabled: false
         hidden_dims: [64]
         action_embed_dim: 8
-        change_bias: 1.875
+        change_bias: 0
         loss_weight: 1.0
       pose:
         enabled: false
@@ -262,6 +263,7 @@ domains:
       inventory_value_mode: categorical_absolute
       inventory_output_mode: categorical_gate
       inventory_effect_reduction: balanced_mean
+      inventory_effect_keep_weight: null
       inventory_architecture: shared_pool_v1
       event_residual:
         enabled: false
@@ -362,7 +364,9 @@ attention_model:
   crafter_inventory_value_mode: ${domains.${domain}.crafter_wm.inventory_value_mode}
   crafter_inventory_output_mode: ${domains.${domain}.crafter_wm.inventory_output_mode}
   crafter_inventory_effect_reduction: ${domains.${domain}.crafter_wm.inventory_effect_reduction}
+  crafter_inventory_effect_keep_weight: ${domains.${domain}.crafter_wm.inventory_effect_keep_weight}
   crafter_inventory_architecture: ${domains.${domain}.crafter_wm.inventory_architecture}
+  crafter_pcgrad: false
   crafter_inventory_event_residual: ${domains.${domain}.crafter_wm.event_residual}
   crafter_pose: ${domains.${domain}.crafter_wm.pose}
   valid_values_obj: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
@@ -380,10 +384,10 @@ attention_model:
   debug_mode: False
   keep_cell_loss: false
   target_validation_keep_cell_loss: false
-  # MAC evaluates the same fixed 500-transition subset from each target on
-  # every iteration (20 targets -> 10k validation samples).
+  # Target evaluation uses the domain-specific fixed subset from each target on
+  # every iteration (Crafter and MiniGrid: 500 per target, 20 targets -> 10k samples).
   # Set to 0 to restore validation on the complete target archive.
-  target_validation_max_samples: 500
+  target_validation_max_samples: ${oc.select:domains.${domain}.target_validation_max_samples,500}
   target_validation_seed: 0
   target_validation_batch_size: 256
   frame_stack: 1
@@ -443,7 +447,6 @@ generator_agent:
   batch_size: ${domains.${domain}.generator_batch_size}
   context_dim: 64
   his_emb_dim: 16
-  ctx_top_k_features: 64
   max_edits_layout: ${domains.${domain}.max_edits_layout}
   max_edits_inventory: ${domains.${domain}.max_edits_inventory}
   reward_w_ce: 7.0
@@ -458,6 +461,8 @@ generator_agent:
   map_height: ${domains.${domain}.h}
   map_width: ${domains.${domain}.w}
   agent_type: 'ppo'
+  # Crafter-only PPO credit assignment ablation; joint preserves current behavior.
+  crafter_credit_mode: joint
   warmup_iterations: 10
   div_k: 10
   map_archive_size: 1000
@@ -474,6 +479,10 @@ ablation:
   type: "none" # "none"|"no_diversity"|"no_history"
 
 seed: 4
+# New Crafter runs save a full completed-iteration state in their results directory.
+# Resume only from that file, with the same CSV and configuration.
+save_iteration_state: true
+resume_training: false
 force_fresh_start: true         # Set to true to delete old model and start from scratch
 
 # Temporary NPZ path used during MAC WM retraining

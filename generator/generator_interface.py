@@ -4,6 +4,10 @@ import torch.nn.functional as F
 import os
 import random
 import math
+import time
+import csv
+import hashlib
+import json
 from collections import deque
 
 from generator.generator_agent import GeneratorPPO
@@ -74,6 +78,21 @@ def _minigrid_effective_edit_map(base_obj, final_obj, final_color, base_color=No
     )
 
 
+def _crafter_effective_edit_map(base_obj, final_obj, final_direction):
+    """Represent only materialized layout edits; exclude the agent start."""
+    base = np.asarray(base_obj).copy()
+    final = np.asarray(final_obj).copy()
+    direction = np.asarray(final_direction).copy()
+    if base.shape != final.shape or base.shape != direction.shape:
+        raise ValueError("Crafter effective edit map channels must have matching shapes")
+    base[base == CRAFTER_OBJ_MAP["agent"]] = CRAFTER_OBJ_MAP["grass"]
+    agent_mask = final == CRAFTER_OBJ_MAP["agent"]
+    final[agent_mask] = CRAFTER_OBJ_MAP["grass"]
+    direction[agent_mask] = 0
+    changed = (base != final) | (direction != 0)
+    return np.stack([np.where(changed, final, 0), np.where(changed, direction, 0)], axis=0)
+
+
 def minigrid_action_table(enable_locked_doors):
     table = dict(ACTION_TABLE_MINIGRID)
     if enable_locked_doors:
@@ -83,6 +102,7 @@ def minigrid_action_table(enable_locked_doors):
 class GeneratorInterface:
     def __init__(self, world_model, device, cfg, agent_type='ppo'):
         self.device = device
+        self.crafter_timing = {"collection": 0.0, "lp_pre": 0.0, "lp_post": 0.0}
         self.cfg = cfg
         self.agent_type = agent_type
         self.ablation_type = getattr(getattr(cfg, "ablation", None), "type", "none")
@@ -97,6 +117,19 @@ class GeneratorInterface:
         
         # Check environment type
         self.is_crafter = (getattr(cfg.attention_model, "env_type", "") == "crafter")
+        self.crafter_credit_mode = str(
+            getattr(hparams, "crafter_credit_mode", "joint")
+        ).lower()
+        if self.crafter_credit_mode not in {"joint", "split", "split_balanced_global"}:
+            raise ValueError(
+                "generator_agent.crafter_credit_mode must be 'joint', 'split', "
+                "or 'split_balanced_global', "
+                f"got {self.crafter_credit_mode!r}"
+            )
+        self._crafter_lp_scale_history = {
+            "layout": deque(maxlen=5),
+            "inventory": deque(maxlen=5),
+        }
         self.is_bipedal = (getattr(cfg.attention_model, "env_type", "") == "bipedalwalker")
         self.is_minigrid = not self.is_crafter and not self.is_bipedal
         minigrid_domain_cfg = getattr(getattr(cfg, "domains", None), "minigrid", None)
@@ -206,7 +239,6 @@ class GeneratorInterface:
                 context_dim=hparams.context_dim,
                 num_actions=len(self.ACTION_TABLE),
                 his_emb_dim=hparams.his_emb_dim,
-                top_k_features=hparams.ctx_top_k_features,
                 ablation_type=self.cfg.ablation.type,
                 env_type=("bipedalwalker" if self.is_bipedal else ("crafter" if self.is_crafter else "minigrid")),
                 lr_actor=float(getattr(ppo_cfg, "lr_actor", 1e-4)) if ppo_cfg is not None else 1e-4,
@@ -220,6 +252,8 @@ class GeneratorInterface:
                 entropy_anneal_iters=int(getattr(ppo_cfg, "entropy_anneal_iters", 0)) if ppo_cfg is not None else 0,
                 buffer_window_rounds=int(getattr(ppo_cfg, "buffer_window_rounds", 1)) if ppo_cfg is not None else 1,
                 update_every_rounds=int(getattr(ppo_cfg, "update_every_rounds", 1)) if ppo_cfg is not None else 1,
+                crafter_credit_mode=self.crafter_credit_mode,
+                warmup_iterations=int(getattr(hparams, "warmup_iterations", 10)),
                 initial_edit_ratio=float(hparams.max_edits_layout),
                 initial_inventory_edit_ratio=float(hparams.max_edits_inventory),
                 edit_action_group_sizes=edit_group_sizes,
@@ -254,14 +288,6 @@ class GeneratorInterface:
                 "device": self.device,
                 "env_type": env_type,
             }
-            if self.is_crafter:
-                crafter_cfg = getattr(getattr(cfg, "domains", None), "crafter", None)
-                reward_cfg = getattr(crafter_cfg, "reward", None)
-                diversity_kwargs.update({
-                    "crafter_map_weight": float(getattr(reward_cfg, "map_edit_novelty", 1.0)),
-                    "crafter_start_weight": float(getattr(reward_cfg, "start_position_novelty", 0.1)),
-                    "crafter_inventory_weight": float(getattr(reward_cfg, "inventory_novelty", 0.2)),
-                })
             if self.is_minigrid:
                 cuda_devices = []
                 diversity_device = torch.device(self.device)
@@ -298,6 +324,13 @@ class GeneratorInterface:
         ))
         self.max_edits_layout = hparams.max_edits_layout
         self.max_edits_inventory = hparams.max_edits_inventory
+        dr_fast_ablation_cfg = getattr(cfg, "dr_fast_ablation", None)
+        self.skip_crafter_learning_progress = bool(
+            self.is_crafter
+            and getattr(dr_fast_ablation_cfg, "skip_learning_progress", False)
+        )
+        if self.is_crafter:
+            self._initialize_crafter_stage_inventory_rng()
         
         if self.is_bipedal:
             self.OBJ_START = 0
@@ -329,11 +362,29 @@ class GeneratorInterface:
             1, int(math.ceil(crafter_lp_probe_budget / max(self.batch_size, 1)))
         )
         self.last_minigrid_metrics = {}
-        self.last_crafter_metrics = {}
+        self.last_crafter_metrics = (
+            {
+                "Pre_Changed_Focal_Loss": float("nan"),
+                "Post_Changed_Focal_Loss": float("nan"),
+                "Learning_Progress": float("nan"),
+                "paired_probe_count": 0,
+                "Inventory_KEEP_Ratio": float("nan"),
+                **{
+                    f"Inventory_Stage_{stage}_{metric}": float("nan")
+                    for stage in range(5)
+                    for metric in ("Count", "Mean_LP", "Reward_Std")
+                },
+            }
+            if self.skip_crafter_learning_progress else {}
+        )
         self.last_generated_minigrid_batch = None
         self._pending_minigrid_round = None
         self._pending_crafter_round = None
+        self.crafter_stage_probe_diagnostic = getattr(
+            cfg, "crafter_stage_probe_diagnostic", None
+        )
         self.last_minigrid_map_diagnostics = []
+        self.last_crafter_map_diagnostics = []
         self.last_generator_update_metrics = {}
         diagnostics_cfg = getattr(cfg, "diagnostics", None)
         self.enable_lp_split_diagnostic = bool(getattr(diagnostics_cfg, "lp_split", True))
@@ -342,6 +393,256 @@ class GeneratorInterface:
         self._last_bipedal_memory = (
             np.zeros(26, dtype=np.float32) if self.is_bipedal else np.zeros(16, dtype=np.float32)
         )
+
+
+    def _initialize_crafter_stage_inventory_rng(self):
+        self._crafter_stage_rng = np.random.default_rng(int(getattr(self.cfg, "seed", 0)))
+
+    def _sample_crafter_stage_inventory(self, stage, rng=None):
+        stage = int(stage)
+        rng = self._crafter_stage_rng if rng is None else rng
+        if not 0 <= stage < 5:
+            raise ValueError(f"Crafter progression-stage token must be 0..4, got {stage}")
+        items = np.zeros(12, dtype=np.float32)
+        # Stage-enabled slots use the official Crafter capacity ranges while
+        # locked slots remain zero; no dataset bank is read.
+        # Stage 4 supplies the iron-pickaxe precondition; diamond itself
+        # remains zero so the environment collection transition creates it.
+        resource_indices = {
+            1: (0, 5),
+            2: (0, 1, 2, 5),
+            3: (0, 1, 2, 3, 5),
+            4: (0, 1, 2, 3, 5),
+        }.get(stage, ())
+        for index in resource_indices:
+            low = 1 if stage == 1 and index == 0 else 0
+            items[index] = rng.integers(low, 10)
+        pickaxe_indices = {
+            2: (6,),
+            3: (6, 7),
+            4: (6, 7, 8),
+        }.get(stage, ())
+        for index in pickaxe_indices:
+            items[index] = rng.integers(1, 10)
+        sword_indices = {
+            1: (9,),
+            2: (9, 10),
+            3: (9, 10, 11),
+            4: (9, 10, 11),
+        }.get(stage, ())
+        for index in sword_indices:
+            items[index] = rng.integers(0, 10)
+        return items
+
+    @staticmethod
+    def _crafter_probe_hash(trajectory):
+        digest = hashlib.sha256()
+        for key in ("obs", "obs_next", "act", "inv", "inv_next", "done"):
+            value = trajectory.get(key) if isinstance(trajectory, dict) else None
+            if value is None:
+                continue
+            if torch.is_tensor(value):
+                value = value.detach().cpu().numpy()
+            array = np.ascontiguousarray(np.asarray(value))
+            digest.update(key.encode("utf-8"))
+            digest.update(str(array.dtype).encode("ascii"))
+            digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+            digest.update(array.tobytes())
+        return digest.hexdigest()
+
+    def _collect_crafter_stage_signal_probes(
+        self, final_maps_obj, base_stats_batch, final_stats_batch,
+        stage_probabilities, iteration,
+    ):
+        cfg = self.crafter_stage_probe_diagnostic
+        if cfg is None or not bool(getattr(cfg, "enabled", False)):
+            return None
+        map_count = int(getattr(cfg, "map_count", self.batch_size))
+        repeats = int(getattr(cfg, "repeats", 2))
+        max_steps = int(getattr(cfg, "max_steps", 125))
+        seed_base = int(getattr(cfg, "seed", getattr(self.cfg, "seed", 0)))
+        output_dir = getattr(cfg, "output_dir", None)
+        if not output_dir:
+            raise ValueError("crafter_stage_probe_diagnostic.output_dir is required")
+        if map_count != self.batch_size or len(final_maps_obj) != map_count:
+            raise ValueError(
+                "Stage signal diagnostic requires map_count to equal the generated batch size; "
+                f"got map_count={map_count}, batch_size={self.batch_size}, maps={len(final_maps_obj)}"
+            )
+        if repeats < 2 or max_steps <= 0:
+            raise ValueError("Stage signal diagnostic requires repeats >= 2 and max_steps > 0")
+        stage_probabilities = np.asarray(stage_probabilities, dtype=np.float32).reshape(map_count, -1)
+        if stage_probabilities.shape != (map_count, 6):
+            raise ValueError(
+                "Stage signal diagnostic needs one six-way policy distribution per layout; "
+                f"got {stage_probabilities.shape}"
+            )
+
+        from pathlib import Path
+        probe_data_dir = Path(output_dir) / "probe_data"
+        probe_visual_dir = Path(output_dir) / "probe_visualizations"
+        probe_data_dir.mkdir(parents=True, exist_ok=True)
+        probe_visual_dir.mkdir(parents=True, exist_ok=True)
+        collect_cfg = self.support.cfg.env.collect
+        old_data_folder = getattr(collect_cfg, "data_folder", None)
+        old_visualize_path = getattr(collect_cfg, "visualize_save_path", None)
+        old_data_save_path = getattr(collect_cfg, "data_save_path", None)
+        old_max_dataset_size = getattr(collect_cfg, "maximum_dataset_size", None)
+        old_save_env_visualize = bool(getattr(collect_cfg, "save_env_visualize", False))
+        old_save_coverage_visualize = bool(getattr(collect_cfg, "save_coverage_visualize", False))
+        old_type = str(collect_cfg.data_type)
+        collect_cfg.data_folder = str(probe_data_dir)
+        collect_cfg.visualize_save_path = str(probe_visual_dir)
+        collect_cfg.save_env_visualize = False
+        collect_cfg.save_coverage_visualize = False
+
+        trajectories, valid_flags, rows = [], [], []
+        try:
+            for map_index, map_obj in enumerate(final_maps_obj):
+                base_stats = np.asarray(base_stats_batch[map_index], dtype=np.float32).copy()
+                # The actual sampled token is supplied separately below through
+                # the selected-stage action stored on the interface.
+                selected_token = int(self._crafter_diagnostic_selected_tokens[map_index])
+                map_hash = hashlib.sha256(np.ascontiguousarray(map_obj).tobytes()).hexdigest()
+                for stage_token in range(6):
+                    for repeat in range(repeats):
+                        stats = base_stats.copy()
+                        if stage_token > 0:
+                            if stage_token == selected_token and repeat == 0:
+                                stats = np.asarray(final_stats_batch[map_index], dtype=np.float32).copy()
+                            else:
+                                inventory_seed = np.random.SeedSequence((
+                                    seed_base, int(iteration), map_index, stage_token, repeat,
+                                ))
+                                stats[4:16] = self._sample_crafter_stage_inventory(
+                                    stage_token - 1, rng=np.random.default_rng(inventory_seed)
+                                )
+                        stats[:4] = base_stats[:4]
+                        if not np.array_equal(stats[:4], base_stats[:4]):
+                            raise RuntimeError("Stage probe modified Crafter physiology slots")
+                        rollout_seed = seed_base + int(iteration) * 100000 + map_index * 100 + repeat
+                        py_state = random.getstate()
+                        np_state = np.random.get_state()
+                        torch_state = torch.random.get_rng_state()
+                        cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+                        try:
+                            random.seed(rollout_seed)
+                            np.random.seed(rollout_seed % (2**32))
+                            torch.manual_seed(rollout_seed)
+                            if torch.cuda.is_available():
+                                torch.cuda.manual_seed_all(rollout_seed)
+                            probe_index = f"stage_signal_m{map_index}_t{stage_token}_r{repeat}"
+                            trajectory = self._rollout_combined(
+                                map_obj, stats, iteration, probe_index,
+                                old_params=None, evaluate_wm=False,
+                                maximum_dataset_size=max_steps,
+                            )[0]
+                        finally:
+                            random.setstate(py_state)
+                            np.random.set_state(np_state)
+                            torch.random.set_rng_state(torch_state)
+                            if cuda_states is not None:
+                                torch.cuda.set_rng_state_all(cuda_states)
+                        valid = bool(trajectory and "obs" in trajectory)
+                        inv = trajectory.get("inv") if valid else None
+                        inv_next = trajectory.get("inv_next") if valid else None
+                        if inv is not None and inv_next is not None:
+                            inv = inv.detach().cpu().numpy() if torch.is_tensor(inv) else np.asarray(inv)
+                            inv_next = inv_next.detach().cpu().numpy() if torch.is_tensor(inv_next) else np.asarray(inv_next)
+                            delta = inv_next.astype(np.float32)[:, 4:16] - inv.astype(np.float32)[:, 4:16]
+                            changed = np.any(np.abs(delta) > 1e-6, axis=1)
+                            changed_count = int(changed.sum())
+                            changed_slots = int(np.any(np.abs(delta) > 1e-6, axis=0).sum())
+                        else:
+                            changed_count = 0
+                            changed_slots = 0
+                        rows.append({
+                            "Seed": seed_base,
+                            "Iter": int(iteration) + 1,
+                            "Map_Index": map_index,
+                            "Layout_SHA256": map_hash,
+                            "Stage_Token": stage_token,
+                            "Repeat": repeat,
+                            "Rollout_Seed": rollout_seed,
+                            "Environment_Valid": int(valid),
+                            "Probe_Valid": int(valid),
+                            "Trajectory_Transitions": int(len(trajectory.get("obs", ()))) if valid else 0,
+                            "Inventory_Changed_Transitions": changed_count,
+                            "Inventory_Changed_Slots": changed_slots,
+                            "No_Inventory_Change": int(changed_count == 0),
+                            "Initial_Physiology_JSON": json.dumps(stats[:4].tolist(), separators=(",", ":")),
+                            "Initial_Inventory_JSON": json.dumps(stats[4:16].tolist(), separators=(",", ":")),
+                            "Stage_Policy_Probability": float(stage_probabilities[map_index, stage_token]),
+                            "Stage_Policy_Distribution_JSON": json.dumps(stage_probabilities[map_index].tolist(), separators=(",", ":")),
+                            "Selected_Policy_Stage_Token": selected_token,
+                            "Generator_Policy_State": "fresh_seed_initialization",
+                            "Trajectory_SHA256": self._crafter_probe_hash(trajectory),
+                            "Inventory_Pre_Changed_Focal_Loss": float("nan"),
+                            "Inventory_Post_Changed_Focal_Loss": float("nan"),
+                            "Inventory_Learning_Progress": float("nan"),
+                        })
+                        trajectories.append(trajectory)
+                        valid_flags.append(valid)
+                        data_name = f"UED_Dual_iter{iteration}_b{probe_index}_test_{old_type}.npz"
+                        data_path = probe_data_dir / data_name
+                        if data_path.exists():
+                            data_path.unlink()
+        finally:
+            collect_cfg.data_type = old_type
+            collect_cfg.data_folder = old_data_folder
+            collect_cfg.visualize_save_path = old_visualize_path
+            collect_cfg.data_save_path = old_data_save_path
+            collect_cfg.maximum_dataset_size = old_max_dataset_size
+            collect_cfg.save_env_visualize = old_save_env_visualize
+            collect_cfg.save_coverage_visualize = old_save_coverage_visualize
+
+        pre_losses, pre_components = self._evaluate_crafter_changed_focal_losses(
+            trajectories, valid_flags, "Stage signal pre-update", include_components=True
+        )
+        for index, (loss, components) in enumerate(zip(pre_losses, pre_components)):
+            inventory_loss = float(components["inventory"]) if components is not None else float("nan")
+            rows[index]["Inventory_Pre_Changed_Focal_Loss"] = inventory_loss
+            rows[index]["Inventory_Changed_Transitions"] = int(
+                components.get("inventory_changed_count", rows[index]["Inventory_Changed_Transitions"])
+            ) if components is not None else rows[index]["Inventory_Changed_Transitions"]
+            rows[index]["No_Inventory_Change"] = int(rows[index]["Inventory_Changed_Transitions"] == 0)
+        return {"rows": rows, "trajectories": trajectories, "valid": valid_flags}
+
+    def _write_crafter_stage_signal_diagnostic(self, diagnostic, post_losses, post_components):
+        cfg = self.crafter_stage_probe_diagnostic
+        csv_path = getattr(cfg, "csv_path", None)
+        if not csv_path:
+            raise ValueError("crafter_stage_probe_diagnostic.csv_path is required")
+        from pathlib import Path
+        path = Path(csv_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        header = [
+            "Seed", "Iter", "Map_Index", "Layout_SHA256", "Stage_Token", "Repeat",
+            "Rollout_Seed", "Environment_Valid", "Probe_Valid", "Trajectory_Transitions",
+            "Inventory_Changed_Transitions", "Inventory_Changed_Slots", "No_Inventory_Change",
+            "Initial_Physiology_JSON", "Initial_Inventory_JSON",
+            "Stage_Policy_Probability", "Stage_Policy_Distribution_JSON",
+            "Selected_Policy_Stage_Token", "Generator_Policy_State", "Trajectory_SHA256",
+            "Inventory_Pre_Changed_Focal_Loss", "Inventory_Post_Changed_Focal_Loss",
+            "Inventory_Learning_Progress",
+        ]
+        if path.exists() and path.stat().st_size:
+            with path.open(newline="") as handle:
+                if next(csv.reader(handle), None) != header:
+                    raise ValueError(f"Stage signal diagnostic CSV schema mismatch: {path}")
+        else:
+            with path.open("w", newline="") as handle:
+                csv.writer(handle).writerow(header)
+        for index, row in enumerate(diagnostic["rows"]):
+            component = post_components[index]
+            post = float(component["inventory"]) if component is not None else float("nan")
+            pre = float(row["Inventory_Pre_Changed_Focal_Loss"])
+            row["Inventory_Post_Changed_Focal_Loss"] = post
+            row["Inventory_Learning_Progress"] = pre - post if np.isfinite(pre) and np.isfinite(post) else float("nan")
+        with path.open("a", newline="") as handle:
+            writer = csv.writer(handle)
+            for row in diagnostic["rows"]:
+                writer.writerow([row.get(name, "") for name in header])
 
     def _get_crafter_reward_cfg(self):
         if not self.is_crafter:
@@ -389,7 +690,7 @@ class GeneratorInterface:
                 return getattr(bipedal_cfg, "history_len")
         return getattr(self.cfg.generator_agent, "history_len", 5)
 
-    def _get_diversity_reward(self, map_tensor, inventory_vec=None):
+    def _get_diversity_reward(self, map_tensor, inventory_vec=None, start_position=None, stage_token=None):
         """Compute diversity safely for discrete MiniGrid maps.
 
         ``DiversityModule`` one-hot encodes object and colour IDs on CUDA.
@@ -442,6 +743,8 @@ class GeneratorInterface:
             self.diversity.get_reward(
                 torch.as_tensor(map_tensor, device=self.device).unsqueeze(0),
                 inventory_vec=inventory_vec,
+                start_position=start_position,
+                stage_token=stage_token,
             )
         )
 
@@ -453,23 +756,22 @@ class GeneratorInterface:
         base_stats = np.asarray(base_stats)
         edit_mask = mask.detach().cpu().numpy() if torch.is_tensor(mask) else np.asarray(mask)
         maps_obj, maps_color, maps_state, maps_stats = [], [], [], []
+        if self.is_crafter and stats_actions is not None:
+            if stats_actions.shape != (len(base_ids), 1):
+                raise ValueError(f"Crafter inventory stage actions must have shape ({len(base_ids)}, 1), got {stats_actions.shape}")
+            if not np.issubdtype(stats_actions.dtype, np.integer):
+                raise ValueError("Crafter inventory stage actions must use an integer dtype")
+            if np.any((stats_actions < 0) | (stats_actions > 5)):
+                raise ValueError("Crafter inventory stage actions must contain only 0..5")
         for i in range(len(base_ids)):
             obj, color, state = self._apply_action(
                 base_ids[i], actions[i], mask=edit_mask[i, 0]
             )
             stats = base_stats[i].copy()
             current_stats = stats_actions[i] if stats_actions is not None else None
-            if self.is_crafter and getattr(self.cfg.generator_agent, "random_stats_actions", False):
-                current_stats = (np.random.rand(32) < 0.15).astype(np.int64)
-                current_stats[0:4] = 0
-                current_stats[16:20] = 0
             if self.is_crafter and current_stats is not None:
-                for k_idx, value in enumerate(current_stats):
-                    slot = k_idx % 16
-                    # Invariant: survival slots are tracker-owned. Even a
-                    # malformed action request cannot alter them.
-                    if value == 1 and slot >= 4:
-                        stats[slot] += 1 if k_idx < 16 else 5
+                stage_token = int(current_stats[0])
+                if stage_token: stats[4:16] = self._sample_crafter_stage_inventory(stage_token - 1)
             elif self.is_minigrid and current_stats is not None:
                 inventory_action = int(np.asarray(current_stats).reshape(-1)[0])
                 if not 0 <= inventory_action < len(MINIGRID_INVENTORY_ACTION_TO_TOKEN):
@@ -700,7 +1002,7 @@ class GeneratorInterface:
 
     def _zero_context(self, B, H, W):
         # (Map features, Inventory Heatmap)
-        feedback_channels = 2 if not self.is_crafter and not self.is_bipedal else 1
+        feedback_channels = 1 if self.is_bipedal else 2
         map_h = torch.zeros((B, feedback_channels, H, W), device=self.device)
         if self.is_crafter:
             stats_h = torch.zeros((B, 16), device=self.device)
@@ -1213,16 +1515,50 @@ class GeneratorInterface:
         self._attach_minigrid_explorer_coverage()
         self._pending_minigrid_round = None
 
-    def _evaluate_crafter_changed_focal_losses(self, trajectories, valid, phase):
-        losses = np.full(self.batch_size, np.nan, dtype=np.float32)
-        for index, trajectory in enumerate(trajectories):
-            if not valid[index] or not trajectory:
-                continue
-            try:
-                losses[index] = float(self.wm.calc_crafter_changed_focal_loss(trajectory))
-            except Exception as exc:
-                print(f"[GeneratorInterface] {phase} Crafter probe failed for env {index}: {exc}")
-        return losses
+    def _evaluate_crafter_changed_focal_losses(self, trajectories, valid, phase, include_feedback=False, include_components=False):
+        count = len(trajectories)
+        valid = np.asarray(valid, dtype=bool).reshape(-1)
+        if valid.size != count:
+            raise ValueError(f"Crafter probe validity mask has {valid.size} values for {count} trajectories")
+        losses = np.full(count, np.nan, dtype=np.float32)
+        feedback = [None] * count if include_feedback else None
+        components = [None] * count if include_components else None
+        indices = [index for index, trajectory in enumerate(trajectories)
+                   if valid[index] and trajectory and "obs" in trajectory]
+        if not indices:
+            if include_components:
+                return (losses, feedback, components) if include_feedback else (losses, components)
+            return (losses, feedback) if include_feedback else losses
+        if torch.device(self.device).type == "cuda":
+            torch.cuda.synchronize(self.device)
+        start = time.perf_counter()
+        try:
+            values = self.wm.calc_crafter_changed_focal_losses(
+                [trajectories[index] for index in indices], max_batch_size=256,
+                return_feedback=include_feedback, return_components=include_components,
+            )
+            if include_components:
+                if include_feedback:
+                    values, valid_feedback, valid_components = values
+                else:
+                    values, valid_components = values
+                for index, item in zip(indices, valid_components):
+                    components[index] = item
+            if include_feedback:
+                if not include_components:
+                    values, valid_feedback = values
+                for index, item in zip(indices, valid_feedback):
+                    feedback[index] = item
+        except Exception as exc:
+            raise RuntimeError(f"{phase} Crafter probe batch failed: {exc}") from exc
+        if torch.device(self.device).type == "cuda":
+            torch.cuda.synchronize(self.device)
+        timing_key = "lp_post" if phase.lower().startswith("post") else "lp_pre"
+        self.crafter_timing[timing_key] += time.perf_counter() - start
+        losses[indices] = np.asarray(values, dtype=np.float32)
+        if include_components:
+            return (losses, feedback, components) if include_feedback else (losses, components)
+        return (losses, feedback) if include_feedback else losses
 
     @staticmethod
     def _aggregate_crafter_learning_progress(pre_losses, post_losses):
@@ -1240,35 +1576,281 @@ class GeneratorInterface:
         if not self.is_crafter or pending is None:
             return
         valid = np.asarray(pending["valid"], dtype=bool)
+        environment_valid = np.asarray(pending.get("environment_valid", valid), dtype=bool)
         pre = np.asarray(pending["pre_changed_focal_losses"], dtype=np.float32)
-        post = self._evaluate_crafter_changed_focal_losses(
-            pending["probe_trajectories"], valid, "Post-update"
+        pre_components = pending["pre_components"]
+        post_result = self._evaluate_crafter_changed_focal_losses(
+            pending["probe_trajectories"], valid, "Post-update",
+            include_feedback=apply_rewards and self.agent_type != "random", include_components=True,
         )
-        _, _, learning_progress, paired = self._aggregate_crafter_learning_progress(pre, post)
-        self.last_crafter_metrics = {
-            "Learning_Progress": learning_progress,
-            "paired_probe_count": int(paired.sum()),
-        }
+        post, feedback, post_components = post_result if len(post_result) == 3 else (post_result[0], None, post_result[1])
+        pre_changed_focal_loss, post_changed_focal_loss, learning_progress, paired = self._aggregate_crafter_learning_progress(pre, post)
+        component_arrays = {}
+        component_metrics = {}
+        for group in ("layout", "inventory"):
+            before = np.asarray([item[group] if item is not None else float("nan") for item in pre_components], dtype=np.float32)
+            after = np.asarray([item[group] if item is not None else float("nan") for item in post_components], dtype=np.float32)
+            group_paired = np.isfinite(before) & np.isfinite(after)
+            component_arrays[group] = (before, after, group_paired)
+            prefix = "Layout" if group == "layout" else "Inventory"
+            component_metrics.update({
+                f"Pre_{prefix}_Changed_Focal_Loss": float(before[group_paired].mean()) if group_paired.any() else float("nan"),
+                f"Post_{prefix}_Changed_Focal_Loss": float(after[group_paired].mean()) if group_paired.any() else float("nan"),
+                f"{prefix}_Learning_Progress": float((before[group_paired] - after[group_paired]).mean()) if group_paired.any() else float("nan"),
+                f"{prefix}_Paired_Probe_Count": int(group_paired.sum()),
+            })
+        novelty_parts = pending.get("novelty_parts", [])
+        novelty = np.asarray([float(part["total_novelty"]) for part in novelty_parts], dtype=np.float32) if novelty_parts else np.zeros(self.batch_size, dtype=np.float32)
+        stage_rewards = []
+        balanced_mode = (
+            apply_rewards and getattr(self, "crafter_credit_mode", "joint") == "split_balanced_global"
+        )
+        layout_before, layout_after, layout_paired = component_arrays["layout"]
+        inventory_before, inventory_after, inventory_paired = component_arrays["inventory"]
+        layout_lp = np.zeros(self.batch_size, dtype=np.float32)
+        inventory_lp = np.zeros(self.batch_size, dtype=np.float32)
+        layout_lp_mask = layout_paired & valid & environment_valid
+        inventory_lp_mask = inventory_paired & valid & environment_valid
+        layout_lp[layout_lp_mask] = layout_before[layout_lp_mask] - layout_after[layout_lp_mask]
+        inventory_lp[inventory_lp_mask] = inventory_before[inventory_lp_mask] - inventory_after[inventory_lp_mask]
+        layout_lp_scale = float("nan")
+        inventory_lp_scale = float("nan")
+        normalized_layout_lp = np.zeros(self.batch_size, dtype=np.float32)
+        normalized_inventory_lp = np.zeros(self.batch_size, dtype=np.float32)
+        layout_reward_layout_lp = np.zeros(self.batch_size, dtype=np.float32)
+        layout_reward_inventory_lp = np.zeros(self.batch_size, dtype=np.float32)
+        stage_reward_layout_lp = np.zeros(self.batch_size, dtype=np.float32)
+        stage_reward_inventory_lp = np.zeros(self.batch_size, dtype=np.float32)
+        reward_lp_values = np.zeros(self.batch_size, dtype=np.float32)
+
+        if balanced_mode:
+            scale_history = getattr(self, "_crafter_lp_scale_history", None)
+            if scale_history is None:
+                scale_history = {"layout": deque(maxlen=5), "inventory": deque(maxlen=5)}
+                self._crafter_lp_scale_history = scale_history
+
+            def _scale_for(group, current_values, current_mask):
+                past = [np.asarray(values, dtype=np.float32).reshape(-1) for values in scale_history[group]]
+                reference = np.concatenate(past) if past else current_values[current_mask]
+                reference = reference[np.isfinite(reference)]
+                if not len(reference):
+                    return 0.001
+                return max(float(np.mean(np.abs(reference))), 0.001)
+
+            layout_lp_scale = _scale_for("layout", layout_lp, layout_lp_mask)
+            inventory_lp_scale = _scale_for("inventory", inventory_lp, inventory_lp_mask)
+            normalized_layout_lp[layout_lp_mask] = np.clip(
+                layout_lp[layout_lp_mask] / layout_lp_scale, -3.0, 3.0
+            )
+            normalized_inventory_lp[inventory_lp_mask] = np.clip(
+                inventory_lp[inventory_lp_mask] / inventory_lp_scale, -3.0, 3.0
+            )
+
         if apply_rewards:
-            # Never retain the provisional instantaneous CE/inventory reward.
-            # A valid probe without a scored change receives only the same
-            # diversity/inventory-change/bias auxiliary terms; only a finite
-            # identical pre/post pair contributes learning progress.
             rewards = []
             weight = float(getattr(self.crafter_reward_cfg, "learning_progress", 1.0))
             reward_clip = float(getattr(self.crafter_reward_cfg, "clip", 100.0))
             for index in range(self.batch_size):
-                if not valid[index]:
-                    reward = -5.0
+                base_reward = -5.0 if not environment_valid[index] else float(pending["auxiliary_rewards"][index])
+                layout_reward = base_reward
+                stage_reward = base_reward
+                if balanced_mode:
+                    if valid[index]:
+                        layout_reward_layout_lp[index] = weight * 1.5 * normalized_layout_lp[index]
+                        layout_reward_inventory_lp[index] = weight * 0.5 * normalized_inventory_lp[index]
+                        stage_reward_layout_lp[index] = weight * 0.5 * normalized_layout_lp[index]
+                        stage_reward_inventory_lp[index] = weight * 1.5 * normalized_inventory_lp[index]
+                    layout_lp_term = layout_reward_layout_lp[index] + layout_reward_inventory_lp[index]
+                    stage_lp_term = stage_reward_layout_lp[index] + stage_reward_inventory_lp[index]
+                    reward_lp_values[index] = layout_lp_term
+                    layout_reward += layout_lp_term
+                    stage_reward += stage_lp_term
                 else:
-                    reward = float(pending["auxiliary_rewards"][index])
-                    if paired[index]:
-                        reward += weight * float(pre[index] - post[index])
-                    reward = float(np.clip(reward, -reward_clip, reward_clip))
-                rewards.append(reward)
-            buffer_rewards = getattr(self.ppo, "buffer", {}).get("reward", [])
+                    if valid[index] and paired[index]:
+                        layout_lp_term = weight * float(pre[index] - post[index])
+                        layout_reward += layout_lp_term
+                        reward_lp_values[index] = layout_lp_term
+                    if valid[index] and inventory_paired[index]:
+                        stage_reward += weight * float(inventory_lp[index])
+                rewards.append(float(np.clip(layout_reward, -reward_clip, reward_clip)))
+                stage_rewards.append(float(np.clip(stage_reward, -reward_clip, reward_clip)))
+            buffer = getattr(self.ppo, "buffer", {})
+            buffer_rewards = buffer.get("reward", [])
             if buffer_rewards and len(buffer_rewards) >= self.batch_size:
                 buffer_rewards[-self.batch_size:] = rewards
+            layout_buffer = buffer.get("layout_reward", [])
+            if layout_buffer and len(layout_buffer) >= self.batch_size:
+                layout_buffer[-self.batch_size:] = rewards
+            stage_buffer = buffer.get("stage_reward", [])
+            if (getattr(self, "crafter_credit_mode", "joint") in {"split", "split_balanced_global"}
+                    and stage_buffer and len(stage_buffer) >= self.batch_size):
+                stage_buffer[-self.batch_size:] = stage_rewards
+            diagnostic_rewards = np.asarray(rewards, dtype=np.float32)
+
+            if balanced_mode:
+                for group, values, mask in (
+                    ("layout", layout_lp, layout_lp_mask),
+                    ("inventory", inventory_lp, inventory_lp_mask),
+                ):
+                    if mask.any():
+                        scale_history[group].append(values[mask].copy())
+        else:
+            diagnostic_rewards = np.asarray(pending.get("rewards", []), dtype=np.float32)
+            stage_rewards = diagnostic_rewards.tolist()
+
+        auxiliary_rewards = np.asarray(
+            pending.get("auxiliary_rewards", np.zeros(self.batch_size)), dtype=np.float32
+        )
+        novelty_contribution = np.where(environment_valid, auxiliary_rewards, 0.0).astype(np.float32)
+        layout_lp_abs = np.abs(layout_reward_layout_lp)
+        layout_inventory_lp_abs = np.abs(layout_reward_inventory_lp)
+        stage_layout_lp_abs = np.abs(stage_reward_layout_lp)
+        stage_inventory_lp_abs = np.abs(stage_reward_inventory_lp)
+        layout_total_contribution = layout_lp_abs + layout_inventory_lp_abs + np.abs(novelty_contribution)
+        stage_total_contribution = stage_layout_lp_abs + stage_inventory_lp_abs + np.abs(novelty_contribution)
+        layout_reward_shares = {
+            "layout_lp": np.divide(layout_lp_abs, layout_total_contribution, out=np.full(self.batch_size, np.nan, dtype=np.float32), where=layout_total_contribution > 0),
+            "inventory_lp": np.divide(layout_inventory_lp_abs, layout_total_contribution, out=np.full(self.batch_size, np.nan, dtype=np.float32), where=layout_total_contribution > 0),
+            "novelty": np.divide(np.abs(novelty_contribution), layout_total_contribution, out=np.full(self.batch_size, np.nan, dtype=np.float32), where=layout_total_contribution > 0),
+        }
+        stage_reward_shares = {
+            "layout_lp": np.divide(stage_layout_lp_abs, stage_total_contribution, out=np.full(self.batch_size, np.nan, dtype=np.float32), where=stage_total_contribution > 0),
+            "inventory_lp": np.divide(stage_inventory_lp_abs, stage_total_contribution, out=np.full(self.batch_size, np.nan, dtype=np.float32), where=stage_total_contribution > 0),
+            "novelty": np.divide(np.abs(novelty_contribution), stage_total_contribution, out=np.full(self.batch_size, np.nan, dtype=np.float32), where=stage_total_contribution > 0),
+        }
+        if feedback is not None:
+            maps_tensor = torch.as_tensor(np.asarray(pending["history_maps"]), dtype=torch.float32, device=self.device)
+            spatial = np.zeros((self.batch_size, 2, self.map_height, self.map_width), dtype=np.float32)
+            item_error = np.zeros((self.batch_size, 16), dtype=np.float32)
+            for index, item in enumerate(feedback):
+                if valid[index] and item is not None:
+                    spatial[index, 0] = item["error_map"]
+                    spatial[index, 1] = item["coverage_map"]
+                    item_error[index, 4:16] = item["item_error"]
+            self.prev_data = (
+                maps_tensor,
+                torch.as_tensor(spatial, dtype=torch.float32, device=self.device),
+                torch.as_tensor(item_error, dtype=torch.float32, device=self.device),
+            )
+        tokens = np.asarray(pending.get("stage_tokens", []), dtype=np.int64).reshape(-1)
+        if len(tokens) != len(pre):
+            raise ValueError(
+                "Crafter inventory stage token count must match the LP probe batch: "
+                f"got {len(tokens)} tokens for {len(pre)} probes"
+            )
+        stage_metrics = {"Inventory_KEEP_Ratio": float(np.mean(tokens == 0)) if len(tokens) else 0.0}
+        for stage in range(5):
+            selected = tokens == stage + 1
+            lp = pre[selected & paired] - post[selected & paired]
+            selected_stage_rewards = np.asarray(stage_rewards, dtype=np.float32)[selected]
+            stage_metrics.update({f"Inventory_Stage_{stage}_Count": int(selected.sum()), f"Inventory_Stage_{stage}_Mean_LP": float(lp.mean()) if len(lp) else 0.0, f"Inventory_Stage_{stage}_Reward_Std": float(selected_stage_rewards.std()) if len(selected_stage_rewards) else 0.0})
+        self.last_crafter_map_diagnostics = [
+            {
+                "map_index": index,
+                "valid": bool(valid[index]),
+                "environment_valid": bool(environment_valid[index]),
+                "stage_token": int(tokens[index]),
+                "inventory_changed_slots": int(pending.get("inventory_changed_slots", [0] * self.batch_size)[index]),
+                "pre_changed_focal_loss": float(pre[index]),
+                "post_changed_focal_loss": float(post[index]),
+                "learning_progress": float(pre[index] - post[index]) if paired[index] else float("nan"),
+                **{f"{group}_{field}": float(component_arrays[group][0 if field == "pre_changed_focal_loss" else 1][index])
+                   for group in ("layout", "inventory") for field in ("pre_changed_focal_loss", "post_changed_focal_loss")},
+                **{f"{group}_learning_progress": float(component_arrays[group][0][index] - component_arrays[group][1][index])
+                   if component_arrays[group][2][index] else float("nan") for group in ("layout", "inventory")},
+                **{f"{group}_changed_count_{phase}": int(item[f"{group}_changed_count"]) if item is not None else 0
+                   for phase, item in (("pre", pre_components[index]), ("post", post_components[index]))
+                   for group in ("layout", "inventory")},
+                **(novelty_parts[index] if novelty_parts else {}),
+                "reward_learning_progress": float(reward_lp_values[index]) if apply_rewards else 0.0,
+                "reward_novelty": float(auxiliary_rewards[index]) if environment_valid[index] else 0.0,
+                "layout_lp_scale": layout_lp_scale,
+                "inventory_lp_scale": inventory_lp_scale,
+                "normalized_layout_lp": float(normalized_layout_lp[index]) if balanced_mode else float("nan"),
+                "normalized_inventory_lp": float(normalized_inventory_lp[index]) if balanced_mode else float("nan"),
+                "layout_reward_layout_lp": float(layout_reward_layout_lp[index]) if balanced_mode else float("nan"),
+                "layout_reward_inventory_lp": float(layout_reward_inventory_lp[index]) if balanced_mode else float("nan"),
+                "stage_reward_layout_lp": float(stage_reward_layout_lp[index]) if balanced_mode else float("nan"),
+                "stage_reward_inventory_lp": float(stage_reward_inventory_lp[index]) if balanced_mode else float("nan"),
+                "layout_reward_layout_lp_share": float(layout_reward_shares["layout_lp"][index]),
+                "layout_reward_inventory_lp_share": float(layout_reward_shares["inventory_lp"][index]),
+                "layout_reward_novelty_share": float(layout_reward_shares["novelty"][index]),
+                "stage_reward_layout_lp_share": float(stage_reward_shares["layout_lp"][index]),
+                "stage_reward_inventory_lp_share": float(stage_reward_shares["inventory_lp"][index]),
+                "stage_reward_novelty_share": float(stage_reward_shares["novelty"][index]),
+                "reward_total": float(diagnostic_rewards[index]) if len(diagnostic_rewards) == self.batch_size else float("nan"),
+                "reward_layout": float(diagnostic_rewards[index]) if len(diagnostic_rewards) == self.batch_size else float("nan"),
+                "reward_stage": float(stage_rewards[index]) if len(stage_rewards) == self.batch_size else float("nan"),
+                "stage_inventory_event_count": int(pre_components[index]["inventory_changed_count"] > 0) if pre_components[index] is not None else 0,
+            }
+            for index in range(self.batch_size)
+        ] if novelty_parts else []
+        valid_reward_mask = environment_valid
+        def _absolute_contribution_share(target, *components):
+            target_total = float(np.abs(target[valid_reward_mask]).sum())
+            total = sum(float(np.abs(component[valid_reward_mask]).sum()) for component in components)
+            return target_total / total if total > 0.0 else float("nan")
+
+        balanced_reward_metrics = {
+            "Layout_LP_Scale": layout_lp_scale,
+            "Inventory_LP_Scale": inventory_lp_scale,
+            "Layout_Reward_Layout_LP_Abs_Mean": float(layout_lp_abs.mean()) if balanced_mode else float("nan"),
+            "Layout_Reward_Inventory_LP_Abs_Mean": float(layout_inventory_lp_abs.mean()) if balanced_mode else float("nan"),
+            "Layout_Reward_Layout_LP_Share": _absolute_contribution_share(layout_reward_layout_lp, layout_reward_layout_lp, layout_reward_inventory_lp, novelty_contribution) if balanced_mode else float("nan"),
+            "Layout_Reward_Inventory_LP_Share": _absolute_contribution_share(layout_reward_inventory_lp, layout_reward_layout_lp, layout_reward_inventory_lp, novelty_contribution) if balanced_mode else float("nan"),
+            "Layout_Reward_Novelty_Abs_Mean": float(np.abs(novelty_contribution[valid_reward_mask]).mean()) if balanced_mode and valid_reward_mask.any() else float("nan"),
+            "Layout_Reward_Novelty_Share": _absolute_contribution_share(novelty_contribution, layout_reward_layout_lp, layout_reward_inventory_lp, novelty_contribution) if balanced_mode else float("nan"),
+            "Stage_Reward_Layout_LP_Abs_Mean": float(stage_layout_lp_abs.mean()) if balanced_mode else float("nan"),
+            "Stage_Reward_Inventory_LP_Abs_Mean": float(stage_inventory_lp_abs.mean()) if balanced_mode else float("nan"),
+            "Stage_Reward_Layout_LP_Share": _absolute_contribution_share(stage_reward_layout_lp, stage_reward_layout_lp, stage_reward_inventory_lp, novelty_contribution) if balanced_mode else float("nan"),
+            "Stage_Reward_Inventory_LP_Share": _absolute_contribution_share(stage_reward_inventory_lp, stage_reward_layout_lp, stage_reward_inventory_lp, novelty_contribution) if balanced_mode else float("nan"),
+            "Stage_Reward_Novelty_Abs_Mean": float(np.abs(novelty_contribution[valid_reward_mask]).mean()) if balanced_mode and valid_reward_mask.any() else float("nan"),
+            "Stage_Reward_Novelty_Share": _absolute_contribution_share(novelty_contribution, stage_reward_layout_lp, stage_reward_inventory_lp, novelty_contribution) if balanced_mode else float("nan"),
+            "Normalized_Layout_LP_Abs_Mean": float(np.abs(normalized_layout_lp[layout_lp_mask]).mean()) if balanced_mode and layout_lp_mask.any() else float("nan"),
+            "Normalized_Inventory_LP_Abs_Mean": float(np.abs(normalized_inventory_lp[inventory_lp_mask]).mean()) if balanced_mode and inventory_lp_mask.any() else float("nan"),
+        }
+        stage_signal_diagnostic = pending.get("stage_signal_diagnostic")
+        if stage_signal_diagnostic is not None:
+            stage_post, stage_post_components = self._evaluate_crafter_changed_focal_losses(
+                stage_signal_diagnostic["trajectories"],
+                stage_signal_diagnostic["valid"],
+                "Stage signal post-update",
+                include_components=True,
+            )
+            self._write_crafter_stage_signal_diagnostic(
+                stage_signal_diagnostic, stage_post, stage_post_components
+            )
+        self.last_crafter_metrics = {
+            "Pre_Changed_Focal_Loss": pre_changed_focal_loss,
+            "Post_Changed_Focal_Loss": post_changed_focal_loss,
+            "Learning_Progress": learning_progress,
+            "paired_probe_count": int(paired.sum()),
+            "valid_probe_count": int(valid.sum()),
+            "Reward_LP_Mean": float(np.mean([
+                row["reward_learning_progress"] for row in self.last_crafter_map_diagnostics
+            ])) if novelty_parts else float("nan"),
+            "Reward_Novelty_Mean": float(np.mean([
+                row["reward_novelty"] for row in self.last_crafter_map_diagnostics
+            ])) if novelty_parts else float("nan"),
+            "Novelty_Total_Mean": float(novelty.mean()) if novelty_parts else float("nan"),
+            "Novelty_Total_Std": float(novelty.std()) if novelty_parts else float("nan"),
+            "Final_Reward_Mean": float(diagnostic_rewards.mean()) if len(diagnostic_rewards) else float("nan"),
+            "Final_Reward_Std": float(diagnostic_rewards.std()) if len(diagnostic_rewards) else float("nan"),
+            "Layout_Reward_Mean": float(diagnostic_rewards.mean()) if len(diagnostic_rewards) else float("nan"),
+            "Layout_Reward_Std": float(diagnostic_rewards.std()) if len(diagnostic_rewards) else float("nan"),
+            "Stage_Reward_Mean": float(np.mean(stage_rewards)) if len(stage_rewards) else float("nan"),
+            "Stage_Reward_Std": float(np.std(stage_rewards)) if len(stage_rewards) else float("nan"),
+            "Stage_No_Inventory_Event_Count": int(sum(
+                bool(valid[index]) and (
+                    item is None or int(item.get("inventory_changed_count", 0)) == 0
+                )
+                for index, item in enumerate(pre_components)
+            )),
+            "Inv_Changed_Slots_Mean": float(np.mean(pending.get("inventory_changed_slots", [0] * self.batch_size))),
+            **component_metrics,
+            **stage_metrics,
+            **balanced_reward_metrics,
+        }
         self._pending_crafter_round = None
 
     def _normalize_base_map(self, grid):
@@ -1586,7 +2168,7 @@ class GeneratorInterface:
             )
             traj, errors, raw_loss_val, solved = res_rollout[0], res_rollout[1], res_rollout[2], res_rollout[3]
             round_trajectories.append(traj)
-            if (self.is_minigrid or self.is_crafter) and traj and "obs" in traj:
+            if (self.is_minigrid or (self.is_crafter and not self.skip_crafter_learning_progress)) and traj and "obs" in traj:
                 probe_budget = (
                     self.crafter_lp_probe_size if self.is_crafter
                     else self.minigrid_lp_probe_size
@@ -1693,6 +2275,7 @@ class GeneratorInterface:
             self._pending_minigrid_round = {
                 "probe_trajectories": probe_trajectories,
                 "valid": probe_valid_flags,
+                "environment_valid": valid_flags,
                 "pre_changed_focal_losses": pre_changed_focal_losses,
                 "final_maps": final_maps_obj,
                 "history_maps": final_maps_3ch,
@@ -1709,22 +2292,38 @@ class GeneratorInterface:
                 "novelty_distance_std": novelty_distance_std,
             }
 
-        elif self.is_crafter:
+        elif self.is_crafter and not self.skip_crafter_learning_progress:
             probe_valid_flags = [
                 valid and bool(probe) and "obs" in probe
                 for valid, probe in zip(valid_flags, probe_trajectories)
             ]
-            pre_changed_focal_losses = self._evaluate_crafter_changed_focal_losses(
-                probe_trajectories, probe_valid_flags, "Pre-update"
+            pre_changed_focal_losses, pre_components = self._evaluate_crafter_changed_focal_losses(
+                probe_trajectories, probe_valid_flags, "Pre-update", include_components=True
             )
             self._pending_crafter_round = {
                 "probe_trajectories": probe_trajectories,
                 "valid": probe_valid_flags,
+                "environment_valid": valid_flags,
                 "pre_changed_focal_losses": pre_changed_focal_losses,
+                "pre_components": pre_components,
                 # The random DR path never applies these rewards, while MAC
                 # replaces its provisional reward after the WM update.
                 "rewards": [0.0] * self.batch_size,
                 "auxiliary_rewards": [0.0] * self.batch_size,
+                "stage_tokens": stats_actions_np.reshape(-1),
+            }
+        elif self.is_crafter:
+            self.last_crafter_metrics = {
+                "Pre_Changed_Focal_Loss": float("nan"),
+                "Post_Changed_Focal_Loss": float("nan"),
+                "Learning_Progress": float("nan"),
+                "paired_probe_count": 0,
+                "Inventory_KEEP_Ratio": float("nan"),
+                **{
+                    f"Inventory_Stage_{stage}_{metric}": float("nan")
+                    for stage in range(5)
+                    for metric in ("Count", "Mean_LP", "Reward_Std")
+                },
             }
 
         self.prev_data = None
@@ -1865,6 +2464,8 @@ class GeneratorInterface:
         probe_trajectories = []
         crafter_auxiliary_rewards = []
         crafter_buffer_rewards = []
+        crafter_novelty_parts = []
+        crafter_inv_changed_slots = []
         solvable_flags = []
         path_lengths = []
         # Explorer coverage is collected per generated map and aggregated
@@ -1935,6 +2536,16 @@ class GeneratorInterface:
                     r_div = float(random_feature_novelties[i])
                 else:
                     r_div = float(combination_novelties[i])
+            elif self.is_crafter:
+                agent_positions = np.argwhere(final_map_obj == CRAFTER_OBJ_MAP["agent"])
+                if len(agent_positions) != 1:
+                    raise ValueError("Crafter novelty requires exactly one final agent")
+                r_div = self._get_diversity_reward(
+                    _crafter_effective_edit_map(base_ids_np[i], final_map_obj, final_map_col),
+                    start_position=tuple(agent_positions[0]),
+                    stage_token=int(stats_actions_np[i, 0]),
+                )
+                novelty_parts = dict(self.diversity.last_components)
             else:
                 r_div = self._get_diversity_reward(
                     final_map_3ch, inventory_vec=final_stats
@@ -1942,6 +2553,8 @@ class GeneratorInterface:
             div_rewards.append(r_div)
             if self.is_minigrid:
                 reward = 0.0  # Finalized after this round's WM update.
+            elif self.is_crafter:
+                reward = self._crafter_auxiliary_reward(r_div, inv_changed_slots)
             else:
                 reward = self._calculate_reward(
                     raw_loss_val, r_div, is_warmup,
@@ -1967,6 +2580,8 @@ class GeneratorInterface:
             if self.is_crafter:
                 crafter_buffer_rewards.append(float(reward))
                 crafter_auxiliary_rewards.append(self._crafter_auxiliary_reward(r_div, inv_changed_slots))
+                crafter_novelty_parts.append(novelty_parts)
+                crafter_inv_changed_slots.append(int(inv_changed_slots))
             raw_scalar_losses.append(raw_loss_val)
             raw_ce_losses.append(t_loss_batch)
             raw_inv_losses.append(i_loss_batch)
@@ -1986,13 +2601,16 @@ class GeneratorInterface:
                 topk_action_mask[i:i+1],
                 location_order[i:i+1],
                 topk_stats_action_mask[i:i+1],
+                **({"stage_logprob": self.ppo.last_stage_logprob[i:i+1]}
+                   if self.is_crafter and self.crafter_credit_mode in {"split", "split_balanced_global"}
+                   else {}),
             )
 
             if traj and 'obs' in traj:
                 valid_trajs.append(traj)
                 # MiniGrid history is built from the held-out probe only after
                 # the WM update, so the pre-update rollout heat is not retained.
-                if self.is_minigrid:
+                if self.is_minigrid or self.is_crafter:
                     continue
                 next_maps.append(self._map_to_tensor(final_map_3ch))
                 terrain_feedback = np.asarray(errors['terrain'], dtype=np.float32)
@@ -2117,15 +2735,82 @@ class GeneratorInterface:
                 valid and bool(probe) and "obs" in probe
                 for valid, probe in zip(valid_flags, probe_trajectories)
             ]
+            pre_changed_focal_losses, pre_components = self._evaluate_crafter_changed_focal_losses(
+                probe_trajectories, probe_valid_flags, "Pre-update", include_components=True
+            )
             self._pending_crafter_round = {
                 "probe_trajectories": probe_trajectories,
                 "valid": probe_valid_flags,
-                "pre_changed_focal_losses": self._evaluate_crafter_changed_focal_losses(
-                    probe_trajectories, probe_valid_flags, "Pre-update"
-                ),
+                "environment_valid": valid_flags,
+                "pre_changed_focal_losses": pre_changed_focal_losses,
+                "pre_components": pre_components,
                 "rewards": crafter_buffer_rewards,
                 "auxiliary_rewards": crafter_auxiliary_rewards,
+                "stage_tokens": stats_actions.detach().cpu().numpy().reshape(-1),
+                "history_maps": final_maps_3ch,
+                "novelty_parts": crafter_novelty_parts,
+                "inventory_changed_slots": crafter_inv_changed_slots,
             }
+
+        diagnostic_cfg = getattr(self, "crafter_stage_probe_diagnostic", None)
+        if self.is_crafter and diagnostic_cfg is not None and bool(getattr(diagnostic_cfg, "enabled", False)):
+            if is_warmup:
+                raise ValueError("Crafter stage signal diagnostic must run after warmup (set warmup_iterations=0)")
+            self._crafter_diagnostic_selected_tokens = stats_actions_np.reshape(-1).astype(np.int64)
+            stage_probs = getattr(self.ppo, "last_stage_probabilities", None)
+            if stage_probs is None:
+                raise RuntimeError("GeneratorPPO did not expose the sampled Crafter stage probabilities")
+            stage_diagnostic = self._collect_crafter_stage_signal_probes(
+                final_maps_obj, base_stats_np, final_stats_batch,
+                stage_probs.detach().cpu().numpy(), iteration,
+            )
+            if self._pending_crafter_round is None:
+                raise RuntimeError("Crafter stage signal probes require a pending formal WM update")
+            self._pending_crafter_round["stage_signal_diagnostic"] = stage_diagnostic
+
+        if self.is_crafter and is_warmup:
+            stage_tokens = stats_actions_np.reshape(-1)
+            novelty_values = np.asarray([part["total_novelty"] for part in crafter_novelty_parts], dtype=np.float32)
+            reward_values = np.asarray(crafter_buffer_rewards, dtype=np.float32)
+            self.last_crafter_metrics = {
+                "Pre_Changed_Focal_Loss": float("nan"),
+                "Post_Changed_Focal_Loss": float("nan"),
+                "Learning_Progress": float("nan"),
+                "paired_probe_count": 0,
+                "valid_probe_count": 0,
+                "Reward_LP_Mean": 0.0,
+                "Reward_Novelty_Mean": float(np.mean([
+                    reward if valid else 0.0
+                    for reward, valid in zip(crafter_auxiliary_rewards, valid_flags)
+                ])),
+                "Novelty_Total_Mean": float(novelty_values.mean()),
+                "Novelty_Total_Std": float(novelty_values.std()),
+                "Final_Reward_Mean": float(reward_values.mean()),
+                "Final_Reward_Std": float(reward_values.std()),
+                "Inv_Changed_Slots_Mean": float(np.mean(crafter_inv_changed_slots)),
+                "Inventory_KEEP_Ratio": float(np.mean(stage_tokens == 0)),
+                **{
+                    f"Inventory_Stage_{stage}_{metric}": (
+                        int(np.sum(stage_tokens == stage + 1)) if metric == "Count" else float("nan")
+                    )
+                    for stage in range(5) for metric in ("Count", "Mean_LP", "Reward_Std")
+                },
+            }
+            self.last_crafter_map_diagnostics = [
+                {
+                    "map_index": index, "valid": bool(valid_flags[index]),
+                    "stage_token": int(stage_tokens[index]),
+                    "inventory_changed_slots": int(crafter_inv_changed_slots[index]),
+                    "pre_changed_focal_loss": float("nan"),
+                    "post_changed_focal_loss": float("nan"),
+                    "learning_progress": float("nan"),
+                    **crafter_novelty_parts[index],
+                    "reward_learning_progress": 0.0,
+                    "reward_novelty": float(crafter_auxiliary_rewards[index]) if valid_flags[index] else 0.0,
+                    "reward_total": float(reward_values[index]),
+                }
+                for index in range(self.batch_size)
+            ]
 
         self._attach_minigrid_explorer_coverage()
 
@@ -2144,6 +2829,8 @@ class GeneratorInterface:
         return None, None, mean_raw_loss, mean_ce_loss, mean_inv_loss, mean_div_reward, valid_trajs, solved_count, avg_bfs, mean_avg_ep_len
 
     def step(self, old_params, iteration=0):
+        if self.is_crafter:
+            self.crafter_timing = {"collection": 0.0, "lp_pre": 0.0, "lp_post": 0.0}
         explorer = self.minigrid_rmax_explorer
         if explorer is not None:
             explorer.begin_iteration()
@@ -2198,6 +2885,7 @@ class GeneratorInterface:
     def _rollout_combined(
         self, map_np, stats_np, iter, idx, old_params=None, color_np=None,
         state_np=None, evaluate_wm=True, maximum_dataset_size=None,
+        crafter_seed=None,
     ):
         import traceback
 
@@ -2261,6 +2949,7 @@ class GeneratorInterface:
                         str(self.agent_type),
                         f"seed{int(getattr(self.cfg, 'seed', 0))}",
                     )
+                collection_start = time.perf_counter()
                 save_path = collect_data_general(
                     self.support.cfg,
                     env_source=env_source,
@@ -2281,7 +2970,10 @@ class GeneratorInterface:
                     # The WM dataset keeps native environment rewards; the
                     # Intrinsic position reward trains only the explorer policy.
                     store_intrinsic_reward=False,
+                    crafter_seed=crafter_seed,
                 )
+                if env_type == "crafter":
+                    self.crafter_timing["collection"] += time.perf_counter() - collection_start
                 if exploration_policy is not None and evaluate_wm:
                     map_object = np.asarray(map_np)
                     # Lava is a terminal hazard, not a coverage target. Keep
@@ -2369,7 +3061,7 @@ class GeneratorInterface:
                  inv_arr = task_npz['g'].astype(np.float32)
                  inv_next_arr = task_npz['h'].astype(np.float32)
                  delta = inv_next_arr - inv_arr
-                 inv_changed_slots = int(np.any(delta != 0, axis=0).sum())
+                 inv_changed_slots = int(np.any(delta[:, 4:16] != 0, axis=0).sum())
 
              shortest_dist = 0.0
              if env_type == "minigrid":
@@ -2492,22 +3184,6 @@ class GeneratorInterface:
         state = np.zeros_like(obj)
         H, W = obj.shape
         
-        # Track limits for restricted items
-        restricted_limits = {}
-        counts = {}
-        if self.is_crafter:
-            restricted_limits = {
-                CRAFTER_OBJ_MAP['diamond']: 1,
-                CRAFTER_OBJ_MAP['table']: 1,
-                CRAFTER_OBJ_MAP['furnace']: 1
-            }
-            # Initialize counts with existing items on base map
-            for r_id in restricted_limits:
-                counts[r_id] = np.sum(obj == r_id)
-        elif (not self.is_crafter) and (not self.is_bipedal):
-            # MiniGrid terminals are fixed by base map + immutable mask.
-            restricted_limits = {}
-
         for i in range(H):
             for j in range(W):
                 # Skip if immutable (mask is 1.0 for boundaries)
@@ -2547,12 +3223,6 @@ class GeneratorInterface:
                         if val is None:
                             continue
 
-                    # Enforce restriction limits
-                    if self.is_crafter and val in restricted_limits:
-                        if counts[val] >= restricted_limits[val]:
-                            continue # Ignore this action, limit reached
-                        counts[val] += 1
-                    
                     obj[i, j] = val
                     if color_name is not None:
                         color[i, j] = COLOR_TO_IDX.get(color_name, 0)
@@ -2644,15 +3314,11 @@ class GeneratorInterface:
 
     def _crafter_auxiliary_reward(self, div_score, inv_diversity):
         reward_cfg = self.crafter_reward_cfg
-        w_div = float(getattr(reward_cfg, "div", getattr(self.cfg.generator_agent, "reward_w_div", 3.0)))
-        w_inv_change = float(getattr(reward_cfg, "inv_change", getattr(self.cfg.generator_agent, "reward_w_inv_change", 0.0)))
-        inv_norm = max(float(getattr(reward_cfg, "inv_change_norm_slots", 8.0)), 1e-6)
-        bias = float(getattr(reward_cfg, "bias", getattr(self.cfg.generator_agent, "reward_bias", 2.0)))
-        clip = float(getattr(reward_cfg, "clip", getattr(self.cfg.generator_agent, "reward_clip", 100.0)))
-        inv_bonus = min(max(float(inv_diversity), 0.0) / inv_norm, 1.0)
+        weight = float(getattr(reward_cfg, "div", 0.01))
+        reward_clip = float(getattr(reward_cfg, "clip", 20.0))
         if self.ablation_type == "no_diversity":
-            div_score, inv_bonus = 0.0, 0.0
-        return float(np.clip(w_div * float(div_score) + w_inv_change * inv_bonus + bias, -clip, clip))
+            weight = 0.0
+        return float(np.clip(weight * np.clip(float(div_score), 0.0, 1.0), -reward_clip, reward_clip))
 
     def _calculate_reward(
         self,

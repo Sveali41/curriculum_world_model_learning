@@ -7,6 +7,21 @@ import numpy as np
 from generator.crafter_env_designer import CRAFTER_OBJ_MAP
 
 
+CRAFTER_LAYOUT_ACTION_TO_OBJECT = {
+    1: CRAFTER_OBJ_MAP["grass"],
+    2: CRAFTER_OBJ_MAP["tree"],
+    3: CRAFTER_OBJ_MAP["stone"],
+    4: CRAFTER_OBJ_MAP["coal"],
+    5: CRAFTER_OBJ_MAP["iron"],
+    6: CRAFTER_OBJ_MAP["diamond"],
+    7: CRAFTER_OBJ_MAP["water"],
+    8: CRAFTER_OBJ_MAP["table"],
+    9: CRAFTER_OBJ_MAP["furnace"],
+    10: CRAFTER_OBJ_MAP["plant"],
+    11: CRAFTER_OBJ_MAP["cow"],
+}
+
+
 class ResBlock(nn.Module):
     """Standard residual block."""
     def __init__(self, channels: int):
@@ -71,8 +86,8 @@ class MapEditorActorCritic(nn.Module):
 
         # === 2. Input Channels ===
         base_in_channels = (self.emb_dim_obj + actual_col_dim + actual_sta_dim) + 2  
-        if self.ablation_type == "no_history" or self.is_minigrid:
-            total_in_channels = base_in_channels 
+        if self.ablation_type == "no_history" or self.is_minigrid or self.is_crafter:
+            total_in_channels = base_in_channels
         else:
             total_in_channels = base_in_channels + context_dim
 
@@ -99,7 +114,7 @@ class MapEditorActorCritic(nn.Module):
         # Semantic history adjusts non-KEEP logits without receiving the
         # previous absolute error coordinate. It can therefore influence both
         # whether a cell is edited and which semantic edit is sampled.
-        if self.is_minigrid and self.ablation_type != "no_history":
+        if (self.is_minigrid or self.is_crafter) and self.ablation_type != "no_history":
             self.history_fusion = nn.Sequential(
                 nn.Conv2d(hidden_dim + context_dim, hidden_dim, 1),
                 nn.ReLU(inplace=True),
@@ -114,9 +129,10 @@ class MapEditorActorCritic(nn.Module):
             self.history_fusion = None
             self.history_type_actor = None
 
-        # B. Stats Head (32 Buttons Config: 2 rows x 16 slots)
-        self.num_stats_slots = 32 
-        self.num_stats_actions = 2 # (0: Off, 1: On)
+        # B. Crafter learns one categorical inventory-stage token:
+        # KEEP or one of five empirically grounded progression stages.
+        self.num_stats_slots = 1 if self.is_crafter else 32
+        self.num_stats_actions = 6 if self.is_crafter else 2
         
         # Bipedal uses 26-dim stats heat, MiniGrid/Crafter still use 16
         stats_in_dim = 26 if self.is_bipedal else 16
@@ -168,6 +184,10 @@ class MapEditorActorCritic(nn.Module):
         if self.history_type_actor is not None:
             nn.init.orthogonal_(self.history_type_actor[-1].weight, gain=0.01)
             nn.init.constant_(self.history_type_actor[-1].bias, 0)
+        if self.is_crafter:
+            nn.init.orthogonal_(self.stats_actor[-1].weight, gain=0.01)
+            # Keep all six Crafter stage tokens equally likely at initialization.
+            nn.init.constant_(self.stats_actor[-1].bias, 0)
         if self.is_minigrid:
             nn.init.orthogonal_(self.inventory_actor.weight, gain=0.01)
             inventory_probabilities = np.concatenate((
@@ -194,8 +214,7 @@ class MapEditorActorCritic(nn.Module):
 
     def forward_features(self, base_map_vec, context_vec):
         """
-        Compresses spatial map features and global context vectors into a unified unified representation 
-        using feature concatenation and residual processing.
+        Encode the current map. MiniGrid and Crafter fuse history after this backbone.
         base_map_vec: (B, 3, H, W)
         context_vec: (B, context_dim)
         return: (B, hidden_dim, H, W)
@@ -213,7 +232,7 @@ class MapEditorActorCritic(nn.Module):
             feat_sta = self.emb_state(base_map_vec[:, 2].long()).permute(0, 3, 1, 2)
         xx, yy = self.get_coordinate_channels(B, H, W, base_map_vec.device)
         
-        if self.is_minigrid or self.ablation_type == "no_history" or context_vec is None:
+        if self.is_minigrid or self.is_crafter or self.ablation_type == "no_history" or context_vec is None:
             x = torch.cat([feat_obj, feat_col, feat_sta, xx, yy], dim=1)
         else:
             context_tiled = context_vec.view(B, -1, 1, 1).expand(-1, -1, H, W)
@@ -223,17 +242,45 @@ class MapEditorActorCritic(nn.Module):
         x = self.res_blocks(x)
         return x
 
+    def _crafter_materialize_layout(self, base_map_vec, terrain_action):
+        """Apply sampled Crafter per-cell actions, preserving non-object channels."""
+        edited_map = base_map_vec.clone()
+        edited_objects = base_map_vec[:, 0].long()
+        for action_id, object_id in CRAFTER_LAYOUT_ACTION_TO_OBJECT.items():
+            edited_objects = torch.where(
+                terrain_action.eq(action_id), object_id, edited_objects
+            )
+        edited_map[:, 0] = edited_objects.to(dtype=edited_map.dtype)
+        return edited_map
+
+    def _crafter_stage_logits(self, edited_map_vec, context_vec, stats_heat):
+        B = edited_map_vec.shape[0]
+        edited_features = self.forward_features(edited_map_vec, context_vec)
+        edited_features = self._history_conditioned_features(edited_features, context_vec)
+        global_vec = F.adaptive_max_pool2d(edited_features, (1, 1)).view(B, -1)
+        if stats_heat is None:
+            stats_heat = torch.zeros(
+                B, 16, device=edited_map_vec.device, dtype=edited_features.dtype
+            )
+        global_vec = torch.cat([global_vec, stats_heat], dim=1)
+        return self.stats_actor(global_vec).view(
+            B, self.num_stats_slots, self.num_stats_actions
+        )
+
+    def _history_conditioned_features(self, features, context_vec):
+        if self.history_fusion is None or context_vec is None:
+            return features
+        B, _, H, W = features.shape
+        context_tiled = context_vec.view(B, -1, 1, 1).expand(-1, -1, H, W)
+        return self.history_fusion(torch.cat([features, context_tiled], dim=1))
+
     def _minigrid_logits(self, features, context_vec):
         """Return learnable per-cell KEEP/edit logits and critic features."""
         logits = self.actor(features)
         if self.history_fusion is None or context_vec is None:
             return logits, features
 
-        B, _, H, W = features.shape
-        context_tiled = context_vec.view(B, -1, 1, 1).expand(-1, -1, H, W)
-        conditioned_features = self.history_fusion(
-            torch.cat([features, context_tiled], dim=1)
-        )
+        conditioned_features = self._history_conditioned_features(features, context_vec)
         logits = logits.clone()
         logits[:, 1:] = logits[:, 1:] + self.history_type_actor(conditioned_features)
         return logits, conditioned_features
@@ -262,11 +309,11 @@ class MapEditorActorCritic(nn.Module):
         return flat_mask.view(B, H, W)
 
     @staticmethod
-    def _minigrid_change_logits(logits):
+    def _discrete_change_logits(logits):
         """Log-odds used by the fixed-budget location policy."""
         return torch.logsumexp(logits[:, 1:], dim=1) - logits[:, 0]
 
-    def _sample_minigrid_locations(self, logits, max_edits, action_mask=None):
+    def _sample_discrete_locations(self, logits, max_edits, action_mask=None):
         """Sample an ordered fixed-size location set without replacement."""
         B, _, H, W = logits.shape
         editable = (
@@ -274,7 +321,7 @@ class MapEditorActorCritic(nn.Module):
             if action_mask is not None
             else torch.ones((B, H, W), dtype=torch.bool, device=logits.device)
         )
-        change_logits = self._minigrid_change_logits(logits).reshape(B, -1)
+        change_logits = self._discrete_change_logits(logits).reshape(B, -1)
         editable_flat = editable.reshape(B, -1)
         selected = torch.zeros_like(editable_flat)
         selection_order = torch.zeros(
@@ -303,7 +350,7 @@ class MapEditorActorCritic(nn.Module):
             location_logprob,
         )
 
-    def _evaluate_minigrid_locations(self, logits, action_mask, selection_order):
+    def _evaluate_discrete_locations(self, logits, action_mask, selection_order):
         """Recompute ordered without-replacement log-probability and entropy."""
         B, _, H, W = logits.shape
         editable = (
@@ -313,7 +360,7 @@ class MapEditorActorCritic(nn.Module):
         )
         editable_flat = editable.reshape(B, -1)
         order_flat = selection_order.reshape(B, -1).long()
-        change_logits = self._minigrid_change_logits(logits).reshape(B, -1)
+        change_logits = self._discrete_change_logits(logits).reshape(B, -1)
         remaining = editable_flat.clone()
         location_logprob = torch.zeros(B, dtype=logits.dtype, device=logits.device)
         location_entropy = torch.zeros(B, dtype=logits.dtype, device=logits.device)
@@ -345,38 +392,18 @@ class MapEditorActorCritic(nn.Module):
         location_entropy = location_entropy / step_count.clamp_min(1.0)
         return location_logprob, location_entropy
 
-    @staticmethod
-    def _crafter_editable_stats_mask(device):
-        # 32 decisions: +1 bank 0:16 and +5 bank 16:32. Slots 0:4 are
-        # tracker-owned survival state, outside Crafter WM output/loss.
-        mask = torch.ones(32, device=device, dtype=torch.bool)
-        mask[0:4] = False
-        mask[16:20] = False
-        return mask
-
-    def _get_stats_topk_mask(self, logits_stats, max_stats_edit_ratio):
-        B, N, _ = logits_stats.shape
-        eligible = self._crafter_editable_stats_mask(logits_stats.device)
-        if N != eligible.numel():
-            raise ValueError(f"Crafter stats head must have {eligible.numel()} decisions, got {N}")
-        prob_click = torch.softmax(logits_stats, dim=-1)[:, :, 1]
-        # The edit budget is defined over the 24 item decisions, not all 32.
-        eligible_count = int(eligible.sum().item())
-        k = max(1, min(int(round(max_stats_edit_ratio * eligible_count)), eligible_count))
-        masked_prob = prob_click.masked_fill(~eligible.unsqueeze(0), -float("inf"))
-        _, topk_indices = torch.topk(masked_prob, k=k, dim=-1)
-        mask = torch.zeros_like(prob_click, dtype=torch.bool)
-        mask.scatter_(1, topk_indices, True)
-        return mask
-
-    def act(self, map_vec, context_vec, action_mask=None, max_edits=0.4, max_stats_edit_ratio=0.1, stats_heat=None):
+    def act(
+        self, map_vec, context_vec, action_mask=None, max_edits=0.4,
+        max_stats_edit_ratio=0.1, stats_heat=None,
+        return_stage_diagnostics=False,
+    ):
         features = self.forward_features(map_vec, context_vec)
         B, _, H, W = map_vec.shape
 
         # A. Terrain Sampling
-        if self.is_minigrid:
+        if self.is_minigrid or self.is_crafter:
             logits, critic_features = self._minigrid_logits(features, context_vec)
-            topk_mask, location_order, location_logprob = self._sample_minigrid_locations(
+            topk_mask, location_order, location_logprob = self._sample_discrete_locations(
                 logits, max_edits, action_mask
             )
             action_logits = logits.clone()
@@ -425,30 +452,19 @@ class MapEditorActorCritic(nn.Module):
                 (B, self.num_stats_slots), device=map_vec.device, dtype=torch.bool
             )
         else:
-            # [Fix 1] Use MaxPool instead of AvgPool to capture the presence of sparse objects
-            global_vec = F.adaptive_max_pool2d(features, (1, 1)).view(B, -1)
-            if stats_heat is None:
-                sh_dim = 26 if self.is_bipedal else 16
-                stats_heat = torch.zeros(B, sh_dim, device=map_vec.device)
-            global_vec = torch.cat([global_vec, stats_heat], dim=1)
-            
-            logits_stats = self.stats_actor(global_vec).view(B, self.num_stats_slots, self.num_stats_actions)
-            topk_stats_mask = self._get_stats_topk_mask(logits_stats, max_stats_edit_ratio)
-            # [Fix 2] Remove Hard Masking on logits to fix the DEAD GRADIENT issue.
-            # Let PPO learn natively without 1e9 jumping discontinuities.
-            # logits_stats[:, :, 0].masked_fill_(~topk_stats_mask, 1e9)
-            # logits_stats[:, :, 1].masked_fill_(~topk_stats_mask, -1e9)
+            edited_map = self._crafter_materialize_layout(map_vec, action)
+            logits_stats = self._crafter_stage_logits(
+                edited_map, context_vec, stats_heat
+            )
             stats_dist = Categorical(logits=logits_stats)
-            # Keep the historical independent Bernoulli-style sampling over
-            # all item decisions. Top-k remains a diagnostic only; survival
-            # decisions are the sole actions removed from PPO's action space.
-            editable_stats = self._crafter_editable_stats_mask(map_vec.device)
-            sampled_stats_action = stats_dist.sample()
-            stats_action = sampled_stats_action.masked_fill(~editable_stats.unsqueeze(0), 0)
-            stats_logprob = (stats_dist.log_prob(stats_action) * editable_stats.unsqueeze(0)).sum(dim=-1)
+            stats_action = stats_dist.sample()
+            stats_logprob = stats_dist.log_prob(stats_action).sum(dim=-1)
+            stage_probs = stats_dist.probs.detach()
+            stage_entropy = stats_dist.entropy().detach()
+            topk_stats_mask = stats_action.ne(0)
 
         value = self.critic(critic_features)
-        return (
+        result = (
             action.detach(),
             stats_action.detach(),
             action_logprob.detach(),
@@ -459,6 +475,11 @@ class MapEditorActorCritic(nn.Module):
             location_order.detach(),
             topk_stats_mask.detach(),
         )
+        if return_stage_diagnostics:
+            if not self.is_crafter:
+                raise ValueError("Stage probability diagnostics are only available for Crafter")
+            return (*result, stage_probs, stage_entropy)
+        return result
 
     def evaluate(
         self,
@@ -470,20 +491,21 @@ class MapEditorActorCritic(nn.Module):
         target_location_order=None,
         target_stats_topk_mask=None,
         stats_heat=None,
+        return_stage_diagnostics=False,
     ):
         terrain_action, stats_action = action_tuple
         features = self.forward_features(map_vec, context_vec)
         B, _, H, W = map_vec.shape
 
         # A. Terrain Eval
-        if self.is_minigrid:
+        if self.is_minigrid or self.is_crafter:
             logits, critic_features = self._minigrid_logits(features, context_vec)
             if target_topk_mask is None or target_location_order is None:
                 raise ValueError(
-                    "MiniGrid PPO evaluation requires the sampled location mask and order"
+                    "Discrete layout PPO evaluation requires the sampled location mask and order"
                 )
             selected = target_topk_mask.bool()
-            location_logprobs, location_entropy = self._evaluate_minigrid_locations(
+            location_logprobs, location_entropy = self._evaluate_discrete_locations(
                 logits, action_mask, target_location_order
             )
             action_logits = logits.clone()
@@ -495,12 +517,12 @@ class MapEditorActorCritic(nn.Module):
             action_logits = logits
             location_logprobs = torch.zeros(B, device=logits.device, dtype=logits.dtype)
             location_entropy = torch.zeros(B, device=logits.device, dtype=logits.dtype)
-        if not self.is_minigrid and target_topk_mask is not None:
+        if not (self.is_minigrid or self.is_crafter) and target_topk_mask is not None:
              action_logits[:, 0, :, :].masked_fill_(~target_topk_mask, 1e9)
              action_logits[:, 1:, :, :].masked_fill_(~target_topk_mask.unsqueeze(1), -1e9)
         dist = Categorical(logits=action_logits.permute(0, 2, 3, 1))
         action_logprobs = dist.log_prob(terrain_action)
-        if self.is_minigrid:
+        if self.is_minigrid or self.is_crafter:
             selected_float = selected.to(dtype=logits.dtype)
             type_entropy = (
                 (dist.entropy() * selected_float).sum(dim=(1, 2))
@@ -511,6 +533,8 @@ class MapEditorActorCritic(nn.Module):
             dist_entropy = dist.entropy().mean()
 
         # B. Inventory/stats evaluation
+        stage_probs = None
+        stage_entropy_per_sample = None
         if self.is_minigrid:
             inventory_logits = self.inventory_actor(
                 F.adaptive_max_pool2d(critic_features, (1, 1)).flatten(1)
@@ -533,26 +557,23 @@ class MapEditorActorCritic(nn.Module):
             stats_logprobs = torch.zeros(B, device=map_vec.device, dtype=logits.dtype)
             stats_entropy = torch.zeros((), device=map_vec.device, dtype=logits.dtype)
         else:
-            # [Fix 1] MaxPool matching the inference code above
-            global_vec = F.adaptive_max_pool2d(features, (1, 1)).view(B, -1)
-            if stats_heat is None:
-                stats_heat_dim = 26 if self.is_bipedal else 16
-                stats_heat = torch.zeros(B, stats_heat_dim, device=map_vec.device)
-            global_vec = torch.cat([global_vec, stats_heat], dim=1)
-            
-            logits_stats = self.stats_actor(global_vec).view(B, self.num_stats_slots, self.num_stats_actions)
-            # [Fix 2] Removed evaluation target hard masking matching inference
-            # if target_stats_topk_mask is not None:
-            #     logits_stats[:, :, 0].masked_fill_(~target_stats_topk_mask, 1e9)
-            #     logits_stats[:, :, 1].masked_fill_(~target_stats_topk_mask, -1e9)
+            edited_map = self._crafter_materialize_layout(map_vec, terrain_action)
+            logits_stats = self._crafter_stage_logits(
+                edited_map, context_vec, stats_heat
+            )
+            if stats_action.shape != (B, 1):
+                raise ValueError(f"Crafter inventory stage actions must have shape ({B}, 1), got {tuple(stats_action.shape)}")
             stats_dist = Categorical(logits=logits_stats)
-            # Match act(): top-k is diagnostic, while all 24 editable item
-            # decisions contribute to PPO likelihood and entropy.
-            active = self._crafter_editable_stats_mask(logits.device).unsqueeze(0).expand(B, -1)
-            stats_logprobs = (stats_dist.log_prob(stats_action) * active).sum(dim=-1)
-            active_float = active.to(dtype=logits.dtype)
-            stats_entropy = (stats_dist.entropy() * active_float).sum() / active_float.sum().clamp_min(1.0)
+            stats_logprobs = stats_dist.log_prob(stats_action.long()).sum(dim=-1)
+            stage_probs = stats_dist.probs.detach()
+            stage_entropy_per_sample = stats_dist.entropy().reshape(B, -1).mean(dim=-1).detach()
+            stats_entropy = stats_dist.entropy().mean()
 
         value = self.critic(critic_features)
         total_entropy = dist_entropy + stats_entropy
-        return action_logprobs, location_logprobs, stats_logprobs, value, total_entropy
+        result = (action_logprobs, location_logprobs, stats_logprobs, value, total_entropy)
+        if return_stage_diagnostics:
+            if not self.is_crafter:
+                raise ValueError("Stage diagnostics are only available for Crafter policies")
+            return (*result, stage_probs, stage_entropy_per_sample)
+        return result
