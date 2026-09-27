@@ -35,8 +35,8 @@ directory. After selecting an iteration, validate its checkpoint on all 20
 uniform targets without retraining:
 
 ```bash
-python -u test/crafter_dr_mac_50/validate_checkpoint.py --config-name config_dr_crafter_dr_mac_50 --iteration 50 seed=0
-python -u test/crafter_dr_mac_50/validate_checkpoint.py --config-name config_mac_crafter_dr_mac_50 --iteration 60 seed=0
+python3 -u test/crafter_dr_mac_50/validate_checkpoint.py --config-name config_dr_crafter_dr_mac_50 --iteration 50 seed=0
+python3 -u test/crafter_dr_mac_50/validate_checkpoint.py --config-name config_mac_crafter_dr_mac_50 --iteration 60 seed=0
 ```
 
 Replace the iteration with the selected snapshot number and seed as needed.

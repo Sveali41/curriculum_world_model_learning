@@ -7,7 +7,7 @@ cd "$repo_root"
 export TRAINER_ROOT="$repo_root"
 export PROJECT_ROOT="$repo_root"
 
-python_bin="${PYTHON:-python}"
+python_bin="${PYTHON:-python3}"
 dry_run=0
 if [[ "${1:-}" == "--dry-run" ]]; then
   dry_run=1
