@@ -17,7 +17,11 @@ for seed in 2 3 4; do
   command=("$python_bin" -u -m trainer.mac_wm_learning
     --config-dir "$experiment_dir/conf"
     --config-name config_mac_crafter_dr_mac_50
-    "seed=$seed" "$@")
+    "seed=$seed"
+    "generator_agent.total_iterations=40"
+    "PPO.update_every_rounds=1"
+    "mac_quick_run_id=mac_balanced_ewc20_epoch10_gen1_10plus30_local_seed${seed}"
+    "$@")
   printf '%q ' "${command[@]}"
   printf '\n'
   if (( !dry_run )); then

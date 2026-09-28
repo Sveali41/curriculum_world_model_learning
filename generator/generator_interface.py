@@ -1639,8 +1639,10 @@ class GeneratorInterface:
 
             layout_lp_scale = _scale_for("layout", layout_lp, layout_lp_mask)
             inventory_lp_scale = _scale_for("inventory", inventory_lp, inventory_lp_mask)
+            layout_lp_clip = float(getattr(self.crafter_reward_cfg, "layout_lp_clip", 3.0))
             normalized_layout_lp[layout_lp_mask] = np.clip(
-                layout_lp[layout_lp_mask] / layout_lp_scale, -3.0, 3.0
+                layout_lp[layout_lp_mask] / layout_lp_scale,
+                -layout_lp_clip, layout_lp_clip,
             )
             normalized_inventory_lp[inventory_lp_mask] = np.clip(
                 inventory_lp[inventory_lp_mask] / inventory_lp_scale, -3.0, 3.0
@@ -1649,6 +1651,9 @@ class GeneratorInterface:
         if apply_rewards:
             rewards = []
             weight = float(getattr(self.crafter_reward_cfg, "learning_progress", 1.0))
+            layout_inventory_lp_weight = float(
+                getattr(self.crafter_reward_cfg, "layout_inventory_lp_weight", 0.5)
+            )
             reward_clip = float(getattr(self.crafter_reward_cfg, "clip", 100.0))
             for index in range(self.batch_size):
                 base_reward = -5.0 if not environment_valid[index] else float(pending["auxiliary_rewards"][index])
@@ -1657,7 +1662,9 @@ class GeneratorInterface:
                 if balanced_mode:
                     if valid[index]:
                         layout_reward_layout_lp[index] = weight * 1.5 * normalized_layout_lp[index]
-                        layout_reward_inventory_lp[index] = weight * 0.5 * normalized_inventory_lp[index]
+                        layout_reward_inventory_lp[index] = (
+                            weight * layout_inventory_lp_weight * normalized_inventory_lp[index]
+                        )
                         stage_reward_layout_lp[index] = weight * 0.5 * normalized_layout_lp[index]
                         stage_reward_inventory_lp[index] = weight * 1.5 * normalized_inventory_lp[index]
                     layout_lp_term = layout_reward_layout_lp[index] + layout_reward_inventory_lp[index]
