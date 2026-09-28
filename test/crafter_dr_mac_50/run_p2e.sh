@@ -13,10 +13,10 @@ if [[ "${1:-}" == "--dry-run" ]]; then
   dry_run=1
   shift
 fi
-for seed in 2 3 4; do
-  command=("$python_bin" -u -m trainer.mac_wm_learning
+for seed in 0 1; do
+  command=("$python_bin" -u -m trainer.p2e_baseline
     --config-dir "$experiment_dir/conf"
-    --config-name config_mac_crafter_dr_mac_50
+    --config-name config_p2e_crafter_dr_mac_50
     "seed=$seed" "$@")
   printf '%q ' "${command[@]}"
   printf '\n'

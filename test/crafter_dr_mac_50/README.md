@@ -43,3 +43,24 @@ Replace the iteration with the selected snapshot number and seed as needed.
 DR snapshot 50 and MAC snapshot 60 both represent 50 WM updates. Offline
 validation writes `aggregate.csv` and `per_target.csv` under that run's
 `offline_validation/` directory.
+
+## Crafter Target and P2E baselines
+
+These separate configs match the DR/MAC WM learning rate, batch size, 10 epochs,
+EWC, replay, and fixed target 1–4 validation (500 samples each). They each
+collect exactly 400,000 new training transitions; the run fails if a collection
+is short. Results and collected training data stay in separate `results/target/`
+and `results/p2e/` directories.
+
+```bash
+bash test/crafter_dr_mac_50/run_target.sh
+bash test/crafter_dr_mac_50/run_p2e.sh
+```
+
+Each script runs seed 0 then seed 1 sequentially. Add `--dry-run` to print its
+commands without training; extra arguments are forwarded as Hydra overrides.
+Target uses 20
+updates × 20,000 transitions and P2E uses 100 updates × 4,000 transitions;
+DR/MAC use 50 updates × 8,000. The new-data budget is equal, while the number
+of WM updates differs by baseline design. Target's full-map observations are
+31×31, so its grid setting remains 31×31; DR/MAC and P2E use 8×8 observations.

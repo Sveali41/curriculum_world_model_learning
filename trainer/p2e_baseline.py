@@ -418,17 +418,36 @@ def p2e_baseline_experiment(cfg: DictConfig):
         target_tasks = [f"crafter_target_task_{i}.txt" for i in range(1, 21)]
         target_data_dir = Path(str(getattr(d_cfg, "target_tasks_folder", TRAINER_PATH / "data" / "crafter" / "target_tasks")))
         val_suffix = str(getattr(d_cfg, "target_task_suffix", "_uniform.npz"))
+        val_start_idx = int(getattr(d_cfg, "val_start_idx", 1))
+        val_n_phases = int(getattr(d_cfg, "val_n_phases", len(target_tasks)))
+        validation_targets = [
+            f"crafter_target_task_{i}.txt"
+            for i in range(val_start_idx, val_start_idx + val_n_phases)
+        ]
+        if not validation_targets or any(task not in target_tasks for task in validation_targets):
+            raise ValueError("Crafter P2E validation target range must be within targets 1-20.")
     elif domain == "bipedalwalker":
         target_tasks = [f"bipedal_target_task_{i}.txt" for i in range(1, 21)]
         target_data_dir = Path(str(getattr(d_cfg, "target_tasks_folder", TRAINER_PATH / "data" / "bipedalwalker" / "target_tasks")))
         val_suffix = str(getattr(d_cfg, "target_task_suffix", "_uniform.npz"))
+        validation_targets = target_tasks
     else:
         target_tasks = [f"target_task{i}.txt" for i in range(20)]
         target_data_dir = Path(str(getattr(d_cfg, "target_tasks_folder", TRAINER_PATH / "data" / "minigrid" / "target_tasks")))
         val_suffix = str(getattr(d_cfg, "target_task_suffix", "_test_uniform.npz"))
+        validation_targets = target_tasks
 
     total_target_budget = transitions_per_collection * updates_per_target
     total_budget = total_target_budget * len(target_tasks)
+    expected_total = getattr(cfg, "expected_total_new_transitions", None)
+    if expected_total is not None:
+        expected_total = int(expected_total)
+        if total_budget != expected_total:
+            raise ValueError(
+                f"P2E data budget is {total_budget}, expected {expected_total} "
+                f"({len(target_tasks)} tasks × {updates_per_target} updates × "
+                f"{transitions_per_collection} transitions)."
+            )
     print(
         f"[P2E Budget] n={transitions_per_collection}, m={updates_per_target}, "
         f"y={len(target_tasks)} => per-target={total_target_budget}, total={total_budget}"
@@ -460,12 +479,16 @@ def p2e_baseline_experiment(cfg: DictConfig):
         task_path = task_dir / target_task
 
         if not task_path.exists():
+            if expected_total is not None:
+                raise FileNotFoundError(f"P2E budget cannot be met; missing target layout: {task_path}")
             print(f"  [Error] Missing target file: {task_path}")
             continue
 
         try:
             env = support.wrap_env_from_text(str(task_path))
         except Exception as e:
+            if expected_total is not None:
+                raise RuntimeError(f"P2E budget cannot be met; failed to load {task_path}") from e
             print(f"  [Error] Env loading failed: {e}")
             continue
 
@@ -522,12 +545,23 @@ def p2e_baseline_experiment(cfg: DictConfig):
                     intrinsic_reward_fn=intrinsic_reward_fn,
                 )
             except Exception as e:
+                env.close()
+                if expected_total is not None:
+                    raise RuntimeError(
+                        f"P2E budget cannot be met; rollout failed for {target_task} "
+                        f"cycle {cycle_idx + 1}."
+                    ) from e
                 print(f"  [Error] Rollout failed: {e}")
                 traceback.print_exc()
-                env.close()
                 continue
 
             batch_transitions = int(len(obs_n))
+            if expected_total is not None and batch_transitions != transitions_per_collection:
+                env.close()
+                raise RuntimeError(
+                    f"P2E budget cannot be met: {target_task} cycle {cycle_idx + 1} "
+                    f"collected {batch_transitions}, expected {transitions_per_collection}."
+                )
             cumulative_transitions += batch_transitions
 
             # [ROOT CAUSE FIX] Use the exact same transpose logic as Target Baseline (save_experiments)
@@ -589,7 +623,9 @@ def p2e_baseline_experiment(cfg: DictConfig):
 
             # Save the collected data to `.npz` for later auditing.
             try:
-                save_dir = TRAINER_PATH / "data" / domain / "target_tasks"
+                save_dir = Path(str(getattr(
+                    cfg.p2e, "dataset_output_dir", TRAINER_PATH / "data" / domain / "target_tasks"
+                )))
                 os.makedirs(save_dir, exist_ok=True)
                 save_name = f"p2e_{target_task}_c{cycle_idx+1}.npz"
                 np.savez(save_dir / save_name, **new_batch)
@@ -624,6 +660,8 @@ def p2e_baseline_experiment(cfg: DictConfig):
                             replay_data = None
                     else:
                         replay_data = None
+            if bool(getattr(cfg, "wm_train_seed_per_update", False)):
+                set_seed(int(seed) + target_idx * updates_per_target + cycle_idx)
             train_res, fisher, _ = AttentionWM_training.train_api(
                 cfg,
                 wm_instance,
@@ -662,7 +700,7 @@ def p2e_baseline_experiment(cfg: DictConfig):
                 cfg,
                 wm_instance,
                 str(target_data_dir),
-                ordered_targets,
+                validation_targets,
                 val_suffix,
                 phase_name=f"p2e_t{target_idx + 1}_c{cycle_idx + 1}",
                 VALID_TIMES=1,
@@ -738,6 +776,10 @@ def p2e_baseline_experiment(cfg: DictConfig):
 
         env.close()
 
+    if expected_total is not None and cumulative_transitions != expected_total:
+        raise RuntimeError(
+            f"P2E trained on {cumulative_transitions} new transitions; expected {expected_total}."
+        )
     print(f">>> P2E Finished. Results: {summary_csv_path}")
 
 if __name__ == "__main__":

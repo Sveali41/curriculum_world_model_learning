@@ -1,0 +1,74 @@
+# Crafter P2E baseline matched to the DR/MAC WM training settings.
+defaults:
+  - config_p2e
+  - _self_
+
+domain: crafter
+seed: 0
+expected_total_new_transitions: 400000
+
+p2e_dr_mac_run_root: ${oc.env:TRAINER_ROOT,${oc.env:PROJECT_ROOT}}/test/crafter_dr_mac_50/results/p2e/seed${seed}
+
+paths:
+  outputs: ${p2e_dr_mac_run_root}
+
+p2e_log_dir: ${p2e_dr_mac_run_root}/logs
+p2e:
+  transitions_per_collection: 4000
+  updates_per_target: 5
+  dataset_output_dir: ${p2e_dr_mac_run_root}/data
+  per_domain:
+    crafter:
+      transitions_per_collection: 4000
+      updates_per_target: 5
+
+generator_agent:
+  total_iterations: 100
+
+domains:
+  crafter:
+    lambda_ewc: 20
+    validation_metric: mse
+    val_start_idx: 1
+    val_n_phases: 4
+    target_validation_max_samples: 500
+    target_validation_seed: ${seed}
+
+attention_model:
+  batch_size: 64
+  n_epochs: 10
+  lr: 5e-4
+  replay_frac: 0.8
+  target_validation_batch_size: 256
+  compute_fisher: true
+  crafter_event_confusion_enabled: true
+  checkpoint_metric: val/observation_loss
+  max_validation_samples: 0
+  validation_sample_from_full_dataset: false
+  validation_subset_seed: ${seed}
+  seed: ${seed}
+  fisher_slot_stratified:
+    enabled: true
+    min_samples_per_observed_slot: 16
+  crafter_transition_replay:
+    enabled: false
+    balance_exponent: 0.35
+    inventory_replay_fraction: 0.25
+    include_action: true
+    include_changed_slot: true
+    protected_slot_replay:
+      enabled: true
+      min_samples_per_observed_slot: 32
+  model_save_path: ${p2e_dr_mac_run_root}/model/wm.ckpt
+
+wm_train_seed_per_update: true
+
+env:
+  collect:
+    data_folder: ${p2e_dr_mac_run_root}/data/
+
+hydra:
+  searchpath:
+    - file://trainer/conf
+  run:
+    dir: ${p2e_dr_mac_run_root}/hydra

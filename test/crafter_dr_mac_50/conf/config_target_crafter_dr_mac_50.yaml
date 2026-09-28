@@ -1,0 +1,68 @@
+# Crafter Target baseline matched to the DR/MAC WM training settings.
+defaults:
+  - config_target_baseline
+  - _self_
+
+domain: crafter
+seed: 0
+expected_total_new_transitions: 400000
+
+target_dr_mac_run_root: ${oc.env:TRAINER_ROOT,${oc.env:PROJECT_ROOT}}/test/crafter_dr_mac_50/results/target/seed${seed}
+
+paths:
+  outputs: ${target_dr_mac_run_root}
+
+target_baseline_log_dir: ${target_dr_mac_run_root}/logs
+
+domains:
+  crafter:
+    # Isolate newly collected training archives; keep validation on the shared
+    # fixed uniform target datasets.
+    data_path: ${target_dr_mac_run_root}/data/
+    val_data_path: ${oc.env:TRAINER_PATH}/data/crafter/target_tasks/
+    val_task_prefix: crafter_target_task_
+    val_start_idx: 1
+    val_n_phases: 4
+    target_validation_max_samples: 500
+    target_validation_seed: ${seed}
+    n_phases: 20
+    start_idx: 1
+    target_dataset_size: 20000
+    grid_shape: [2, 31, 31]
+    validation_metric: mse
+    lambda_ewc: 20
+
+attention_model:
+  batch_size: 64
+  n_epochs: 10
+  lr: 5e-4
+  replay_frac: 0.8
+  target_validation_batch_size: 256
+  compute_fisher: true
+  crafter_event_confusion_enabled: true
+  checkpoint_metric: val/observation_loss
+  max_validation_samples: 0
+  validation_sample_from_full_dataset: false
+  validation_subset_seed: ${seed}
+  seed: ${seed}
+  fisher_slot_stratified:
+    enabled: true
+    min_samples_per_observed_slot: 16
+  crafter_transition_replay:
+    enabled: false
+    balance_exponent: 0.35
+    inventory_replay_fraction: 0.25
+    include_action: true
+    include_changed_slot: true
+    protected_slot_replay:
+      enabled: true
+      min_samples_per_observed_slot: 32
+  model_save_path: ${target_dr_mac_run_root}/model/wm.ckpt
+
+wm_train_seed_per_update: true
+
+hydra:
+  searchpath:
+    - file://trainer/conf
+  run:
+    dir: ${target_dr_mac_run_root}/hydra

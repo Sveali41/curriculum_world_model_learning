@@ -252,7 +252,16 @@ def run_target_baseline_experiment(cfg: DictConfig):
         for i in range(val_start_idx, val_start_idx + val_n_phases)
     ]
     val_data_path = str(getattr(d_cfg, "val_data_path", d_cfg.data_path))
-    target_dataset_size = getattr(d_cfg, "target_dataset_size", 20000)
+    target_dataset_size = int(getattr(d_cfg, "target_dataset_size", 20000))
+    expected_total = getattr(cfg, "expected_total_new_transitions", None)
+    if expected_total is not None:
+        expected_total = int(expected_total)
+        planned_total = int(n_phases) * target_dataset_size
+        if planned_total != expected_total:
+            raise ValueError(
+                f"Target data budget is {planned_total}, expected {expected_total} "
+                f"({n_phases} tasks × {target_dataset_size} transitions)."
+            )
     force_recollect_per_task = True
 
     for i, current_task in enumerate(task_names):
@@ -315,6 +324,8 @@ def run_target_baseline_experiment(cfg: DictConfig):
                 print(f"Moved {saved_file} to {train_path}")
                 
             if not os.path.exists(train_path):
+                if expected_total is not None:
+                    raise FileNotFoundError(f"Target budget cannot be met; collection did not create {train_path}")
                 print(f"Failed to generate {train_path}. Skipping phase.")
                 continue
 
@@ -327,9 +338,18 @@ def run_target_baseline_experiment(cfg: DictConfig):
         limit_size = target_dataset_size
         if total_len > limit_size:
             print(f"  -> Truncating {total_len} to {limit_size} exactly as requested.")
-            full_data = {k: full_data[k][:limit_size] for k in data_keys}
+            full_data = {
+                k: full_data[k][:limit_size] if np.asarray(full_data[k]).ndim > 0 else full_data[k]
+                for k in data_keys
+            }
             total_len = limit_size
         
+        if expected_total is not None and total_len != target_dataset_size:
+            raise RuntimeError(
+                f"Target budget cannot be met: {train_path} has {total_len} transitions, "
+                f"expected {target_dataset_size}."
+            )
+
         # One task = one phase: use all available (targeted 20,000) data in a single update.
         sub_step_size = total_len
         n_sub_steps = 1
@@ -393,6 +413,8 @@ def run_target_baseline_experiment(cfg: DictConfig):
                         except ValueError as e2:
                             print(f"  [Warn] Replay export still failed after harmonization: {e2}")
                             replay_data = None
+            if bool(getattr(cfg, "wm_train_seed_per_update", False)):
+                set_seed(int(seed) + i)
             train_res, fisher, net = AttentionWM_training.train_api(
                 cfg, net=net, old_params=old_params, fisher=fisher, 
                 replay_data=replay_data, direct_data=sub_data
@@ -473,6 +495,10 @@ def run_target_baseline_experiment(cfg: DictConfig):
         print(f"  [Buffer] After archiving: buffer size = {len(fisher_buffer)} samples")
         torch.cuda.empty_cache()
 
+    if expected_total is not None and cumulative_data_size != expected_total:
+        raise RuntimeError(
+            f"Target trained on {cumulative_data_size} new transitions; expected {expected_total}."
+        )
     print(f"\n[SUCCESS] Experiment Complete. CSV saved to: {csv_out_path}")
 
 if __name__ == "__main__":
