@@ -46,6 +46,7 @@ from trainer.common.utils import (
     CRAFTER_FOCAL_VAL_METRICS, MINIGRID_TARGET_VAL_METRICS, set_seed, validate_on_all_targets,
 )
 from trainer.common.paths import RESULTS_ROOT, VISUALIZATIONS_ROOT
+from trainer.common.wm_snapshots import save_wm_update_snapshot
 
 
 
@@ -420,6 +421,13 @@ def run_target_baseline_experiment(cfg: DictConfig):
                 replay_data=replay_data, direct_data=sub_data
             )
             old_params = train_res["old_params"]
+            if is_crafter and bool(getattr(cfg, "save_wm_update_checkpoints", False)):
+                snapshot = save_wm_update_snapshot(
+                    cfg.attention_model.model_save_path,
+                    getattr(cfg, "wm_snapshot_run_dir", log_dir),
+                    i + 1,
+                )
+                print(f"  [Checkpoint] Saved WM update snapshot: {snapshot}")
 
             # --- B. Validation Step (on ALL targets) ---
             if sub_idx == n_sub_steps - 1 or sub_idx % 2 == 0:

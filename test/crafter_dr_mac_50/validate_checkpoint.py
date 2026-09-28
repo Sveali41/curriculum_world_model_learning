@@ -1,4 +1,4 @@
-"""Validate a retained Crafter DR/MAC WM update on fixed uniform targets."""
+"""Validate a retained Crafter WM update on fixed uniform targets."""
 
 from __future__ import annotations
 
@@ -35,7 +35,11 @@ def _experiment_kind(config_name: str) -> str:
         return "dr"
     if config_name.startswith("config_mac_"):
         return "mac"
-    raise ValueError("Use a Crafter DR or MAC experiment config from this experiment folder")
+    if config_name.startswith("config_target_"):
+        return "target"
+    if config_name.startswith("config_p2e_"):
+        return "p2e"
+    raise ValueError("Use a Crafter DR, MAC, Target, or P2E config from this experiment folder")
 
 
 def _check_saved_config(cfg, run_dir: Path) -> None:
@@ -71,7 +75,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config-dir", type=Path, default=CONFIG_DIR, help="Experiment Hydra config directory")
     parser.add_argument("--config-name", required=True, help="Experiment YAML name without .yaml")
-    parser.add_argument("--iteration", type=int, required=True, help="One-based DR/MAC iteration with a saved WM update")
+    parser.add_argument("--iteration", type=int, required=True, help="One-based WM update with a saved checkpoint")
     parser.add_argument("--target-count", type=int, default=20, help="Targets to validate; default 20 (use 1 for smoke)")
     parser.add_argument("overrides", nargs="*", help="Hydra overrides such as seed=1 or dr_quick_run_id=...")
     args = parser.parse_args()
@@ -86,7 +90,11 @@ def main() -> None:
         cfg = hydra.compose(config_name=args.config_name, overrides=args.overrides)
     if str(cfg.domain) != "crafter":
         raise ValueError(f"Expected Crafter config, got domain={cfg.domain}")
-    run_dir = Path(str(cfg.dr_log_dir if kind == "dr" else cfg.mac_results_dir)).resolve()
+    run_dir = Path(str(
+        cfg.dr_log_dir if kind == "dr" else
+        cfg.mac_results_dir if kind == "mac" else
+        cfg.wm_snapshot_run_dir
+    )).resolve()
     _check_saved_config(cfg, run_dir)
     checkpoint = run_dir / "wm_snapshots" / f"iter_{args.iteration:03d}.ckpt"
     if not checkpoint.is_file():

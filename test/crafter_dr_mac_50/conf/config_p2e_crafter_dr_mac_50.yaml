@@ -62,6 +62,8 @@ attention_model:
   model_save_path: ${p2e_dr_mac_run_root}/model/wm.ckpt
 
 wm_train_seed_per_update: true
+save_wm_update_checkpoints: true
+wm_snapshot_run_dir: ${p2e_dr_mac_run_root}
 
 env:
   collect:

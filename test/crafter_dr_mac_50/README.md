@@ -50,7 +50,9 @@ These separate configs match the DR/MAC WM learning rate, batch size, 10 epochs,
 EWC, replay, and fixed target 1–4 validation (500 samples each). They each
 collect exactly 400,000 new training transitions; the run fails if a collection
 is short. Results and collected training data stay in separate `results/target/`
-and `results/p2e/` directories.
+and `results/p2e/` directories. Each WM update also saves an
+`wm_snapshots/iter_NNN.ckpt` file under its seed's run directory, so any update
+can later be validated on all 20 targets without retraining.
 
 ```bash
 bash test/crafter_dr_mac_50/run_target.sh
@@ -64,3 +66,11 @@ updates × 20,000 transitions and P2E uses 100 updates × 4,000 transitions;
 DR/MAC use 50 updates × 8,000. The new-data budget is equal, while the number
 of WM updates differs by baseline design. Target's full-map observations are
 31×31, so its grid setting remains 31×31; DR/MAC and P2E use 8×8 observations.
+
+After training, validate a selected Target or P2E snapshot on all 20 uniform
+targets without fitting again:
+
+```bash
+python3 -u test/crafter_dr_mac_50/validate_checkpoint.py --config-name config_target_crafter_dr_mac_50 --iteration 20 seed=0
+python3 -u test/crafter_dr_mac_50/validate_checkpoint.py --config-name config_p2e_crafter_dr_mac_50 --iteration 100 seed=0
+```

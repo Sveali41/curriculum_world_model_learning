@@ -32,6 +32,7 @@ from trainer.common.utils import (
     CRAFTER_FOCAL_VAL_METRICS, MINIGRID_TARGET_VAL_METRICS, set_seed, validate_on_all_targets
 )
 from trainer.common.paths import RESULTS_ROOT, VISUALIZATIONS_ROOT
+from trainer.common.wm_snapshots import save_wm_update_snapshot
 from modelBased.data.data_collect import visualize_agent_coverage
 from domain.minigrid.action_codec import MODEL_ACTION_COUNT
 
@@ -671,6 +672,14 @@ def p2e_baseline_experiment(cfg: DictConfig):
                 direct_data=new_batch,
             )
             old_params = train_res.get("old_params")
+            if domain == "crafter" and bool(getattr(cfg, "save_wm_update_checkpoints", False)):
+                update_number = target_idx * updates_per_target + cycle_idx + 1
+                snapshot = save_wm_update_snapshot(
+                    cfg.attention_model.model_save_path,
+                    getattr(cfg, "wm_snapshot_run_dir", log_dir),
+                    update_number,
+                )
+                print(f"  [Checkpoint] Saved WM update snapshot: {snapshot}")
 
             try:
                 wm_instance.eval()
