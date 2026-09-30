@@ -35,15 +35,18 @@ python3 test/minigrid_mpc_k_sweep/run_k_sweep.py \
   --run-id mac_hk_5targets
 ```
 
-Use a different `--baselines` and `--run-id` for DR, Target, or P2E. Or put all baselines in the manifest and pass a comma-separated list. Runs are sequential. One baseline with five WM checkpoints, five targets, five K values, and 10 episodes per case runs 1,250 episodes. To do a small check, narrow the sweep, for example `--targets 2 --k-values 8 --episodes 1 --max-ep-len 64 --population 16 --elite-count 4 --iterations 1`.
+Use a different `--baselines` and `--run-id` for DR, Target, or P2E. Or put all baselines in the manifest and pass a comma-separated list. Each checkpoint group runs in one persistent worker, which loads the WM once and reuses it across its target/K cases; every case still has a separate directory. `--workers` controls concurrent checkpoint groups (default 2), and the parent alone writes aggregate CSV rows in fixed manifest/target/K order. On the tested 8 GB GPU, `--workers 2` passed the throughput, memory, and trajectory checks; one-checkpoint sweeps naturally use only one worker. One baseline with five WM checkpoints, five targets, five K values, and 10 episodes per case runs 1,250 episodes. To do a small check, narrow the sweep, for example `--targets 2 --k-values 8 --episodes 1 --max-ep-len 64 --population 16 --elite-count 4 --iterations 1`.
 
-Add `--resume` with the same run ID to continue a stopped run. The launcher checks the saved configuration and checkpoint hashes before resuming completed cases. It does not launch concurrently, so a GPU is not shared by multiple MPC runs.
+Add `--resume` with the same run ID to continue a stopped run. The launcher checks the saved experiment configuration and checkpoint hashes before resuming completed cases; worker count may change because it only changes scheduling. Console output defaults to every 100 real steps while all step rows remain in the CSV. Add `--capture-action-hashes` for a parity audit (candidate sequence, ranking, and selected action-list SHA-256); it adds overhead and should be disabled for timing runs. Add `--profile-timing` for synchronized per-episode timing and peak CUDA memory; profiling adds overhead. The sweep uses the attention-weights-off path by default; fixed-seed checks at K=8, 16, 32, 64, and 128 matched candidate sequences, candidate rankings, selected action lists, and real trajectories exactly. Use `--return-attention-weights` to select the original path.
 
 ## Outputs
 
 Results live under `test/minigrid_mpc_k_sweep/results/<run-id>/`:
 
-- `episode_results.csv`: per-episode native reward, realized guide return, combined diagnostic, success, steps, planner scores, and WM match rates.
+- `episode_results.csv`: per-episode native reward, realized guide return, combined diagnostic, success, steps, planner scores, WM match rates, and case wall time.
+- `wm_mpc_action_hashes.csv` (when enabled): CEM candidate sequence, candidate ranking, and selected full action-list hashes by plan.
+- `wm_mpc_timing.csv` (when enabled): model loading, total planning, WM forward/decode, remaining planning, environment stepping, logging, and peak allocated CUDA memory.
+- `worker_timing.csv`: per-checkpoint worker process/model-load time and summed case time.
 - `model_target_k_summary.csv`: summaries per baseline, checkpoint, target, and K.
 - `baseline_k_summary.csv`: aggregate comparison per baseline and K.
 - `cases/<baseline>/<model>/<target>/H<K>_K<K>/planner/`: full per-step, per-block, and trace CSV/JSON for each case.

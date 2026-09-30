@@ -5,13 +5,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
-import shlex
 import statistics
 import subprocess
 import sys
@@ -22,6 +22,7 @@ from typing import Iterable
 ROOT = Path(__file__).resolve().parents[2]
 WM_ROOT = ROOT / "wm"
 EXPERIMENT_ROOT = ROOT / "test" / "minigrid_mpc_k_sweep"
+WORKER_SCRIPT = EXPERIMENT_ROOT / "run_case_worker.py"
 TARGET_ROOT = ROOT / "trainer" / "level" / "minigrid" / "target_task"
 
 PLANNER_FIELDS = (
@@ -38,7 +39,7 @@ META_FIELDS = (
     "baseline", "model_id", "checkpoint", "checkpoint_sha256", "target_id",
     "target", "horizon", "execute_steps", "eval_seed",
 )
-RESULT_FIELDS = META_FIELDS + PLANNER_FIELDS
+RESULT_FIELDS = META_FIELDS + ("case_wall_seconds",) + PLANNER_FIELDS
 
 
 def _csv_ints(value: str, name: str, minimum: int = 1) -> list[int]:
@@ -126,7 +127,8 @@ def _command(
     *, model: dict[str, str], target_id: int, horizon: int, eval_seed: int,
     episodes: int, max_ep_len: int, reward_mode: str, guide_weight: float,
     population: int, elite_count: int, iterations: int, gamma: float,
-    cpu_threads: int, case_root: Path,
+    cpu_threads: int, print_every_steps: int, capture_action_hashes: bool,
+    profile_timing: bool, skip_attention_weights: bool, case_root: Path,
 ) -> list[str]:
     target = f"target_task{target_id}"
     layout = TARGET_ROOT / f"{target}.txt"
@@ -152,6 +154,10 @@ def _command(
         f"PPO.mpc.iterations={iterations}",
         f"PPO.mpc.gamma={gamma}",
         f"PPO.mpc.cpu_threads={cpu_threads}",
+        f"PPO.mpc.print_every_steps={print_every_steps}",
+        f"PPO.mpc.capture_action_hashes={str(capture_action_hashes).lower()}",
+        f"PPO.mpc.profile_timing={str(profile_timing).lower()}",
+        f"PPO.mpc.minigrid_skip_attention_weights={str(skip_attention_weights).lower()}",
         f"PPO.mpc.output_dir={planner_output}",
         f"hydra.run.dir={hydra_output}",
     ]
@@ -190,7 +196,7 @@ def _load_episode_rows(path: Path) -> list[dict[str, str]]:
 
 
 def _stats(values: Iterable[float]) -> tuple[float, float]:
-    data = list(values)
+    data = [value for value in values if math.isfinite(float(value))]
     if not data:
         return float("nan"), float("nan")
     return statistics.mean(data), statistics.stdev(data) if len(data) > 1 else 0.0
@@ -204,7 +210,7 @@ def _write_summary(path: Path, rows: list[dict[str, str]], keys: tuple[str, ...]
         "real_reward", "environment_steps", "realized_goal_guide_return",
         "real_reward_plus_realized_goal_guide", "mean_plan_score",
         "mean_planning_latency_ms", "wm_real_pose_match_rate",
-        "wm_real_inventory_match_rate",
+        "wm_real_inventory_match_rate", "case_wall_seconds",
     )
     mean_fields = tuple(
         metric if metric.startswith("mean_") else f"mean_{metric}"
@@ -257,6 +263,41 @@ def _summarize(run_root: Path, rows: list[dict[str, str]]) -> None:
     )
 
 
+def _execute_group(
+    group: dict, child_env: dict[str, str]
+) -> tuple[list[tuple[dict, list[dict[str, str]], float]], float, dict]:
+    worker_started = time.perf_counter()
+    with group["worker_log"].open("w", encoding="utf-8") as worker_log:
+        result = subprocess.run(
+            [sys.executable, "-u", str(WORKER_SCRIPT), "--jobs-json", str(group["jobs_json"])],
+            cwd=WM_ROOT, env=child_env, stdout=worker_log,
+            stderr=subprocess.STDOUT, text=True, check=False,
+        )
+    elapsed = time.perf_counter() - worker_started
+    if result.returncode != 0:
+        tail = group["worker_log"].read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()[-60:]
+        raise RuntimeError(
+            f"MPC worker failed with exit code {result.returncode}; "
+            f"see {group['worker_log']}\n" + "\n".join(tail)
+        )
+    worker_metrics = json.loads(
+        group["worker_metrics_path"].read_text(encoding="utf-8")
+    )
+    completed_cases = []
+    for job in group["jobs"]:
+        source_rows = _read_results(
+            job["planner_summary"], episodes=job["episodes"],
+            eval_seed=job["eval_seed"], checkpoint=job["checkpoint"],
+        )
+        case_seconds = float(json.loads(
+            job["runtime_path"].read_text(encoding="utf-8")
+        )["case_wall_seconds"])
+        completed_cases.append((job, source_rows, case_seconds))
+    return completed_cases, elapsed, worker_metrics
+
+
 def _case_key(row: dict[str, str]) -> tuple[str, str, str, str, str]:
     return (
         row["baseline"], row["model_id"], row["target_id"], row["horizon"],
@@ -286,6 +327,23 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--cpu-threads", type=int, default=4)
+    parser.add_argument("--print-every-steps", type=int, default=100)
+    parser.add_argument("--capture-action-hashes", action="store_true",
+                        help="Write candidate/final action hashes for parity audits")
+    parser.add_argument("--profile-timing", action="store_true",
+                        help="Record synchronized per-episode timing breakdown; adds profiling overhead")
+    attention_group = parser.add_mutually_exclusive_group()
+    attention_group.add_argument(
+        "--skip-attention-weights", dest="skip_attention_weights", action="store_true",
+        help="Omit unused attention weights (default; parity checked for K=8,16,32,64,128)",
+    )
+    attention_group.add_argument(
+        "--return-attention-weights", dest="skip_attention_weights", action="store_false",
+        help="Use the original attention-weight output path",
+    )
+    parser.set_defaults(skip_attention_weights=True)
+    parser.add_argument("--workers", type=int, default=2,
+                        help="Concurrent checkpoint workers (validated at 2 on the local 8 GB GPU)")
     parser.add_argument("--run-id", default="")
     parser.add_argument("--results-root", type=Path, default=EXPERIMENT_ROOT / "results")
     parser.add_argument("--resume", action="store_true",
@@ -300,8 +358,9 @@ def main() -> None:
         parser.error("goal-guide-weight must be finite and nonnegative")
     if args.population < 1 or not 1 <= args.elite_count <= args.population:
         parser.error("require population >= 1 and 1 <= elite-count <= population")
-    if args.iterations < 1 or args.cpu_threads < 1 or not 0.0 <= args.gamma <= 1.0:
-        parser.error("iterations/cpu-threads must be positive and gamma in [0,1]")
+    if (args.iterations < 1 or args.cpu_threads < 1 or args.print_every_steps < 1
+            or args.workers < 1 or not 0.0 <= args.gamma <= 1.0):
+        parser.error("iterations/cpu-threads/print-every-steps/workers must be positive and gamma in [0,1]")
     try:
         target_ids = _csv_ints(args.targets, "targets")
         k_values = _csv_ints(args.k_values, "k-values")
@@ -363,6 +422,12 @@ def main() -> None:
         "iterations": args.iterations,
         "gamma": args.gamma,
         "cpu_threads": args.cpu_threads,
+        "print_every_steps": args.print_every_steps,
+        "capture_action_hashes": args.capture_action_hashes,
+        "profile_timing": args.profile_timing,
+        "skip_attention_weights": args.skip_attention_weights,
+        "workers": args.workers,
+        "reuse_model_by_checkpoint": True,
     }
     config_path = run_root / "run_config.json"
     if args.dry_run:
@@ -371,6 +436,7 @@ def main() -> None:
         print(f"Targets: {', '.join(v['name'] for v in targets.values())}")
         print(f"H=K: {','.join(map(str, k_values))}")
         print(f"Episodes per case: {args.episodes}; total cases: {case_count}; total episodes: {case_count * args.episodes}")
+        print(f"Workers: {args.workers}; console print interval: {args.print_every_steps}")
         print(f"Results: {run_root}")
         first = _command(
             model=models[0], target_id=target_ids[0], horizon=k_values[0],
@@ -378,6 +444,10 @@ def main() -> None:
             reward_mode=args.reward_mode, guide_weight=args.goal_guide_weight,
             population=args.population, elite_count=args.elite_count,
             iterations=args.iterations, gamma=args.gamma, cpu_threads=args.cpu_threads,
+            print_every_steps=args.print_every_steps,
+            capture_action_hashes=args.capture_action_hashes,
+            profile_timing=args.profile_timing,
+            skip_attention_weights=args.skip_attention_weights,
             case_root=run_root / "cases" / _safe_component(models[0]["baseline"]) /
                       _safe_component(models[0]["model_id"]) / targets[target_ids[0]]["name"] /
                       f"H{ k_values[0] }_K{ k_values[0]}",
@@ -392,8 +462,15 @@ def main() -> None:
         if not config_path.is_file():
             parser.error(f"Cannot resume without run_config.json: {run_root}")
         prior_config = json.loads(config_path.read_text(encoding="utf-8"))
-        if prior_config != run_config:
+        prior_science = dict(prior_config)
+        current_science = dict(run_config)
+        # Worker count changes scheduling only; keep it out of experiment identity.
+        prior_science.pop("workers", None)
+        current_science.pop("workers", None)
+        if prior_science != current_science:
             parser.error(f"Resume settings differ from saved run_config.json: {run_root}")
+        if prior_config.get("workers") != args.workers:
+            config_path.write_text(json.dumps(run_config, indent=2) + "\n", encoding="utf-8")
     else:
         if args.resume:
             parser.error(f"Cannot resume a run directory that does not exist: {run_root}")
@@ -410,6 +487,8 @@ def main() -> None:
 
     case_count = len(models) * len(targets) * len(k_values)
     case_number = 0
+    jobs: list[dict] = []
+    completed: dict[int, tuple[dict, list[dict[str, str]], float]] = {}
     for model in models:
         baseline_component = _safe_component(model["baseline"])
         model_component = _safe_component(model["model_id"])
@@ -423,7 +502,9 @@ def main() -> None:
                 existing = grouped.get(key, [])
                 if existing:
                     if len(existing) != args.episodes:
-                        raise RuntimeError(f"Incomplete aggregate rows for case {key}; inspect {aggregate_path}")
+                        raise RuntimeError(
+                            f"Incomplete aggregate rows for case {key}; inspect {aggregate_path}"
+                        )
                     if not args.resume:
                         raise RuntimeError(f"Duplicate case in run output: {key}")
                     print(f"[skip {case_number}/{case_count}] already complete: {key}", flush=True)
@@ -436,64 +517,151 @@ def main() -> None:
                 planner_output = case_root / "planner"
                 planner_summary = planner_output / "wm_mpc_results.csv"
                 case_root.mkdir(parents=True, exist_ok=True)
+                job = {
+                    "number": case_number,
+                    "key": key,
+                    "baseline": model["baseline"],
+                    "model_id": model["model_id"],
+                    "checkpoint": checkpoint,
+                    "checkpoint_sha256": model["checkpoint_sha256"],
+                    "target_id": target_id,
+                    "target": target_info["name"],
+                    "horizon": horizon,
+                    "eval_seed": args.eval_seed,
+                    "episodes": args.episodes,
+                    "case_root": case_root,
+                    "planner_summary": planner_summary,
+                    "runtime_path": case_root / "case_runtime.json",
+                }
                 if args.resume and planner_summary.is_file():
                     source_rows = _read_results(
                         planner_summary, episodes=args.episodes,
                         eval_seed=args.eval_seed, checkpoint=checkpoint,
                     )
                     print(f"[recover {case_number}/{case_count}] {key}", flush=True)
-                else:
-                    command = _command(
-                        model=model, target_id=target_id, horizon=horizon,
-                        eval_seed=args.eval_seed, episodes=args.episodes,
-                        max_ep_len=args.max_ep_len, reward_mode=args.reward_mode,
-                        guide_weight=args.goal_guide_weight, population=args.population,
-                        elite_count=args.elite_count, iterations=args.iterations,
-                        gamma=args.gamma, cpu_threads=args.cpu_threads,
-                        case_root=case_root,
-                    )
-                    log_path = case_root / "launcher.log"
-                    print(f"[run {case_number}/{case_count}] {key}", flush=True)
-                    with log_path.open("w", encoding="utf-8") as log_handle:
-                        log_handle.write(shlex.join(command) + "\n\n")
-                        log_handle.flush()
-                        result = subprocess.run(
-                            command, cwd=WM_ROOT, env=_child_env(), stdout=log_handle,
-                            stderr=subprocess.STDOUT, text=True, check=False,
-                        )
-                    if result.returncode != 0:
-                        tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-40:]
-                        print("\n".join(tail), file=sys.stderr)
-                        raise SystemExit(
-                            f"MPC failed with exit code {result.returncode}; see {log_path}"
-                        )
-                    source_rows = _read_results(
-                        planner_summary, episodes=args.episodes,
-                        eval_seed=args.eval_seed, checkpoint=checkpoint,
-                    )
+                    completed[case_number] = (job, source_rows, float("nan"))
+                    continue
 
-                enriched = []
-                for row in source_rows:
-                    episode = int(row["episode"])
-                    enriched.append({
-                        "baseline": model["baseline"],
-                        "model_id": model["model_id"],
-                        "checkpoint": str(checkpoint),
-                        "checkpoint_sha256": model["checkpoint_sha256"],
-                        "target_id": target_id,
-                        "target": target_info["name"],
-                        "horizon": horizon,
-                        "execute_steps": horizon,
-                        "eval_seed": args.eval_seed,
-                        **{field: row[field] for field in PLANNER_FIELDS},
-                    })
-                _append_rows(aggregate_path, enriched, RESULT_FIELDS)
-                all_rows.extend(enriched)
-                grouped[key] = enriched
-                _summarize(run_root, all_rows)
-                print(f"[done {case_number}/{case_count}] {planner_summary}", flush=True)
+                command = _command(
+                    model=model, target_id=target_id, horizon=horizon,
+                    eval_seed=args.eval_seed, episodes=args.episodes,
+                    max_ep_len=args.max_ep_len, reward_mode=args.reward_mode,
+                    guide_weight=args.goal_guide_weight, population=args.population,
+                    elite_count=args.elite_count, iterations=args.iterations,
+                    gamma=args.gamma, cpu_threads=args.cpu_threads,
+                    print_every_steps=args.print_every_steps,
+                    capture_action_hashes=args.capture_action_hashes,
+                    profile_timing=args.profile_timing,
+                    skip_attention_weights=args.skip_attention_weights,
+                    case_root=case_root,
+                )
+                job["log_path"] = case_root / "launcher.log"
+                job["command"] = command
+                jobs.append(job)
+
+    child_env = _child_env()
+    worker_groups: dict[str, dict] = {}
+    for job in jobs:
+        group_key = str(job["checkpoint"])
+        group = worker_groups.setdefault(group_key, {"jobs": []})
+        group["jobs"].append(job)
+    worker_group_list = []
+    for group_index, group in enumerate(worker_groups.values(), start=1):
+        group["jobs"].sort(key=lambda item: item["number"])
+        first_job = group["jobs"][0]
+        group_root = run_root / "workers" / _safe_component(
+            f"{first_job['baseline']}_{first_job['model_id']}"
+        )
+        group_root.mkdir(parents=True, exist_ok=True)
+        group["jobs_json"] = group_root / "jobs.json"
+        group["worker_log"] = group_root / "worker.log"
+        group["worker_metrics_path"] = group_root / "worker_metrics.json"
+        worker_jobs = []
+        for job in group["jobs"]:
+            job["runtime_path"].parent.mkdir(parents=True, exist_ok=True)
+            worker_jobs.append({
+                "model_id": job["model_id"],
+                "overrides": job["command"][4:],
+                "log_path": str(job["log_path"]),
+                "runtime_path": str(job["runtime_path"]),
+                "worker_metrics_path": str(group["worker_metrics_path"]),
+            })
+        group["jobs_json"].write_text(
+            json.dumps(worker_jobs, indent=2) + "\n", encoding="utf-8"
+        )
+        group["number"] = group_index
+        worker_group_list.append(group)
+
+    if worker_group_list:
+        for group in worker_group_list:
+            first_job = group["jobs"][0]
+            print(
+                f"[queued worker {group['number']}/{len(worker_group_list)}] "
+                f"model={first_job['model_id']} cases={len(group['jobs'])}", flush=True,
+            )
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            future_to_group = {
+                executor.submit(_execute_group, group, child_env): group
+                for group in worker_group_list
+            }
+            for future in as_completed(future_to_group):
+                group = future_to_group[future]
+                case_results, worker_elapsed, worker_metrics = future.result()
+                worker_metrics["process_wall_seconds"] = worker_elapsed
+                group["worker_metrics_path"].write_text(
+                    json.dumps(worker_metrics, indent=2) + "\n", encoding="utf-8"
+                )
+                first_job = group["jobs"][0]
+                print(
+                    f"[finished worker {group['number']}/{len(worker_group_list)}] "
+                    f"model={first_job['model_id']} wall={worker_elapsed:.1f}s "
+                    f"loaded_model={worker_metrics['model_load_seconds']:.2f}s", flush=True,
+                )
+                for job, source_rows, case_seconds in case_results:
+                    completed[job["number"]] = (job, source_rows, case_seconds)
+
+
+    # A single parent writes the aggregate files in manifest/target/K order.
+    for number in sorted(completed):
+        job, source_rows, elapsed = completed[number]
+        enriched = []
+        for row in source_rows:
+            enriched.append({
+                "baseline": job["baseline"],
+                "model_id": job["model_id"],
+                "checkpoint": str(job["checkpoint"]),
+                "checkpoint_sha256": job["checkpoint_sha256"],
+                "target_id": job["target_id"],
+                "target": job["target"],
+                "horizon": job["horizon"],
+                "execute_steps": job["horizon"],
+                "eval_seed": job["eval_seed"],
+                "case_wall_seconds": elapsed,
+                **{field: row[field] for field in PLANNER_FIELDS},
+            })
+        _append_rows(aggregate_path, enriched, RESULT_FIELDS)
+        all_rows.extend(enriched)
+        grouped[job["key"]] = enriched
+        _summarize(run_root, all_rows)
+        print(
+            f"[saved {number}/{case_count}] "
+            f"{job['planner_summary']}", flush=True,
+        )
 
     _summarize(run_root, all_rows)
+    worker_metrics_rows = []
+    for metrics_path in sorted((run_root / "workers").glob("*/worker_metrics.json")):
+        worker_metrics_rows.append(json.loads(metrics_path.read_text(encoding="utf-8")))
+    if worker_metrics_rows:
+        with (run_root / "worker_timing.csv").open("w", newline="", encoding="utf-8") as handle:
+            fields = (
+                "model_id", "checkpoint", "case_count", "model_load_seconds",
+                "worker_seconds", "case_seconds_sum", "process_wall_seconds",
+                "model_reused_across_cases",
+            )
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(worker_metrics_rows)
     print(f"Episode results: {aggregate_path}")
     print(f"Model/target/K summary: {run_root / 'model_target_k_summary.csv'}")
     print(f"Baseline/K summary: {run_root / 'baseline_k_summary.csv'}")
