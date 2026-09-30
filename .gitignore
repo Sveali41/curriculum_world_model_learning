@@ -44,4 +44,6 @@ wm/tests
 test/*
 !test/crafter_dr_mac_50/
 test/crafter_dr_mac_50/results/
+!test/minigrid_mpc_k_sweep/
+test/minigrid_mpc_k_sweep/results/
 *.resume.pt

@@ -1,13 +1,17 @@
 # Crafter DR vs balanced MAC: focal gamma 1, five seeds
 
 Both arms use seeds 0–4, focal gamma 1 for the layout and inventory base effect
-losses, 8,000 new transitions per WM update, 10 WM epochs, EWC 20, and the same
-replay and WM configuration. The inventory event residual loss and existing
-KEEP/CHANGE weights are unchanged. During training, each update validates
-uniform targets 1–4 with 500 fixed samples per target. MAC runs 10 novelty
-warmup rounds before its 50 WM updates. The warmup rounds do not count as WM
-updates. These runs use separate `gamma1` result directories and leave previous
-gamma 0 runs intact.
+losses, an 8,000-transition budget per collection iteration, 10 WM epochs, EWC
+20, and the same replay and WM configuration. The inventory event residual loss
+and existing KEEP/CHANGE weights are unchanged. Validation uses uniform targets
+1–4 with 500 fixed samples per target. These runs use separate `gamma1` result
+directories and leave previous gamma 0 runs intact.
+
+The scripts first run a quick stage with 30 WM updates per seed: DR uses 30 total
+iterations; MAC uses 40 total iterations, including 10 warmup rounds. If the
+results look promising, pass `--resume-full` to continue those same runs to DR
+iteration 50 and MAC iteration 60 (10 warmup + 50 WM updates). Resume preserves
+the run ID and seed and does not restart training.
 
 From the repository root, run DR seeds 0–4 sequentially on the server:
 
@@ -16,22 +20,21 @@ bash test/crafter_dr_mac_50/run_dr.sh
 ```
 
 The scripts forward optional Hydra overrides. For example,
-`bash test/crafter_dr_mac_50/run_dr.sh --dry-run` prints all five commands
-without training.
+`bash test/crafter_dr_mac_50/run_dr.sh --dry-run` prints all five quick-stage
+commands without training.
 
-Run balanced MAC locally, also sequentially for seeds 0–4:
+Run MAC locally, also sequentially for seeds 0–4:
 
 ```bash
 bash test/crafter_dr_mac_50/run_mac.sh
 ```
 
-Run the five seeds sequentially on each machine unless you have measured that
+Run the five seeds sequentially in each stage unless you have measured that
 concurrent training fits its GPU memory. Each run has its own results,
 checkpoint, and resume state directory in `results/` below this folder.
 
-To resume an interrupted run, repeat its command with
-`force_fresh_start=false resume_training=true`. Do not use a different seed or
-run ID when resuming.
+To resume an interrupted quick-stage run, pass `--resume-full` after fixing the
+cause of the interruption. Do not use a different seed or run ID when resuming.
 
 Each successful WM update saves a checkpoint in its run's `wm_snapshots/`
 directory. After selecting an iteration, validate its checkpoint on all 20
