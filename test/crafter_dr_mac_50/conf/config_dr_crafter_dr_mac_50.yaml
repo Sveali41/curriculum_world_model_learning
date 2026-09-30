@@ -5,7 +5,7 @@ defaults:
 
 domain: crafter
 seed: 0
-dr_quick_run_id: dr_ewc20_epoch10_seed${seed}
+dr_quick_run_id: dr_ewc20_epoch10_gamma1_seed${seed}
 dr_quick_output_root: ${oc.env:TRAINER_ROOT,${oc.env:PROJECT_ROOT}}/test/crafter_dr_mac_50/results/dr/${dr_quick_run_id}
 
 paths:
@@ -16,6 +16,7 @@ generator_agent:
 
 domains:
   crafter:
+    focal_gamma: 1.0
     lambda_ewc: 20
     iter_transition_budget: 8000
     learning_progress_probe_budget: 0

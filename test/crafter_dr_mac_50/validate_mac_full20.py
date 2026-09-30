@@ -1,4 +1,4 @@
-"""Evaluate retained DR or MAC WM updates on all 20 uniform targets into one CSV."""
+"""Evaluate retained Crafter WM updates on all 20 uniform targets into one CSV."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from validate_checkpoint import (
     _check_saved_config,
     hydra,
     np,
+    OmegaConf,
     set_seed,
     torch,
     AttentionWorldModel,
@@ -37,18 +38,20 @@ FIELDS = (
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--arm", choices=("dr", "mac"), default="mac")
+    parser.add_argument("--arm", choices=("dr", "mac", "target", "p2e"), default="mac")
     parser.add_argument("--seeds", nargs="+", type=int, choices=tuple(range(5)), default=(0, 1))
     parser.add_argument("--start-update", type=int, default=1)
-    parser.add_argument("--end-update", type=int, default=50)
+    parser.add_argument("--end-update", type=int, default=None)
     parser.add_argument(
         "--output",
         type=Path,
         default=None,
     )
     args = parser.parse_args()
-    if not 1 <= args.start_update <= args.end_update <= 50:
-        parser.error("Expected 1 <= --start-update <= --end-update <= 50")
+    max_update = {"dr": 50, "mac": 50, "target": 20, "p2e": 100}[args.arm]
+    end_update = args.end_update if args.end_update is not None else max_update
+    if not 1 <= args.start_update <= end_update <= max_update:
+        parser.error(f"Expected 1 <= --start-update <= --end-update <= {max_update}")
     if len(set(args.seeds)) != len(args.seeds):
         parser.error("--seeds must not contain duplicates")
 
@@ -62,8 +65,18 @@ def main() -> None:
             cfg = hydra.compose(
                 config_name=config_name, overrides=[f"seed={seed}"]
             )
-        run_dir = Path(str(cfg.mac_results_dir if args.arm == "mac" else cfg.dr_log_dir)).resolve()
-        _check_saved_config(cfg, run_dir)
+        run_root = {
+            "dr": "dr_log_dir", "mac": "mac_results_dir",
+            "target": "target_dr_mac_run_root", "p2e": "p2e_dr_mac_run_root",
+        }[args.arm]
+        run_dir = Path(str(getattr(cfg, run_root))).resolve()
+        saved_config = run_dir / "hydra" / ".hydra" / "config.yaml"
+        if saved_config.is_file():
+            _check_saved_config(cfg, run_dir)
+        elif args.arm != "p2e":
+            raise FileNotFoundError(f"Missing original experiment config: {saved_config}")
+        else:
+            print(f"[Full20] P2E seed={seed}: saved config missing; checking checkpoint metadata", flush=True)
         if int(cfg.attention_model.target_validation_max_samples) != 500:
             raise ValueError("Full validation requires 500 fixed samples per target")
         domain = cfg.domains.crafter
@@ -75,8 +88,8 @@ def main() -> None:
         missing = [target_dir / f"{name}{suffix}" for name in names if not (target_dir / f"{name}{suffix}").is_file()]
         if missing:
             raise FileNotFoundError(f"Missing {len(missing)} uniform targets; first: {missing[0]}")
-        configs[seed] = (cfg, target_dir, names, suffix)
-        for update in range(args.start_update, args.end_update + 1):
+        configs[seed] = (cfg, target_dir, names, suffix, saved_config.is_file())
+        for update in range(args.start_update, end_update + 1):
             iteration = update + iteration_offset
             checkpoint = run_dir / "wm_snapshots" / f"iter_{iteration:03d}.ckpt"
             if not checkpoint.is_file():
@@ -105,8 +118,8 @@ def main() -> None:
             writer.writeheader()
             handle.flush()
         for seed in args.seeds:
-            cfg, target_dir, names, suffix = configs[seed]
-            for update in range(args.start_update, args.end_update + 1):
+            cfg, target_dir, names, suffix, has_saved_config = configs[seed]
+            for update in range(args.start_update, end_update + 1):
                 checkpoint = checkpoints[seed, update]
                 checkpoint_hash = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
                 key = (seed, update)
@@ -128,7 +141,17 @@ def main() -> None:
                 set_seed(seed)
                 raw = torch.load(checkpoint, map_location="cpu", weights_only=False)
                 state = raw["state_dict"] if isinstance(raw, dict) and "state_dict" in raw else raw
+                if not has_saved_config:
+                    expected = OmegaConf.to_container(cfg.attention_model, resolve=True)
+                    embedded = OmegaConf.to_container(raw["hyper_parameters"], resolve=True)
+                    for values in (expected, embedded):
+                        values.pop("model_save_path", None)
+                        values.pop("data_dir", None)
+                    if embedded != expected:
+                        raise ValueError(f"Checkpoint model config differs from validation config: {checkpoint}")
                 model = AttentionWorldModel(cfg.attention_model)
+                if not has_saved_config and raw.get("world_model_contract") != model.model.checkpoint_contract:
+                    raise ValueError(f"Checkpoint world-model contract differs from validation config: {checkpoint}")
                 model.load_state_dict(state, strict=True)
                 model = model.to(device).eval()
                 summary = validate_on_all_targets(
@@ -167,7 +190,7 @@ def main() -> None:
                 )
                 handle.flush()
                 print(
-                    f"[Full20] arm={args.arm} seed={seed} update={update}/50 "
+                    f"[Full20] arm={args.arm} seed={seed} update={update}/{max_update} "
                     f"combined={metrics['target_val_changed_focal_loss']:.6f} "
                     f"layout={metrics['target_val_layout_changed_focal_loss']:.6f} "
                     f"inventory={metrics['target_val_inventory_changed_focal_loss']:.6f} "

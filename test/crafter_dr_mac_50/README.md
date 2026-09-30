@@ -1,28 +1,31 @@
-# Crafter DR vs balanced MAC: 50 WM updates
+# Crafter DR vs balanced MAC: focal gamma 1, five seeds
 
-Both arms use seed 0 or 1, 8,000 new transitions per WM update, 10 WM epochs,
-EWC 20, and the same replay and WM configuration. During training, each update
-validates uniform targets 1–4 with 500 fixed samples per target. MAC runs 10
-novelty warmup rounds before its 50 WM updates. The warmup rounds do not count
-as WM updates.
+Both arms use seeds 0–4, focal gamma 1 for the layout and inventory base effect
+losses, 8,000 new transitions per WM update, 10 WM epochs, EWC 20, and the same
+replay and WM configuration. The inventory event residual loss and existing
+KEEP/CHANGE weights are unchanged. During training, each update validates
+uniform targets 1–4 with 500 fixed samples per target. MAC runs 10 novelty
+warmup rounds before its 50 WM updates. The warmup rounds do not count as WM
+updates. These runs use separate `gamma1` result directories and leave previous
+gamma 0 runs intact.
 
-From the repository root, run DR seed 0 then seed 1 on the server:
+From the repository root, run DR seeds 0–4 sequentially on the server:
 
 ```bash
 bash test/crafter_dr_mac_50/run_dr.sh
 ```
 
 The scripts forward optional Hydra overrides. For example,
-`bash test/crafter_dr_mac_50/run_dr.sh --dry-run` prints both commands without
-training.
+`bash test/crafter_dr_mac_50/run_dr.sh --dry-run` prints all five commands
+without training.
 
-Run balanced MAC locally, also sequentially for seed 0 and 1:
+Run balanced MAC locally, also sequentially for seeds 0–4:
 
 ```bash
 bash test/crafter_dr_mac_50/run_mac.sh
 ```
 
-Run the two seeds sequentially on each machine unless you have measured that
+Run the five seeds sequentially on each machine unless you have measured that
 concurrent training fits its GPU memory. Each run has its own results,
 checkpoint, and resume state directory in `results/` below this folder.
 

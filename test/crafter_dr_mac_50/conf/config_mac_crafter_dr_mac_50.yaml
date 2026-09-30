@@ -6,7 +6,7 @@ defaults:
 
 domain: crafter
 seed: 0
-mac_quick_run_id: mac_balanced_ewc20_epoch10_seed${seed}
+mac_quick_run_id: mac_balanced_ewc20_epoch10_gamma1_seed${seed}
 mac_quick_output_root: ${oc.env:TRAINER_ROOT,${oc.env:PROJECT_ROOT}}/test/crafter_dr_mac_50/results/mac/${mac_quick_run_id}
 
 paths:
@@ -20,6 +20,7 @@ generator_agent:
 
 domains:
   crafter:
+    focal_gamma: 1.0
     lambda_ewc: 20
     iter_transition_budget: 8000
     # Independent probes supply the MAC generator reward; DR skips them.
