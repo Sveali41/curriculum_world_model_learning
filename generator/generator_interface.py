@@ -361,7 +361,16 @@ class GeneratorInterface:
         self.crafter_lp_probe_size = max(
             1, int(math.ceil(crafter_lp_probe_budget / max(self.batch_size, 1)))
         )
+        bipedal_domain_cfg = getattr(getattr(cfg, "domains", None), "bipedalwalker", None)
+        bipedal_lp_probe_budget = int(
+            getattr(bipedal_domain_cfg, "learning_progress_probe_budget", 1000)
+        )
+        self.bipedal_lp_probe_size = max(
+            1, int(math.ceil(bipedal_lp_probe_budget / max(self.batch_size, 1)))
+        )
         self.last_minigrid_metrics = {}
+        self.last_bipedal_metrics = {}
+        self.last_bipedal_map_diagnostics = []
         self.last_crafter_metrics = (
             {
                 "Pre_Changed_Focal_Loss": float("nan"),
@@ -379,6 +388,7 @@ class GeneratorInterface:
         )
         self.last_generated_minigrid_batch = None
         self._pending_minigrid_round = None
+        self._pending_bipedal_round = None
         self._pending_crafter_round = None
         self.crafter_stage_probe_diagnostic = getattr(
             cfg, "crafter_stage_probe_diagnostic", None
@@ -995,6 +1005,9 @@ class GeneratorInterface:
         if self.is_bipedal:
             self.bipedal_history.clear()
             self._last_bipedal_memory = np.zeros(26, dtype=np.float32)
+            self._pending_bipedal_round = None
+            self.last_bipedal_metrics = {}
+            self.last_bipedal_map_diagnostics = []
 
         if hasattr(self.ppo, "clear_buffer"):
             self.ppo.clear_buffer()
@@ -1514,6 +1527,95 @@ class GeneratorInterface:
         # the explorer coverage fields before MAC writes its CSV row.
         self._attach_minigrid_explorer_coverage()
         self._pending_minigrid_round = None
+
+    def _evaluate_bipedal_probe_losses(self, trajectories, valid):
+        valid = np.asarray(valid, dtype=bool).reshape(-1)
+        if len(trajectories) != self.batch_size or valid.size != self.batch_size:
+            raise ValueError("Bipedal LP needs one held-out probe per generated environment")
+        losses = np.full(self.batch_size, np.nan, dtype=np.float32)
+        was_training = self.wm.training
+        self.wm.eval()
+        try:
+            with torch.no_grad():
+                for index, trajectory in enumerate(trajectories):
+                    if not valid[index]:
+                        continue
+                    if not trajectory or "obs" not in trajectory or len(trajectory["obs"]) == 0:
+                        raise RuntimeError(f"Bipedal LP probe is missing for environment {index}")
+                    loss = float(self.wm.calc_loss(trajectory)["loss_obs"].item())
+                    if not np.isfinite(loss):
+                        raise RuntimeError(f"Bipedal LP probe loss is nonfinite for environment {index}: {loss}")
+                    losses[index] = loss
+        finally:
+            self.wm.train(was_training)
+        return losses
+
+    def _begin_bipedal_learning_progress(self, trajectories, valid, diversity, episode_lengths):
+        valid = np.asarray(valid, dtype=bool).reshape(-1)
+        diversity = np.asarray(diversity, dtype=np.float32).reshape(-1)
+        episode_lengths = np.asarray(episode_lengths, dtype=np.float32).reshape(-1)
+        if any(values.size != self.batch_size for values in (valid, diversity, episode_lengths)):
+            raise ValueError("Bipedal LP metadata must match the generator batch size")
+        pre_losses = self._evaluate_bipedal_probe_losses(trajectories, valid)
+        self._pending_bipedal_round = {
+            "trajectories": trajectories,
+            "valid": valid,
+            "pre_losses": pre_losses,
+            "diversity": diversity,
+            "episode_lengths": episode_lengths,
+        }
+
+    def finalize_bipedal_learning_progress(self, apply_rewards=False):
+        """Measure held-out WM loss reduction and optionally finalize PPO rewards."""
+        pending = self._pending_bipedal_round
+        if not self.is_bipedal or pending is None:
+            return
+        valid = pending["valid"]
+        pre_losses = pending["pre_losses"]
+        post_losses = self._evaluate_bipedal_probe_losses(pending["trajectories"], valid)
+        paired = valid & np.isfinite(pre_losses) & np.isfinite(post_losses)
+        learning_progress = pre_losses - post_losses
+        rewards = []
+        for index in range(self.batch_size):
+            reward = (
+                self._calculate_reward(
+                    0.0, float(pending["diversity"][index]), False,
+                    avg_ep_len=float(pending["episode_lengths"][index]),
+                    learning_progress=float(learning_progress[index]),
+                ) if paired[index] else -5.0
+            )
+            rewards.append(reward)
+        if apply_rewards:
+            buffer_rewards = getattr(self.ppo, "buffer", {}).get("reward", [])
+            if len(buffer_rewards) < self.batch_size:
+                raise RuntimeError("Bipedal LP cannot finalize PPO reward: generator buffer is incomplete")
+            buffer_rewards[-self.batch_size:] = rewards
+        self.last_bipedal_metrics = {
+            "Pre_WM_Loss": float(pre_losses[paired].mean()) if paired.any() else float("nan"),
+            "Post_WM_Loss": float(post_losses[paired].mean()) if paired.any() else float("nan"),
+            "Learning_Progress": float(learning_progress[paired].mean()) if paired.any() else float("nan"),
+            "paired_probe_count": int(paired.sum()),
+            "Reward_LP_Mean": (
+                float(getattr(self.bipedal_reward_cfg, "learning_progress", 1.0) * learning_progress[paired].mean())
+                if paired.any() else float("nan")
+            ),
+            "Final_Reward_Mean": float(np.mean(rewards)),
+            "Final_Reward_Std": float(np.std(rewards)),
+        }
+        self.last_bipedal_map_diagnostics = [
+            {
+                "map_index": index,
+                "valid": bool(paired[index]),
+                "pre_probe_loss": float(pre_losses[index]),
+                "post_probe_loss": float(post_losses[index]),
+                "learning_progress": float(learning_progress[index]),
+                "diversity": float(pending["diversity"][index]),
+                "episode_length": float(pending["episode_lengths"][index]),
+                "reward_total": float(rewards[index]),
+            }
+            for index in range(self.batch_size)
+        ]
+        self._pending_bipedal_round = None
 
     def _evaluate_crafter_changed_focal_losses(self, trajectories, valid, phase, include_feedback=False, include_components=False):
         count = len(trajectories)
@@ -2123,6 +2225,7 @@ class GeneratorInterface:
         valid_trajs = []
         raw_scalar_losses, div_rewards = [], []
         raw_ce_losses, raw_inv_losses = [], []
+        all_avg_ep_lens = []
         solved_count = 0
         bfs_count = 0
         total_bfs_dist = 0.0
@@ -2175,9 +2278,10 @@ class GeneratorInterface:
             )
             traj, errors, raw_loss_val, solved = res_rollout[0], res_rollout[1], res_rollout[2], res_rollout[3]
             round_trajectories.append(traj)
-            if (self.is_minigrid or (self.is_crafter and not self.skip_crafter_learning_progress)) and traj and "obs" in traj:
+            if (self.is_minigrid or (self.is_crafter and not self.skip_crafter_learning_progress) or (self.is_bipedal and not is_warmup)) and traj and "obs" in traj:
                 probe_budget = (
                     self.crafter_lp_probe_size if self.is_crafter
+                    else self.bipedal_lp_probe_size if self.is_bipedal
                     else self.minigrid_lp_probe_size
                 )
                 probe_traj = self._rollout_combined(
@@ -2199,6 +2303,8 @@ class GeneratorInterface:
             t_loss_batch = res_rollout[4] if len(res_rollout) > 4 else raw_loss_val
             i_loss_batch = res_rollout[5] if len(res_rollout) > 5 else 0.0
             inv_changed_slots = res_rollout[6] if len(res_rollout) > 6 else 0
+            avg_ep_len = res_rollout[7] if len(res_rollout) > 7 else 200.0
+            all_avg_ep_lens.append(avg_ep_len)
 
             if self.is_crafter:
                 is_connected, conn_stats = self.seeder.check_connectivity(final_map_obj)
@@ -2237,8 +2343,8 @@ class GeneratorInterface:
                     final_map_3ch, inventory_vec=final_stats
                 )
             div_rewards.append(r_div)
-            if self.is_minigrid:
-                reward = 0.0  # DR has no PPO update; diagnostics are finalized later.
+            if self.is_minigrid or (self.is_bipedal and not is_warmup):
+                reward = 0.0  # LP diagnostics are finalized after the WM update.
             else:
                 reward = self._calculate_reward(
                     raw_loss_val, r_div, is_warmup,
@@ -2299,6 +2405,10 @@ class GeneratorInterface:
                 "novelty_distance_std": novelty_distance_std,
             }
 
+        elif self.is_bipedal and not is_warmup:
+            self._begin_bipedal_learning_progress(
+                probe_trajectories, valid_flags, div_rewards, all_avg_ep_lens,
+            )
         elif self.is_crafter and not self.skip_crafter_learning_progress:
             probe_valid_flags = [
                 valid and bool(probe) and "obs" in probe
@@ -2494,8 +2604,12 @@ class GeneratorInterface:
             )
             traj, errors, raw_loss_val, solved = res_rollout[0], res_rollout[1], res_rollout[2], res_rollout[3]
             round_trajectories.append(traj)
-            if (self.is_minigrid or (self.is_crafter and not is_warmup)) and traj and "obs" in traj:
-                probe_budget = self.crafter_lp_probe_size if self.is_crafter else self.minigrid_lp_probe_size
+            if (self.is_minigrid or (self.is_crafter and not is_warmup) or (self.is_bipedal and not is_warmup)) and traj and "obs" in traj:
+                probe_budget = (
+                    self.crafter_lp_probe_size if self.is_crafter
+                    else self.bipedal_lp_probe_size if self.is_bipedal
+                    else self.minigrid_lp_probe_size
+                )
                 probe_traj = self._rollout_combined(
                     final_map_obj, final_stats, iteration, f"{i}_lp_probe",
                     old_params=old_params, color_np=final_map_col, state_np=final_map_state,
@@ -2558,7 +2672,7 @@ class GeneratorInterface:
                     final_map_3ch, inventory_vec=final_stats
                 )
             div_rewards.append(r_div)
-            if self.is_minigrid:
+            if self.is_minigrid or (self.is_bipedal and not is_warmup):
                 reward = 0.0  # Finalized after this round's WM update.
             elif self.is_crafter:
                 reward = self._crafter_auxiliary_reward(r_div, inv_changed_slots)
@@ -2737,6 +2851,10 @@ class GeneratorInterface:
                 "archive_nearest_hamming": archive_nearest_hamming,
                 "novelty_distance_std": novelty_distance_std,
             }
+        elif self.is_bipedal and not is_warmup:
+            self._begin_bipedal_learning_progress(
+                probe_trajectories, valid_flags, div_rewards, all_avg_ep_lens,
+            )
         elif self.is_crafter and not is_warmup:
             probe_valid_flags = [
                 valid and bool(probe) and "obs" in probe
@@ -3336,6 +3454,7 @@ class GeneratorInterface:
         ce_loss=None,
         inv_loss=None,
         avg_ep_len=200.0,
+        learning_progress=None,
     ):
         if is_warmup and self.is_crafter:
             reward_cfg = self.crafter_reward_cfg
@@ -3362,41 +3481,20 @@ class GeneratorInterface:
             return float(np.clip(reward, -reward_clip, reward_clip))
 
         if is_warmup and self.is_bipedal:
-            w_survival = float(getattr(self.bipedal_reward_cfg, "survival", 0.08))
-            return 1.0 + div_score * 5.0 + w_survival * avg_ep_len
+            return float(div_score) * 5.0
         
         if self.is_bipedal:
-            # For bipedal, validation returns:
-            # - inv_loss slot: contact BCE (lower is better)
-            # We intentionally do NOT use contact accuracy here because it
-            # saturates early and is not a reliable training signal.
+            if learning_progress is None:
+                raise ValueError("Bipedal reward requires post-update held-out learning progress")
             reward_cfg = self.bipedal_reward_cfg
-            w_bce = float(getattr(reward_cfg, "contact_bce", getattr(self.cfg.generator_agent, "reward_w_inv", 3.0)))
+            w_lp = float(getattr(reward_cfg, "learning_progress", 1.0))
             w_div = float(getattr(reward_cfg, "div", getattr(self.cfg.generator_agent, "reward_w_div", 3.0)))
-            w_total = float(getattr(reward_cfg, "total_loss", getattr(self.cfg.generator_agent, "reward_w_total", 0.0)))
-            bias = float(getattr(reward_cfg, "bias", getattr(self.cfg.generator_agent, "reward_bias", 2.0)))
             reward_clip = float(getattr(reward_cfg, "clip", getattr(self.cfg.generator_agent, "reward_clip", 100.0)))
-
-            contact_bce = float(inv_loss) if inv_loss is not None else 0.0
-            total_loss = float(raw_loss)
-
-            # Use log-scaled MSE to preserve reward resolution at small error values.
-            mse_reward_term = float(np.log10(total_loss * 50.0 + 1.0))
-
-            # Add survival as an independent reward term based on episode length.
-            survival_ratio = avg_ep_len
-            w_survival = float(getattr(reward_cfg, "survival", 3.0))
-
             reward = (
-                + w_bce * contact_bce
-                + w_total * mse_reward_term
+                w_lp * float(learning_progress)
                 + w_div * float(div_score)
-                + w_survival * survival_ratio
-                + bias
             )
-            reward = float(np.clip(reward, -reward_clip, reward_clip))
-
-            return reward
+            return float(np.clip(reward, -reward_clip, reward_clip))
 
         # Crafter: No BFS, Pure adversarial reward loop. 
         # Any environment is a valid challenge for the World Model.

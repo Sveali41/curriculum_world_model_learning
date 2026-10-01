@@ -511,7 +511,8 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         ewc_suffix += crafter_pose_suffix
         ewc_suffix += crafter_event_residual_suffix
         ewc_suffix += crafter_validation_suffix
-        summary_csv_path = log_dir / f"dr_summary_{domain_name}{mask_suffix}{ewc_suffix}.csv"
+        reward_suffix = "_lp_g1" if is_bipedal else ""
+        summary_csv_path = log_dir / f"dr_summary_{domain_name}{mask_suffix}{ewc_suffix}{reward_suffix}.csv"
     transition_stats_csv_path = (
         log_dir / f"dr_crafter_replay{ablation_suffix}_seed{seed}.csv"
         if transition_replay_enabled else None
@@ -599,6 +600,7 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
             "gen_val_contact_acc", "gen_val_contact_bce", "gen_val_avg_val_loss_wm",
             "target_val_contact_acc", "target_val_contact_bce", "target_val_avg_val_loss_wm",
+            "Pre_WM_Loss", "Post_WM_Loss", "Learning_Progress", "LP_Probe_Count",
             "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
         ]
     if quick_target_loss_csv:
@@ -925,6 +927,8 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             generator.finalize_minigrid_rewards()
         elif is_crafter:
             generator.finalize_crafter_learning_progress(apply_rewards=False)
+        elif is_bipedal:
+            generator.finalize_bipedal_learning_progress(apply_rewards=False)
 
         # C. Validation on Target Tasks (aligned with MAC: validate every iter after warmup)
         warmup_iters = _safe_int_cfg(
@@ -1108,6 +1112,10 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                 "gen_val_avg_val_loss_wm": gen_val_avg_val_loss_wm,
                 "target_val_contact_acc": target_val_contact_acc, "target_val_contact_bce": target_val_contact_bce,
                 "target_val_avg_val_loss_wm": target_val_avg_val_loss_wm,
+                "Pre_WM_Loss": getattr(generator, "last_bipedal_metrics", {}).get("Pre_WM_Loss", float("nan")),
+                "Post_WM_Loss": getattr(generator, "last_bipedal_metrics", {}).get("Post_WM_Loss", float("nan")),
+                "Learning_Progress": getattr(generator, "last_bipedal_metrics", {}).get("Learning_Progress", float("nan")),
+                "LP_Probe_Count": getattr(generator, "last_bipedal_metrics", {}).get("paired_probe_count", 0),
                 "New_Data_Size": current_transitions, "Buffer_Size": len(fisher_buffer),
                 "Solvable_Count": solvable_count, "Avg_Path_Len": avg_path_len,
             }

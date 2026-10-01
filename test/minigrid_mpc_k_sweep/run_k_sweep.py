@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import statistics
 import subprocess
 import sys
@@ -126,6 +127,7 @@ def _child_env() -> dict[str, str]:
 def _command(
     *, model: dict[str, str], target_id: int, horizon: int, eval_seed: int,
     episodes: int, max_ep_len: int, reward_mode: str, guide_weight: float,
+    stop_on_prediction_mismatch: bool,
     population: int, elite_count: int, iterations: int, gamma: float,
     cpu_threads: int, print_every_steps: int, capture_action_hashes: bool,
     profile_timing: bool, skip_attention_weights: bool, case_root: Path,
@@ -144,10 +146,11 @@ def _command(
         f"PPO.checkpoint_path_wm={model['checkpoint']}",
         f"PPO.max_ep_len={max_ep_len}",
         f"PPO.mpc.episodes={episodes}",
-        "PPO.mpc.minigrid_stop_on_prediction_mismatch=false",
+        f"PPO.mpc.minigrid_stop_on_prediction_mismatch={str(stop_on_prediction_mismatch).lower()}",
         f"PPO.mpc.horizon={horizon}",
         f"PPO.mpc.minigrid_execute_steps={horizon}",
         f"PPO.mpc.minigrid_reward_mode={reward_mode}",
+        *(["PPO.use_main_dense_reward=true"] if reward_mode == "legacy_dense" else []),
         f"PPO.mpc.minigrid_goal_guide_weight={guide_weight}",
         f"PPO.mpc.population={population}",
         f"PPO.mpc.elite_count={elite_count}",
@@ -322,6 +325,8 @@ def main() -> None:
     parser.add_argument("--reward-mode", choices=("native_goal", "legacy_dense"),
                         default="native_goal")
     parser.add_argument("--goal-guide-weight", type=float, default=0.05)
+    parser.add_argument("--stop-on-prediction-mismatch", action="store_true",
+                        help="Replan early when real and predicted states disagree")
     parser.add_argument("--population", type=int, default=128)
     parser.add_argument("--elite-count", type=int, default=16)
     parser.add_argument("--iterations", type=int, default=3)
@@ -429,6 +434,8 @@ def main() -> None:
         "workers": args.workers,
         "reuse_model_by_checkpoint": True,
     }
+    if args.stop_on_prediction_mismatch:
+        run_config["stop_on_prediction_mismatch"] = True
     config_path = run_root / "run_config.json"
     if args.dry_run:
         case_count = len(models) * len(targets) * len(k_values)
@@ -442,6 +449,7 @@ def main() -> None:
             model=models[0], target_id=target_ids[0], horizon=k_values[0],
             eval_seed=args.eval_seed, episodes=args.episodes, max_ep_len=args.max_ep_len,
             reward_mode=args.reward_mode, guide_weight=args.goal_guide_weight,
+            stop_on_prediction_mismatch=args.stop_on_prediction_mismatch,
             population=args.population, elite_count=args.elite_count,
             iterations=args.iterations, gamma=args.gamma, cpu_threads=args.cpu_threads,
             print_every_steps=args.print_every_steps,
@@ -546,7 +554,9 @@ def main() -> None:
                     model=model, target_id=target_id, horizon=horizon,
                     eval_seed=args.eval_seed, episodes=args.episodes,
                     max_ep_len=args.max_ep_len, reward_mode=args.reward_mode,
-                    guide_weight=args.goal_guide_weight, population=args.population,
+                    guide_weight=args.goal_guide_weight,
+                    stop_on_prediction_mismatch=args.stop_on_prediction_mismatch,
+                    population=args.population,
                     elite_count=args.elite_count, iterations=args.iterations,
                     gamma=args.gamma, cpu_threads=args.cpu_threads,
                     print_every_steps=args.print_every_steps,

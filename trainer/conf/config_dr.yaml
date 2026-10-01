@@ -23,7 +23,7 @@ dr_temp_data_dir: ${domains.${domain}.mini_tasks_temp_root}dr/
 # loss details remain in checkpoint metadata and CSV logs, not the filename.
 attention_model:
   seed: ${seed}
-  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/dr_attention_world_model_${domain}_${ablation.type}_seed${seed}.ckpt
+  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/dr_attention_world_model_${domain}_${ablation.type}${oc.select:domains.${domain}.reward_artifact_suffix,}_seed${seed}.ckpt
   continue_learning: true
   ewc_enabled: true
   compute_fisher: true

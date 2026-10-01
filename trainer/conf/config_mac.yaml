@@ -231,6 +231,8 @@ domains:
       combination_novelty: 1.0
 
   bipedalwalker:
+    # Separate artifacts for the gamma-1 WM and LP-based generator reward.
+    reward_artifact_suffix: _lp_g1
     h: 1
     w: 24
     active_w: 6                  # bipedal-only: only the first active_w slots can place obstacles
@@ -253,12 +255,26 @@ domains:
     use_bipedal_attention: true
     # Data collection budget for MAC/DR (per training iteration).
     iter_transition_budget: 4000
+    # Separate per-environment probe transitions for pre/post WM learning progress.
+    learning_progress_probe_budget: 1000
     generator_batch_size: 8
     max_edits_layout: 1.0
     max_edits_inventory: 0.0
     replay_frac: 0.7
     lambda_ewc: 0.05
     validation_metric: "mse"
+    focal_gamma: 1.0
+    observation_schema:
+      - {name: hull_pose, distribution: mse, indices: [0, 1]}
+      - {name: hull_vel, distribution: mse, indices: [2, 3]}
+      - {name: leg1_hip, distribution: mse, indices: [4, 5]}
+      - {name: leg1_knee, distribution: mse, indices: [6, 7]}
+      - {name: leg1_contact, distribution: bernoulli_effect, indices: [8], prediction_source: contact_logits, target_mode: current_plus_delta}
+      - {name: leg2_hip, distribution: mse, indices: [9, 10]}
+      - {name: leg2_knee, distribution: mse, indices: [11, 12]}
+      - {name: leg2_contact, distribution: bernoulli_effect, indices: [13], prediction_source: contact_logits, target_mode: current_plus_delta}
+      - {name: lidar_near, distribution: mse, indices: [14, 15, 16, 17, 18]}
+      - {name: lidar_far, distribution: mse, indices: [19, 20, 21, 22, 23]}
     crafter_wm:
       inventory_value_mode: categorical_absolute
       inventory_output_mode: categorical_gate
@@ -276,11 +292,8 @@ domains:
         mode: learned_detached
       artifact_suffix: ""
     reward:
-      contact_bce: 1
-      total_loss: 1.0
+      learning_progress: 1.0
       div: 2.0
-      survival: 0.01
-      bias: 0.0
       clip: 30.0
     contact_positive_ratio: 0.5  # Ratio of contact=1 samples in Fisher Buffer label balancing
     history_len: 10
@@ -395,7 +408,7 @@ attention_model:
 
   # Model save/load
   freeze_weight: False
-  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/mac_attention_world_model_${domain}_${ablation.type}_seed${seed}.ckpt
+  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/mac_attention_world_model_${domain}_${ablation.type}${oc.select:domains.${domain}.reward_artifact_suffix,}_seed${seed}.ckpt
 
   # Visualization
   visualization: False

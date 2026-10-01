@@ -467,6 +467,10 @@ def adversarial_ued_training(cfg: DictConfig):
         summary_csv_path = log_dir / (
             f"mac_crafter_lp_layout_stage_novelty_results{ablation_suffix}{metric_suffix}.csv"
         )
+    elif env_type == "bipedalwalker":
+        summary_csv_path = log_dir / (
+            f"bipedalwalker_ued_lp_g1_results{mask_suffix}{ablation_suffix}{metric_suffix}.csv"
+        )
     else:
         summary_csv_path = log_dir / f"{env_type}_ued_results{mask_suffix}{ablation_suffix}{metric_suffix}.csv"
     if ablation_suffix or metric_suffix or env_type != "crafter":
@@ -554,6 +558,7 @@ def adversarial_ued_training(cfg: DictConfig):
             "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
             "gen_val_contact_acc", "gen_val_contact_bce", "gen_val_avg_val_loss_wm",
             "target_val_contact_acc", "target_val_contact_bce", "target_val_avg_val_loss_wm",
+            "Pre_WM_Loss", "Post_WM_Loss", "Learning_Progress", "LP_Probe_Count",
             "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
         ]
     elif is_minigrid:
@@ -1155,6 +1160,10 @@ def adversarial_ued_training(cfg: DictConfig):
         else:
             if is_crafter:
                 gen_interface.finalize_crafter_learning_progress(apply_rewards=not is_warmup_for_wm)
+            elif is_bipedal:
+                gen_interface.finalize_bipedal_learning_progress(
+                    apply_rewards=not is_warmup_for_wm
+                )
             gen_loss, gen_entropy, gen_mean_reward = gen_interface.update(iteration=iteration)
             print(
                 f"[Generator] Policy Updated. Loss: {gen_loss:.4f} | "
@@ -1420,6 +1429,10 @@ def adversarial_ued_training(cfg: DictConfig):
                             "target_val_contact_acc": f"{target_val_contact_acc:.6f}",
                             "target_val_contact_bce": f"{target_val_contact_bce:.6f}",
                             "target_val_avg_val_loss_wm": f"{target_val_avg_val_loss_wm:.6f}",
+                            "Pre_WM_Loss": f"{getattr(gen_interface, 'last_bipedal_metrics', {}).get('Pre_WM_Loss', float('nan')):.6f}",
+                            "Post_WM_Loss": f"{getattr(gen_interface, 'last_bipedal_metrics', {}).get('Post_WM_Loss', float('nan')):.6f}",
+                            "Learning_Progress": f"{getattr(gen_interface, 'last_bipedal_metrics', {}).get('Learning_Progress', float('nan')):.6f}",
+                            "LP_Probe_Count": int(getattr(gen_interface, 'last_bipedal_metrics', {}).get('paired_probe_count', 0)),
                             "New_Data_Size": new_data_size,
                             "Buffer_Size": len(fisher_buffer),
                             "Solvable_Count": f"{gen_solvable_count}",
