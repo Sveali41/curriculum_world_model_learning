@@ -600,6 +600,7 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
             "gen_val_contact_acc", "gen_val_contact_bce", "gen_val_avg_val_loss_wm",
             "target_val_contact_acc", "target_val_contact_bce", "target_val_avg_val_loss_wm",
+            "target_val_contact_changed_loss",
             "Pre_WM_Loss", "Post_WM_Loss", "Learning_Progress", "LP_Probe_Count",
             "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
         ]
@@ -748,6 +749,11 @@ def run_dr_baseline_experiment(cfg: DictConfig):
 
             print(f"  [Generator] Collected {len(valid_trajs)} valid trajectories.")
             if not valid_trajs:
+                if is_bipedal:
+                    raise RuntimeError(
+                        f"Bipedal DR iteration {iteration + 1} produced no valid trajectories. "
+                        "See the rollout errors above; check the BipedalWalker/Box2D runtime dependencies."
+                    )
                 print("  [Skip] No valid trajectories collected.")
                 continue
             new_batch = convert_trajectories_to_batch(valid_trajs)
@@ -939,6 +945,7 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         target_val_field_losses = {
             name: float("nan") for name in MINIGRID_VAL_LOSS_FIELDS
         }
+        target_val_contact_changed_loss = float("nan")
         target_val_focal_loss = 0.0
         target_val_changed_focal_loss = 0.0
         target_val_false_set_rate = 0.0
@@ -982,6 +989,7 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                 if is_bipedal:
                     target_val_contact_acc = val_summary.get("contact_acc", 0.0)
                     target_val_contact_bce = val_summary.get("contact_bce", 0.0)
+                    target_val_contact_changed_loss = val_summary["contact_changed_loss"]
                     target_val_val_ce_loss = 0.0
                     target_val_val_inv_loss = 0.0
                     print(f"    -> Results: Avg Loss = {target_val_avg_val_loss_wm:.5f}")
@@ -1112,6 +1120,7 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                 "gen_val_avg_val_loss_wm": gen_val_avg_val_loss_wm,
                 "target_val_contact_acc": target_val_contact_acc, "target_val_contact_bce": target_val_contact_bce,
                 "target_val_avg_val_loss_wm": target_val_avg_val_loss_wm,
+                "target_val_contact_changed_loss": target_val_contact_changed_loss,
                 "Pre_WM_Loss": getattr(generator, "last_bipedal_metrics", {}).get("Pre_WM_Loss", float("nan")),
                 "Post_WM_Loss": getattr(generator, "last_bipedal_metrics", {}).get("Post_WM_Loss", float("nan")),
                 "Learning_Progress": getattr(generator, "last_bipedal_metrics", {}).get("Learning_Progress", float("nan")),

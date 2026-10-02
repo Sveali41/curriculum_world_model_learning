@@ -42,6 +42,8 @@ wm/tests
 
 # Keep experiment launch code in Git while excluding generated test results.
 test/*
+!test/bipedal_dr/
+test/bipedal_dr/seed0/
 !test/crafter_dr_mac_50/
 test/crafter_dr_mac_50/results/
 !test/minigrid_mpc_k_sweep/

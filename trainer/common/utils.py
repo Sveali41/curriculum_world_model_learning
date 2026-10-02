@@ -699,6 +699,8 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
     terrain_losses = []
     contact_accs = []
     contact_bces = []
+    contact_changed_losses = []
+    original_bipedal_losses = []
     is_bipedal = (getattr(cfg.attention_model, "env_type", "") == "bipedalwalker")
     is_crafter = (getattr(cfg.attention_model, "env_type", "") == "crafter")
     is_minigrid = (getattr(cfg.attention_model, "env_type", "") == "minigrid")
@@ -747,11 +749,32 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
         contact_acc = float(metrics.get('val/contact_acc', 0.0))
         contact_bce = float(metrics.get('val/contact_bce', 0.0))
 
+        if is_bipedal:
+            original_bipedal_losses.append(main_loss)
+            # Replace only the contact terms; retain the schema's equal field weights.
+            target_terms = []
+            for spec in validation_cfg.attention_model.observation_schema:
+                name = str(spec["name"])
+                metric = (f"val/{name}_switch_focal_loss"
+                          if str(spec.get("prediction_source", "")) == "contact_logits"
+                          else f"val/{name}_nll")
+                if metric not in metrics:
+                    raise RuntimeError(f"Bipedal target validation requires metric {metric!r}")
+                target_terms.append(float(metrics[metric]))
+            if not target_terms:
+                raise RuntimeError("Bipedal target validation requires a nonempty observation_schema")
+            main_loss = float(np.mean(target_terms))
+
         losses.append(main_loss)
         terrain_losses.append(t_loss)
         inv_losses.append(i_loss)
         contact_accs.append(contact_acc)
         contact_bces.append(contact_bce)
+        if is_bipedal:
+            # Match the existing equal weighting of observation fields and tasks.
+            leg_losses = [float(metrics.get(f"val/leg{leg}_contact_switch_focal_loss", float("nan")))
+                          for leg in (1, 2)]
+            contact_changed_losses.append(float(np.mean(leg_losses)))
         if is_minigrid:
             minigrid_focal_losses.append(float(metrics.get("val/observation_loss", 0.0)))
             minigrid_changed_focal_losses.append(float(metrics.get("val/changed_focal_loss", 0.0)))
@@ -820,6 +843,8 @@ def validate_on_target_task(cfg, net, old_params, data_save_dir, target_file, ph
     if is_bipedal:
         result['contact_acc'] = float(np.mean(contact_accs))
         result['contact_bce'] = float(np.mean(contact_bces))
+        result['contact_changed_loss'] = float(np.mean(contact_changed_losses))
+        result['original_avg_val_loss_wm'] = float(np.mean(original_bipedal_losses))
     if is_minigrid:
         result['focal_loss'] = float(np.mean(minigrid_focal_losses)) if minigrid_focal_losses else 0.0
         result['changed_focal_loss'] = float(np.mean(minigrid_changed_focal_losses)) if minigrid_changed_focal_losses else 0.0
@@ -854,6 +879,8 @@ def validate_on_all_targets(
     terrain_losses = []
     contact_accs = []
     contact_bces = []
+    contact_changed_losses = []
+    original_bipedal_losses = []
     minigrid_field_losses = {name: [] for name in MINIGRID_VAL_LOSS_FIELDS}
     minigrid_focal_losses = []
     minigrid_changed_focal_losses = []
@@ -903,6 +930,9 @@ def validate_on_all_targets(
             inv_losses.append(inv_val)
             contact_accs.append(c_acc)
             contact_bces.append(c_bce)
+            if is_bipedal:
+                contact_changed_losses.append(float(res["contact_changed_loss"]))
+                original_bipedal_losses.append(float(res["original_avg_val_loss_wm"]))
             for name in MINIGRID_VAL_LOSS_FIELDS:
                 value = float(res.get(name, float("nan")))
                 if np.isfinite(value):
@@ -937,6 +967,8 @@ def validate_on_all_targets(
                 "inventory_loss": inv_val,
                 "contact_acc": c_acc,
                 "contact_bce": c_bce,
+                **({"contact_changed_loss": float(res["contact_changed_loss"]),
+                    "original_avg_val_loss_wm": float(res["original_avg_val_loss_wm"])} if is_bipedal else {}),
                 **({name: float(res.get(name, 0.0)) for name in CRAFTER_INVENTORY_VAL_METRICS}
                    if is_crafter else {}),
                 **({name: float(res.get(name, float("nan"))) for name in CRAFTER_FOCAL_VAL_METRICS}
@@ -968,6 +1000,8 @@ def validate_on_all_targets(
     elif is_bipedal:
         result["contact_acc"] = float(np.mean(contact_accs)) if valid_count > 0 else 0.0
         result["contact_bce"] = float(np.mean(contact_bces)) if valid_count > 0 else 0.0
+        result["contact_changed_loss"] = float(np.mean(contact_changed_losses)) if valid_count > 0 else float("nan")
+        result["original_avg_val_loss_wm"] = float(np.mean(original_bipedal_losses)) if valid_count > 0 else float("nan")
     else:
         result["terrain_loss"] = float(np.mean(terrain_losses)) if valid_count > 0 else 0.0
         result["inventory_loss"] = float(np.mean(inv_losses)) if valid_count > 0 else 0.0

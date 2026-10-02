@@ -558,6 +558,7 @@ def adversarial_ued_training(cfg: DictConfig):
             "Seed", "Iter", "Gen_Mean_Reward", "Gen_Loss", "Gen_Entropy", "Gen_Div_Reward",
             "gen_val_contact_acc", "gen_val_contact_bce", "gen_val_avg_val_loss_wm",
             "target_val_contact_acc", "target_val_contact_bce", "target_val_avg_val_loss_wm",
+            "target_val_contact_changed_loss",
             "Pre_WM_Loss", "Post_WM_Loss", "Learning_Progress", "LP_Probe_Count",
             "New_Data_Size", "Buffer_Size", "Solvable_Count", "Avg_Path_Len",
         ]
@@ -1201,6 +1202,7 @@ def adversarial_ued_training(cfg: DictConfig):
         target_val_field_losses = {
             name: float("nan") for name in MINIGRID_VAL_LOSS_FIELDS
         }
+        target_val_contact_changed_loss = float("nan")
         target_val_focal_loss = 0.0
         target_val_changed_focal_loss = 0.0
         target_val_false_set_rate = 0.0
@@ -1227,6 +1229,7 @@ def adversarial_ued_training(cfg: DictConfig):
             target_avg_losses = []
             target_contact_accs = []
             target_contact_bces = []
+            target_contact_changed_losses = []
             target_field_loss_values = {
                 name: [] for name in MINIGRID_VAL_LOSS_FIELDS
             }
@@ -1286,6 +1289,7 @@ def adversarial_ued_training(cfg: DictConfig):
                     if is_bipedal:
                         target_contact_accs.append(res_dict.get('contact_acc', 0.0))
                         target_contact_bces.append(res_dict.get('contact_bce', 0.0))
+                        target_contact_changed_losses.append(res_dict['contact_changed_loss'])
                     elif not is_minigrid:
                         target_ce_losses.append(res_dict.get('terrain_loss', 0.0))
                         target_inv_losses.append(res_dict.get('inventory_loss', 0.0))
@@ -1317,6 +1321,7 @@ def adversarial_ued_training(cfg: DictConfig):
                 target_val_valid_count = len(target_avg_losses)
                 target_val_avg_val_loss_wm = float(np.mean(target_avg_losses))
                 if is_bipedal:
+                    target_val_contact_changed_loss = float(np.mean(target_contact_changed_losses))
                     target_val_contact_acc = float(np.mean(target_contact_accs)) if target_contact_accs else 0.0
                     target_val_contact_bce = float(np.mean(target_contact_bces)) if target_contact_bces else 0.0
                     print(f"[Metrics] Combined Target Loss -> Total: {target_val_avg_val_loss_wm:.4f} | Contact Acc: {target_val_contact_acc:.4f} | Contact BCE: {target_val_contact_bce:.4f}")
@@ -1428,6 +1433,7 @@ def adversarial_ued_training(cfg: DictConfig):
                             "gen_val_avg_val_loss_wm": f"{gen_val_avg_val_loss_wm:.6f}",
                             "target_val_contact_acc": f"{target_val_contact_acc:.6f}",
                             "target_val_contact_bce": f"{target_val_contact_bce:.6f}",
+                            "target_val_contact_changed_loss": f"{target_val_contact_changed_loss:.6f}",
                             "target_val_avg_val_loss_wm": f"{target_val_avg_val_loss_wm:.6f}",
                             "Pre_WM_Loss": f"{getattr(gen_interface, 'last_bipedal_metrics', {}).get('Pre_WM_Loss', float('nan')):.6f}",
                             "Post_WM_Loss": f"{getattr(gen_interface, 'last_bipedal_metrics', {}).get('Post_WM_Loss', float('nan')):.6f}",
