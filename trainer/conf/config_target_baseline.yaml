@@ -40,6 +40,7 @@ domains:
     validation_metric: "mse_weighted"
 
   bipedalwalker:
+    target_validation_batch_size: 256
     n_phases: 20
     task_prefix: "bipedal_target_task_"
     data_path: ${oc.env:TRAINER_PATH}/data/bipedalwalker/target_tasks/
@@ -59,5 +60,5 @@ attention_model:
   ewc_ratio: 0.9              # bipedal:0.9 | crafter and minigrid: 0.9
   replay_frac: 1            # bipedal:0.7 | crafter and minigrid: 3
   # Validation-only batch size; training batch_size remains inherited as 64.
-  target_validation_batch_size: 512
+  target_validation_batch_size: ${oc.select:domains.${domain}.target_validation_batch_size,512}
   model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/target_attention_world_model_${domain}_${ablation.type}${domains.${domain}.crafter_wm.artifact_suffix}_seed${seed}.ckpt

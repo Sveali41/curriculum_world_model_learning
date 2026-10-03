@@ -50,5 +50,9 @@ p2e_log_dir: ${paths.results}/p2e/
 
 attention_model:
   # Validation-only batch size; training batch_size remains inherited as 64.
-  target_validation_batch_size: 512
+  target_validation_batch_size: ${oc.select:domains.${domain}.target_validation_batch_size,512}
   model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/p2e_attention_world_model_${domain}_${ablation.type}${domains.${domain}.crafter_wm.artifact_suffix}_seed${seed}.ckpt
+
+domains:
+  bipedalwalker:
+    target_validation_batch_size: 256

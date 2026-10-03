@@ -216,6 +216,7 @@ def run_target_baseline_experiment(cfg: DictConfig):
         csv_columns = [
             "Seed", "Iter", "Phase", "Trained_On", "data_size", "cumulative_data_size",
             "target_val_contact_acc", "target_val_contact_bce", "target_val_avg_val_loss_wm",
+            "target_val_contact_changed_loss",
             "Avg_Val_Total", "Buffer_Size",
         ]
         csv_domain_name = "bipedalwalker"
@@ -454,14 +455,18 @@ def run_target_baseline_experiment(cfg: DictConfig):
                 )
 
                 if val_summary["valid_count"] > 0:
-                    phase_metrics["target_val_avg_val_loss_wm"] = val_summary["avg_val_loss_wm"]
+                    # Match the original full validation objective in the MAC/DR runs.
+                    phase_metrics["target_val_avg_val_loss_wm"] = val_summary[
+                        "original_avg_val_loss_wm" if is_bipedal else "avg_val_loss_wm"
+                    ]
                     phase_metrics["target_val_valid_count"] = int(val_summary["valid_count"])
                     if not is_crafter:
-                        phase_metrics["Avg_Val_Total"] = val_summary["avg_val_loss_wm"]
+                        phase_metrics["Avg_Val_Total"] = phase_metrics["target_val_avg_val_loss_wm"]
                     
                     if is_bipedal:
                         phase_metrics["target_val_contact_acc"] = val_summary.get("contact_acc", 0.0)
                         phase_metrics["target_val_contact_bce"] = val_summary.get("contact_bce", 0.0)
+                        phase_metrics["target_val_contact_changed_loss"] = val_summary["contact_changed_loss"]
                         print(f"    -> Results: Avg C_ACC = {phase_metrics['target_val_contact_acc']:.5f}, Avg C_BCE = {phase_metrics['target_val_contact_bce']:.5f}, Avg Total = {phase_metrics['Avg_Val_Total']:.5f}")
                     elif is_crafter:
                         phase_metrics.update({

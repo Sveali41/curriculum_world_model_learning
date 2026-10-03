@@ -376,9 +376,10 @@ def p2e_baseline_experiment(cfg: DictConfig):
         summary_header = [
             "Seed", "Iter", "P2E_Mean_Reward", "P2E_Ensemble_Loss",
             "target_val_contact_acc", "target_val_contact_bce", "target_val_avg_val_loss_wm",
+            "target_val_contact_changed_loss",
             "New_Data_Size", "Buffer_Size", "Cumulative_Transitions", "TargetIdx", "CycleIdx", "TargetName"
         ]
-        file_non_empty = os.path.exists(summary_csv_path) and os.path.getsize(summary_csv_path) > 0
+        file_non_empty = _ensure_summary_csv_schema(summary_csv_path, summary_header)
     else:
         summary_header = [
             "Seed", "Iter", "P2E_Mean_Reward", "P2E_Ensemble_Loss",
@@ -715,10 +716,14 @@ def p2e_baseline_experiment(cfg: DictConfig):
                 VALID_TIMES=1,
             )
             if val_summary["valid_count"] > 0:
-                m_v = float(val_summary["avg_val_loss_wm"])
+                # Match the original full validation objective in the MAC/DR runs.
+                m_v = float(val_summary[
+                    "original_avg_val_loss_wm" if is_bipedal else "avg_val_loss_wm"
+                ])
                 if is_bipedal:
                     m_contact_acc = float(val_summary.get("contact_acc", np.nan))
                     m_contact_bce = float(val_summary.get("contact_bce", np.nan))
+                    m_contact_changed_loss = float(val_summary["contact_changed_loss"])
                 else:
                     m_inv_v = float(val_summary.get("inventory_loss", np.nan))
                     m_ce_v = float(val_summary.get("terrain_loss", np.nan))
@@ -753,6 +758,7 @@ def p2e_baseline_experiment(cfg: DictConfig):
                             m_contact_acc,
                             m_contact_bce,
                             m_v,
+                            m_contact_changed_loss,
                             batch_transitions,
                             len(fisher_buffer),
                             cumulative_transitions,
