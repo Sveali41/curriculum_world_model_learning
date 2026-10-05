@@ -110,7 +110,7 @@ domains:
     # Use ordinary closed doors only; locked-door actions/maps are disabled.
     locked_doors: false
     # Real-environment acquisition policy shared by MAC and DR generated tasks.
-    exploration_policy: random # "rmax"|"random"
+    exploration_policy: random # "rmax"|"random"|"p2e"
     rmax_like:
       # A/B option: "episodic" provides the visited map and persistent GRU
       # hidden state; "none" zeros both while retaining the same network size.
@@ -513,6 +513,13 @@ PPO:
   buffer_window_rounds: 1
   # Accumulate this many rounds before one on-policy generator update.
   update_every_rounds: 2
+
+# Used only when domains.minigrid.exploration_policy=p2e. The standalone P2E
+# baseline overrides these values in config_p2e.yaml.
+p2e:
+  num_models: 10
+  disag_lr: 1e-4
+  intrinsic_reward_scale: 1.0
 
 diagnostics:
   enabled: true

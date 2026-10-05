@@ -134,13 +134,14 @@ class GeneratorInterface:
         self.is_minigrid = not self.is_crafter and not self.is_bipedal
         minigrid_domain_cfg = getattr(getattr(cfg, "domains", None), "minigrid", None)
         self.minigrid_rmax_explorer = None
+        self.minigrid_p2e_explorer = None
         if self.is_minigrid:
             exploration_policy = str(
                 getattr(minigrid_domain_cfg, "exploration_policy", "random")
             ).lower()
-            if exploration_policy not in {"random", "rmax"}:
+            if exploration_policy not in {"random", "rmax", "p2e"}:
                 raise ValueError(
-                    "domains.minigrid.exploration_policy must be 'random' or 'rmax'"
+                    "domains.minigrid.exploration_policy must be 'random', 'rmax', or 'p2e'"
                 )
             if exploration_policy == "rmax":
                 explorer_backend = str(
@@ -167,6 +168,10 @@ class GeneratorInterface:
                         self.minigrid_rmax_explorer.checkpoint_path = dqn_checkpoint
                 if bool(getattr(minigrid_domain_cfg.rmax_like, "resume", False)):
                     self.minigrid_rmax_explorer.load_checkpoint()
+            elif exploration_policy == "p2e":
+                from generator.minigrid_p2e_explorer import MiniGridP2EExplorer
+
+                self.minigrid_p2e_explorer = MiniGridP2EExplorer(cfg, world_model, device)
 
         if self.is_crafter:
             # Crafter: use custom seeder, actions, and map sizes
@@ -3054,26 +3059,29 @@ class GeneratorInterface:
                  self.support.cfg.env.collect.visualize_save_path
              )
              try:
-                exploration_policy = self.minigrid_rmax_explorer
+                exploration_policy = self.minigrid_rmax_explorer or self.minigrid_p2e_explorer
                 if exploration_policy is not None:
-                    exploration_policy.set_training(bool(evaluate_wm))
-                    self.support.cfg.env.collect.data_type = "rmax"
-                    save_minienv_coverage = bool(
-                        getattr(
-                            self.cfg.domains.minigrid.rmax_like,
-                            "save_minienv_coverage",
-                            False,
+                    if self.minigrid_rmax_explorer is not None:
+                        exploration_policy.set_training(bool(evaluate_wm))
+                        self.support.cfg.env.collect.data_type = "rmax"
+                        save_minienv_coverage = bool(
+                            getattr(
+                                self.cfg.domains.minigrid.rmax_like,
+                                "save_minienv_coverage",
+                                False,
+                            )
                         )
-                    )
-                    self.support.cfg.env.collect.save_coverage_visualize = (
-                        save_minienv_coverage and bool(evaluate_wm)
-                    )
-                    self.support.cfg.env.collect.visualize_save_path = os.path.join(
-                        original_visualize_save_path,
-                        "minienv_coverage",
-                        str(self.agent_type),
-                        f"seed{int(getattr(self.cfg, 'seed', 0))}",
-                    )
+                        self.support.cfg.env.collect.save_coverage_visualize = (
+                            save_minienv_coverage and bool(evaluate_wm)
+                        )
+                        self.support.cfg.env.collect.visualize_save_path = os.path.join(
+                            original_visualize_save_path,
+                            "minienv_coverage",
+                            str(self.agent_type),
+                            f"seed{int(getattr(self.cfg, 'seed', 0))}",
+                        )
+                    else:
+                        self.support.cfg.env.collect.data_type = "p2e"
                 collection_start = time.perf_counter()
                 save_path = collect_data_general(
                     self.support.cfg,
@@ -3099,7 +3107,7 @@ class GeneratorInterface:
                 )
                 if env_type == "crafter":
                     self.crafter_timing["collection"] += time.perf_counter() - collection_start
-                if exploration_policy is not None and evaluate_wm:
+                if self.minigrid_rmax_explorer is not None and evaluate_wm:
                     map_object = np.asarray(map_np)
                     # Lava is a terminal hazard, not a coverage target. Keep
                     # it out of both the denominator and the visited count.
@@ -3164,6 +3172,13 @@ class GeneratorInterface:
 
              # Load trajectory first. Even if validation later fails, keep the rollout.
              task_npz = np.load(save_path, allow_pickle=True)
+             if self.minigrid_p2e_explorer is not None and evaluate_wm:
+                 ensemble_loss = self.minigrid_p2e_explorer.finish_rollout(task_npz)
+                 print(
+                     f"[MiniGrid P2E] transitions={len(task_npz['a'])} "
+                     f"ensemble_loss={ensemble_loss:.5f} "
+                     f"ppo_updates={self.minigrid_p2e_explorer.update_count}"
+                 )
              traj = {
                  'obs': torch.tensor(task_npz['a'], device=self.device),
                  'obs_next': torch.tensor(task_npz['b'], device=self.device),
@@ -3226,6 +3241,10 @@ class GeneratorInterface:
 
              return traj, error_dict, mean_loss, solved, mean_aux_metric, mean_inv_loss, inv_changed_slots, avg_ep_len, shortest_dist
         except Exception as e:
+             if self.minigrid_p2e_explorer is not None and evaluate_wm:
+                 raise RuntimeError(
+                     f"MiniGrid P2E rollout failed at iteration {iter}, map {idx}"
+                 ) from e
              print(f"[GeneratorInterface] Rollout failed for env_type={env_type}, iter={iter}, idx={idx}: {e}")
              traceback.print_exc()
              return {}, {
