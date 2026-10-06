@@ -288,11 +288,16 @@ def main() -> int:
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--jobs", type=int, default=1,
                         help="Maximum number of independent MPC cases to run concurrently")
+    parser.add_argument("--no-early-replan", action="store_true",
+                        help="Execute the planned prefix despite prediction mismatches; replan after K actions")
     parser.add_argument("--output-root", type=Path, default=RESULTS / "mpc_crafter_dr_mac_50")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true", help="Rerun completed cases")
     args = parser.parse_args()
+    guidance = dict(GUIDANCE)
+    if args.no_early_replan:
+        guidance["crafter_stop_on_prediction_mismatch"] = False
     arms = list(dict.fromkeys(part.strip() for part in args.arms.split(",") if part.strip()))
     if not arms or set(arms) - set(ARMS):
         parser.error("--arms must contain dr, mac, target and/or p2e")
@@ -332,7 +337,7 @@ def main() -> int:
                         "episodes": args.episodes, "eval_seed": args.eval_seed,
                         "max_episode_steps": args.max_episode_steps, "population": args.population,
                         "elite_count": args.elite_count, "iterations": args.iterations,
-                        "guidance": GUIDANCE,
+                        "guidance": guidance,
                     }
                     command = [
                         args.python, "-u", "-m", "modelBased.policy_training.planners.mpc_planner",
@@ -345,7 +350,7 @@ def main() -> int:
                         f"PPO.mpc.iterations={args.iterations}", "PPO.mpc.print_every_steps=512",
                         f"PPO.mpc.crafter_output_dir={case_dir}", f"hydra.run.dir={case_dir / 'hydra'}",
                     ]
-                    command.extend(f"PPO.mpc.{name}={str(value).lower()}" for name, value in GUIDANCE.items())
+                    command.extend(f"PPO.mpc.{name}={str(value).lower()}" for name, value in guidance.items())
                     if args.dry_run:
                         print(f"H{horizon}/K{execute} {arm} seed{seed} target{target}", flush=True)
                         print("[DRY RUN]", shlex.join(command), flush=True)

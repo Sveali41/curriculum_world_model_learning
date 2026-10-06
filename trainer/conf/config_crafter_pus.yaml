@@ -1,0 +1,39 @@
+# WAKER-inspired parameterized uncertainty sampling with Crafter Random exploration.
+defaults:
+  - config_dr
+  - _self_
+
+domain: crafter
+
+generator_agent:
+  total_iterations: 50
+  warmup_iterations: 0
+
+env:
+  collect:
+    data_type: random
+    save_env_visualize: false
+    save_coverage_visualize: false
+
+pus:
+  enabled: true
+  num_models: 3
+  uniform_fraction: 0.2
+  ema_alpha: 0.9
+  reservoir_per_theta: 64
+  history_train_samples: 1024
+  predictor_batch_size: 256
+
+dr_fast_ablation:
+  skip_learning_progress: true
+
+# The Crafter DR resume snapshot does not include PUS scores or predictor heads.
+save_iteration_state: false
+resume_training: false
+force_fresh_start: true
+
+dr_log_dir: ${paths.results}/crafter_pus/
+dr_temp_data_dir: ${domains.crafter.mini_tasks_temp_root}pus/
+
+attention_model:
+  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/pus_attention_world_model_crafter_${ablation.type}_seed${seed}.ckpt

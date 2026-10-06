@@ -1,7 +1,7 @@
 /modelBased/wandb/
 wandb/
 outputs/*
-!outputs/jupyter/
+outputs/jupyter/
 outputs/jupyter/*
 !outputs/jupyter/*.ipynb
 legacy/artifacts/

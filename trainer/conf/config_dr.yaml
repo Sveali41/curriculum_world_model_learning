@@ -32,10 +32,10 @@ attention_model:
   fisher_samples: 1000
   fisher_beta: 0.3
   scale_factor: 1.0
-  # Crafter DR only: retain observed interaction outcomes and softly rebalance
-  # historical replay. Other domains leave this opt-in path disabled in code.
+  # Match MAC's ordinary Fisher replay for the Crafter comparison.
+  # The settings below remain available for the prior replay ablation.
   crafter_transition_replay:
-    enabled: true
+    enabled: false
     balance_exponent: 0.35
     # Reserve a quarter of historical replay for observed inventory changes.
     # This changes replay composition only; current-iteration collection and
@@ -46,10 +46,10 @@ attention_model:
     # This affects historical replay only; collection remains uniformly random.
     include_changed_slot: true
     protected_slot_replay:
-      enabled: true
+      enabled: false
       min_samples_per_observed_slot: 32
   fisher_slot_stratified:
-    enabled: true
+    enabled: false
     min_samples_per_observed_slot: 16
   # Optional fixed non-target holdout. Keep disabled for the initial loss
   # ablation so DR uses its historical internal 90/10 validation split.

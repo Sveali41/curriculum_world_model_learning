@@ -1276,7 +1276,9 @@ def adversarial_ued_training(cfg: DictConfig):
                             seed, iteration + 1, Path(t_file).stem,
                             res_dict.get("crafter_event_confusion", []),
                         )
-                    target_avg_losses.append(res_dict['avg_val_loss_wm'])
+                    target_avg_losses.append(res_dict[
+                        'original_avg_val_loss_wm' if is_bipedal else 'avg_val_loss_wm'
+                    ])
                     if is_minigrid:
                         target_focal_losses.append(float(res_dict.get("focal_loss", 0.0)))
                         target_changed_focal_losses.append(float(res_dict.get("changed_focal_loss", 0.0)))

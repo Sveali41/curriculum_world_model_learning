@@ -359,6 +359,9 @@ def run_dr_baseline_experiment(cfg: DictConfig):
     is_bipedal = (domain_name == "bipedalwalker")
     is_minigrid = (domain_name == "minigrid")
     is_crafter = (domain_name == "crafter")
+    is_pus = bool(getattr(getattr(cfg, "pus", None), "enabled", False))
+    if is_pus and (not (is_minigrid or is_crafter) or int(cfg.generator_agent.wm_train_frequency) != 1):
+        raise ValueError("PUS requires MiniGrid or Crafter and one WM update per iteration")
     val_n_phases = int(getattr(d_cfg, "val_n_phases", getattr(d_cfg, "target_task_count", 20)))
     val_task_prefix = str(getattr(d_cfg, "val_task_prefix", getattr(d_cfg, "target_task_prefix", "target_task")))
     val_data_path = str(getattr(d_cfg, "val_data_path", getattr(d_cfg, "target_tasks_folder", "")))
@@ -373,7 +376,7 @@ def run_dr_baseline_experiment(cfg: DictConfig):
     )
     
     print(f"\n{'='*80}")
-    print(f"### [DR BASEMENT START] Domain: {domain_name.upper()} | Seed: {seed}")
+    print(f"### [{'PUS' if is_pus else 'DR'} BASEMENT START] Domain: {domain_name.upper()} | Seed: {seed}")
     print(f"{'='*80}\n")
 
     # Override Attention Model configs based on Domain
@@ -426,6 +429,13 @@ def run_dr_baseline_experiment(cfg: DictConfig):
     ckpt_path = cfg.attention_model.model_save_path
     force_fresh_start = bool(getattr(cfg, "force_fresh_start", False))
     resume_training = is_crafter and bool(getattr(cfg, "resume_training", False))
+    if is_pus and is_crafter and (
+        resume_training or bool(getattr(cfg, "save_iteration_state", False))
+    ):
+        raise ValueError(
+            "Crafter PUS does not support iteration-state resume; "
+            "set resume_training=false and save_iteration_state=false"
+        )
     if resume_training and force_fresh_start:
         raise ValueError("resume_training=true requires force_fresh_start=false")
     uses_minigrid_rmax = (
@@ -465,8 +475,17 @@ def run_dr_baseline_experiment(cfg: DictConfig):
     # 1. Initialization
     wm = AttentionWorldModel(cfg.attention_model).to(device)
 
-    # DR usually generates random maps via GeneratorInterface (agent_type='random')
-    generator = GeneratorInterface(wm, device, cfg, agent_type='random')
+    if is_pus:
+        if is_minigrid:
+            from generator.minigrid_pus import MiniGridPUSGenerator
+
+            generator = MiniGridPUSGenerator(wm, device, cfg)
+        else:
+            from generator.crafter_pus import CrafterPUSGenerator
+
+            generator = CrafterPUSGenerator(wm, device, cfg)
+    else:
+        generator = GeneratorInterface(wm, device, cfg, agent_type='random')
     if str(cfg.domain) == "minigrid":
         fisher_buffer = ReservoirReplayBuffer(
             max_size=cfg.attention_model.fisher_buffer_size,
@@ -491,13 +510,13 @@ def run_dr_baseline_experiment(cfg: DictConfig):
     mask_suffix = f"_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
     if is_minigrid:
         summary_csv_path = log_dir / (
-            f"dr_summary_minigrid_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
+            f"{'pus' if is_pus else 'dr'}_summary_minigrid_mask{int(getattr(cfg.attention_model, 'attention_mask_size', 0))}"
             "_focal_reservoir.csv"
         )
     elif is_crafter:
         ablation_type = str(getattr(getattr(cfg, "ablation", None), "type", "none"))
         ablation_suffix = "" if ablation_type == "none" else f"_{ablation_type}"
-        summary_csv_path = log_dir / f"dr_crafter_results{ablation_suffix}.csv"
+        summary_csv_path = log_dir / f"{'pus' if is_pus else 'dr'}_crafter_results{ablation_suffix}.csv"
     else:
         ewc_suffix = "_ewc_balanced_inventory" if bool(getattr(cfg.attention_model, "ewc_enabled", False)) else ""
         ewc_suffix += crafter_value_mode_suffix
@@ -518,6 +537,11 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         if transition_replay_enabled else None
     )
     resume_state_path = log_dir / f"crafter_dr_seed{seed}.resume.pt"
+    selection_csv_path = log_dir / "pus_selected_settings.csv" if is_pus else None
+    if is_pus and (summary_csv_path.exists() or selection_csv_path.exists()):
+        raise FileExistsError(
+            f"PUS output already exists in {log_dir}; use a fresh per-seed results directory"
+        )
     file_exists = False
 
     old_params, fisher = None, None
@@ -667,6 +691,8 @@ def run_dr_baseline_experiment(cfg: DictConfig):
         raise ValueError("dr_fast_ablation.paired_data_mode must be off, write, or read")
     if paired_data_mode != "off" and not is_crafter:
         raise ValueError("Paired batch mode is only supported for Crafter DR")
+    if is_pus and paired_data_mode != "off":
+        raise ValueError("PUS requires collecting its own parameter-labeled trajectories")
     paired_data_dir = Path(str(getattr(fast_cfg, "paired_data_dir", ""))) if paired_data_mode != "off" else None
     paired_train_seed = bool(getattr(fast_cfg, "paired_train_seed", False))
     if paired_train_seed and paired_data_mode == "off":
@@ -715,6 +741,13 @@ def run_dr_baseline_experiment(cfg: DictConfig):
             avg_path_len = 0.0
         else:
             trajs = generator.step(old_params=old_params, iteration=iteration)
+            if is_pus:
+                pd.DataFrame(generator.selection_rows).to_csv(
+                    selection_csv_path,
+                    mode="a",
+                    header=not selection_csv_path.exists(),
+                    index=False,
+                )
             # GeneratorInterface.step() returns a 9-tuple.
             if isinstance(trajs, tuple) and len(trajs) >= 7:
                 gen_val_avg_val_loss_wm = float(trajs[2])
@@ -919,6 +952,12 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                 else:
                     wm.load_state_dict(old_params.state_dict())
             generator.sync_world_model(wm.state_dict())
+            if is_pus:
+                ensemble_loss = generator.update_uncertainty(new_batch, valid_trajs)
+                print(
+                    f"  [PUS] ensemble_loss={ensemble_loss:.6f} "
+                    f"scored_settings={len(generator.scores)}/{len(generator.settings)}"
+                )
             if is_crafter and bool(getattr(cfg, "save_wm_update_checkpoints", False)):
                 snapshot = save_wm_update_snapshot(ckpt_path, cfg.dr_log_dir, iteration + 1)
                 print(f"  [Checkpoint] Saved WM update snapshot: {snapshot}")
@@ -985,7 +1024,9 @@ def run_dr_baseline_experiment(cfg: DictConfig):
 
             if val_summary["valid_count"] > 0:
                 target_val_valid_count = int(val_summary["valid_count"])
-                target_val_avg_val_loss_wm = val_summary["avg_val_loss_wm"]
+                target_val_avg_val_loss_wm = val_summary[
+                    "original_avg_val_loss_wm" if is_bipedal else "avg_val_loss_wm"
+                ]
                 if is_bipedal:
                     target_val_contact_acc = val_summary.get("contact_acc", 0.0)
                     target_val_contact_bce = val_summary.get("contact_bce", 0.0)
@@ -1283,7 +1324,7 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                 "rng": rng_state(),
             })
 
-    print(f"\n[DR DONE] Log: {summary_csv_path}")
+    print(f"\n[{'PUS' if is_pus else 'DR'} DONE] Log: {summary_csv_path}")
 
 if __name__ == "__main__":
     run_dr_baseline_experiment()
