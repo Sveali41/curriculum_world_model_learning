@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from generator.crafter_env_designer import CRAFTER_OBJ_MAP
+from generator.crafter_env_designer import CRAFTER_OBJ_MAP, CRAFTER_STATS_KEYS
 from generator.generator_interface import GeneratorInterface
 from modelBased.common import utils as wm_utils
 from modelBased.world_model.crafter_dynamics import get_crafter_agent_position
@@ -14,9 +14,10 @@ OBJECT_NAMES = (
     "tree", "stone", "coal", "iron", "diamond",
     "water", "table", "furnace", "plant", "cow",
 )
-# DR actions 0 and 1 both produce an empty inventory, so theta has five
-# distinct inventory conditions: empty and progression stages 1 through 4.
-NUM_SETTINGS = 3 ** len(OBJECT_NAMES) * 5
+RESOURCE_NAMES = tuple(CRAFTER_STATS_KEYS[4:10])
+# Map counts, exact initial resource counts, and the tool progression stage.
+# Resource counts override the resource part of the sampled stage inventory.
+NUM_SETTINGS = 3 ** len(OBJECT_NAMES) * 10 ** len(RESOURCE_NAMES) * 5
 
 
 def _numpy(value):
@@ -66,8 +67,9 @@ class CrafterPUSGenerator(GeneratorInterface):
         self.selection_rows = []
 
     def _sample_uniform_setting(self):
-        counts = tuple(int(value) for value in self.rng.integers(0, 3, size=len(OBJECT_NAMES)))
-        return (*counts, int(self.rng.integers(0, 5)))
+        map_counts = tuple(int(value) for value in self.rng.integers(0, 3, size=len(OBJECT_NAMES)))
+        resource_counts = tuple(int(value) for value in self.rng.integers(0, 10, size=len(RESOURCE_NAMES)))
+        return (*map_counts, *resource_counts, int(self.rng.integers(0, 5)))
 
     def _select_settings(self, iteration):
         if iteration == 0:
@@ -103,25 +105,29 @@ class CrafterPUSGenerator(GeneratorInterface):
 
     def generate_map(self, theta):
         theta = tuple(int(value) for value in theta)
-        if len(theta) != len(OBJECT_NAMES) + 1 or any(
-            count not in (0, 1, 2) for count in theta[:-1]
-        ) or theta[-1] not in range(5):
+        map_counts = theta[:len(OBJECT_NAMES)]
+        resource_counts = theta[len(OBJECT_NAMES):-1]
+        if (len(theta) != len(OBJECT_NAMES) + len(RESOURCE_NAMES) + 1
+            or any(count not in (0, 1, 2) for count in map_counts)
+            or any(count not in range(10) for count in resource_counts)
+            or theta[-1] not in range(5)):
             raise ValueError(f"Invalid Crafter PUS setting: {theta}")
         grid = self.seeder.generate()
         interior = grid[1:-1, 1:-1]
         interior[interior != CRAFTER_OBJ_MAP["agent"]] = CRAFTER_OBJ_MAP["grass"]
         positions = np.argwhere(grid == CRAFTER_OBJ_MAP["grass"])
-        if sum(theta[:-1]) > len(positions):
+        if sum(map_counts) > len(positions):
             raise ValueError(f"Crafter PUS setting {theta} exceeds editable cells")
         positions = positions[self.rng.permutation(len(positions))]
         offset = 0
-        for name, count in zip(OBJECT_NAMES, theta[:-1]):
+        for name, count in zip(OBJECT_NAMES, map_counts):
             for row, col in positions[offset:offset + count]:
                 grid[row, col] = CRAFTER_OBJ_MAP[name]
             offset += count
         stats = self._default_stats()
         if theta[-1]:
             stats[4:16] = self._sample_crafter_stage_inventory(theta[-1])
+        stats[4:10] = resource_counts
         return grid, stats
 
     def step(self, old_params, iteration=0):
@@ -146,7 +152,8 @@ class CrafterPUSGenerator(GeneratorInterface):
             trajectories.append(trajectory)
             self.selection_rows.append({
                 "Seed": int(self.cfg.seed), "Iter": iteration + 1, "Map": env_index,
-                **{f"n_{name}": count for name, count in zip(OBJECT_NAMES, theta[:-1])},
+                **{f"n_{name}": count for name, count in zip(OBJECT_NAMES, theta[:len(OBJECT_NAMES)])},
+                **{f"inventory_{name}": count for name, count in zip(RESOURCE_NAMES, theta[len(OBJECT_NAMES):-1])},
                 "inventory_stage": theta[-1],
                 "Selection_Mode": mode, "Selection_Probability": probability,
                 "Uncertainty": self.scores.get(theta, float("nan")),
