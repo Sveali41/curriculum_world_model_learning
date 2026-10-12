@@ -14,10 +14,9 @@ OBJECT_NAMES = (
     "tree", "stone", "coal", "iron", "diamond",
     "water", "table", "furnace", "plant", "cow",
 )
-RESOURCE_NAMES = tuple(CRAFTER_STATS_KEYS[4:10])
-# Map counts, exact initial resource counts, and the tool progression stage.
-# Resource counts override the resource part of the sampled stage inventory.
-NUM_SETTINGS = 3 ** len(OBJECT_NAMES) * 10 ** len(RESOURCE_NAMES) * 5
+INVENTORY_NAMES = tuple(CRAFTER_STATS_KEYS[4:16])
+# Map object counts and exact initial counts for all resources and tools.
+NUM_SETTINGS = 3 ** len(OBJECT_NAMES) * 10 ** len(INVENTORY_NAMES)
 
 
 def _numpy(value):
@@ -68,8 +67,8 @@ class CrafterPUSGenerator(GeneratorInterface):
 
     def _sample_uniform_setting(self):
         map_counts = tuple(int(value) for value in self.rng.integers(0, 3, size=len(OBJECT_NAMES)))
-        resource_counts = tuple(int(value) for value in self.rng.integers(0, 10, size=len(RESOURCE_NAMES)))
-        return (*map_counts, *resource_counts, int(self.rng.integers(0, 5)))
+        inventory_counts = tuple(int(value) for value in self.rng.integers(0, 10, size=len(INVENTORY_NAMES)))
+        return (*map_counts, *inventory_counts)
 
     def _select_settings(self, iteration):
         if iteration == 0:
@@ -106,11 +105,10 @@ class CrafterPUSGenerator(GeneratorInterface):
     def generate_map(self, theta):
         theta = tuple(int(value) for value in theta)
         map_counts = theta[:len(OBJECT_NAMES)]
-        resource_counts = theta[len(OBJECT_NAMES):-1]
-        if (len(theta) != len(OBJECT_NAMES) + len(RESOURCE_NAMES) + 1
+        inventory_counts = theta[len(OBJECT_NAMES):]
+        if (len(theta) != len(OBJECT_NAMES) + len(INVENTORY_NAMES)
             or any(count not in (0, 1, 2) for count in map_counts)
-            or any(count not in range(10) for count in resource_counts)
-            or theta[-1] not in range(5)):
+            or any(count not in range(10) for count in inventory_counts)):
             raise ValueError(f"Invalid Crafter PUS setting: {theta}")
         grid = self.seeder.generate()
         interior = grid[1:-1, 1:-1]
@@ -125,9 +123,7 @@ class CrafterPUSGenerator(GeneratorInterface):
                 grid[row, col] = CRAFTER_OBJ_MAP[name]
             offset += count
         stats = self._default_stats()
-        if theta[-1]:
-            stats[4:16] = self._sample_crafter_stage_inventory(theta[-1])
-        stats[4:10] = resource_counts
+        stats[4:16] = inventory_counts
         return grid, stats
 
     def step(self, old_params, iteration=0):
@@ -153,8 +149,7 @@ class CrafterPUSGenerator(GeneratorInterface):
             self.selection_rows.append({
                 "Seed": int(self.cfg.seed), "Iter": iteration + 1, "Map": env_index,
                 **{f"n_{name}": count for name, count in zip(OBJECT_NAMES, theta[:len(OBJECT_NAMES)])},
-                **{f"inventory_{name}": count for name, count in zip(RESOURCE_NAMES, theta[len(OBJECT_NAMES):-1])},
-                "inventory_stage": theta[-1],
+                **{f"inventory_{name}": count for name, count in zip(INVENTORY_NAMES, theta[len(OBJECT_NAMES):])},
                 "Selection_Mode": mode, "Selection_Probability": probability,
                 "Uncertainty": self.scores.get(theta, float("nan")),
                 "Transitions": len(trajectory["obs"]),

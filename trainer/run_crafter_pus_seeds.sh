@@ -32,6 +32,8 @@ fi
 
 job_dir="$script_dir"
 cd "$repo"
+export NUMBA_CACHE_DIR="$job_dir/numba_cache"
+mkdir -p "$NUMBA_CACHE_DIR"
 
 export TRAINER_ROOT="$repo"
 export PROJECT_ROOT="$repo"
@@ -61,6 +63,7 @@ for seed in 0 1 2 3 4; do
         dr_log_dir="$seed_dir/results" \
         dr_temp_data_dir="$seed_dir/temp" \
         paths.outputs="$seed_dir/artifacts" \
+        attention_model.model_save_path="$seed_dir/models/AttentionWM/pus_attention_world_model_crafter_none_seed${seed}.ckpt" \
         force_fresh_start=true \
         resume_training=false \
         > "$seed_dir/train.log" 2>&1; then

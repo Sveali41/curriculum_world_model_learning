@@ -921,7 +921,8 @@ def adversarial_ued_training(cfg: DictConfig):
             f"[Generator] Collected {num_valid_trajs} valid trajectories. Solvable: {gen_solvable_count} | Avg BFS: {gen_avg_bfs:.2f}"
         )
 
-        if num_valid_trajs == 0:
+        is_warmup_for_wm = iteration < warmup_iterations
+        if num_valid_trajs == 0 and not is_warmup_for_wm:
             print(
                 "[Warning] No valid trajectories this round. But we still update Generator with failure penalties!"
             )
@@ -931,7 +932,7 @@ def adversarial_ued_training(cfg: DictConfig):
         # --------------------------------------------------------
         # Step 2: Prepare buffer inputs
         # --------------------------------------------------------
-        new_batch = convert_trajectories_to_batch(valid_trajectories)
+        new_batch = None if is_warmup_for_wm else convert_trajectories_to_batch(valid_trajectories)
         # An empty trajectory list currently returns an empty legacy-shaped
         # batch with ``info=None``.  Do not send that placeholder through the
         # MiniGrid DataModule: it is not a legacy dataset and has no inventory
@@ -985,7 +986,7 @@ def adversarial_ued_training(cfg: DictConfig):
 
 
         # PPO remains delayed until after WM training so MiniGrid can measure
-        # held-out pre/post learning progress for this generated layout batch.
+        # pre/post learning progress on sampled current transitions for this generated layout batch.
         gen_loss = 0.0
         gen_entropy = 0.0
         gen_mean_reward = 0.0
@@ -996,7 +997,6 @@ def adversarial_ued_training(cfg: DictConfig):
         wm_final_loss = 0.0 # default if not trained
         
         # During warmup, skip world-model updates and data accumulation.
-        is_warmup_for_wm = (iteration < warmup_iterations)
         
         if (not is_warmup_for_wm) and (iteration % wm_train_frequency == 0) and (new_batch is not None):
             if bool(getattr(cfg, "wm_train_seed_per_update", False)):
@@ -1141,7 +1141,7 @@ def adversarial_ued_training(cfg: DictConfig):
                 "[System] World Model updated, reloaded, and synced to Generator."
             )
 
-        # Evaluate held-out post-loss and apply LP + diversity before PPO.
+        # Evaluate post-loss on the fixed sampled transitions and apply LP + diversity before PPO.
         if is_minigrid:
             gen_interface.finalize_minigrid_rewards()
             # For MiniGrid, expose the first (learning-progress) component of

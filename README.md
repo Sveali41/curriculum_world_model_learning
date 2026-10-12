@@ -128,13 +128,25 @@ python trainer/mac_wm_learning.py domain=<domain> seed=0
 ```
 *Ablations: append `ablation.type=no_history` or `ablation.type=no_diversity`.*
 
-Generator diagnostics are written beside the MAC CSV (`*.manifest.json` and
-`*.maps.jsonl`). After a run, create a report without retraining:
+MAC uses `generator_agent.warmup_iterations` rounds for generator diversity
+warmup in Crafter, MiniGrid, and BipedalWalker, without collecting environment
+transitions or LP probes. WM training and replay begin after warmup, followed
+by normal collection and pre/post WM learning-progress evaluation.
+The MiniGrid exploration policy also remains idle during warmup. Generator
+warmup still uses compute.
 
-```bash
-python trainer/analyze_mac_diagnostics.py \
-  --mac <mac-csv> --dr <dr-csv> --output <report-dir>
-```
+For LP, each environment reuses a random 40% subset of its collected
+transitions, without a separate probe rollout or exclusion from WM training
+and replay. The same subset is evaluated before and after the WM update.
+Sampling is without replacement, deterministic for the experiment seed,
+iteration, and environment index, and rounds the sample count up (at least
+one transition for a nonempty trajectory). The fraction is configured by
+`generator_agent.learning_progress_sample_fraction`. DR does not sample LP
+subsets or compute pre/post LP losses in any domain; its LP log fields are
+left unavailable (NaN).
+
+Generator diagnostics are written beside the MAC CSV (`*.manifest.json` and
+`*.maps.jsonl`).
 
 **2. DR baseline (domain randomization)**
 ```bash
@@ -172,8 +184,19 @@ The workspace output tree is organized as follows:
 
 - `outputs/hydra/`: Hydra run logs and multiruns
 - `outputs/results/`: MAC, DR, P2E, target-baseline, and continual-learning metrics
+- `outputs/planning/`: retained MPC evaluation results
 - `outputs/visualizations/`: dataset, environment, error, and model figures
 - `outputs/wandb/`: local Weights & Biases run files
+
+Historical experiments formerly stored in `test/` and `trainer/results/`
+now live alongside these outputs. Bipedal runs, Crafter DR/MAC comparisons,
+quick comparisons, and Bipedal contact focal ablations are under
+`outputs/results/`. MiniGrid MPC sweeps are under
+`outputs/planning/minigrid_mpc_k_sweep/`, and the former `test/results (1)/`
+is under `outputs/planning/minigrid_hk_comparison/`. Their metrics,
+checkpoints, datasets, and protocol records are retained. Saved run metadata
+may still contain the original `test/` or `trainer/results/` paths; these historical records were
+not rewritten.
 
 Generated datasets stay under `trainer/data/`, and reusable model checkpoints
 stay under `wm/modelBased/models/`; these are persistent inputs/artifacts rather

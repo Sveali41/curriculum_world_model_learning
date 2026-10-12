@@ -3,7 +3,6 @@ wandb/
 outputs/*
 outputs/jupyter/
 outputs/jupyter/*
-!outputs/jupyter/*.ipynb
 legacy/artifacts/
 .env
 .codex/
@@ -40,12 +39,7 @@ Curriculum_Learning_World_Models_AAMAS_2027_without_bipedal_continual_appendix/
 trainer/data
 wm/tests
 
-# Keep experiment launch code in Git while excluding generated test results.
-test/*
-!test/bipedal_dr/
-test/bipedal_dr/seed0/
-!test/crafter_dr_mac_50/
-test/crafter_dr_mac_50/results/
-!test/minigrid_mpc_k_sweep/
-test/minigrid_mpc_k_sweep/results/
 *.resume.pt
+
+submission_artifacts/
+.aws/

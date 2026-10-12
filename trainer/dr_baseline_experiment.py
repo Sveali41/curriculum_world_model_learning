@@ -966,15 +966,6 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                     torch.cuda.synchronize(device)
                 wm_train_seconds = time.perf_counter() - wm_train_start
 
-        # Keep DR's held-out LP diagnostics aligned with MAC. DR has no PPO
-        # update, but the reward components remain comparable.
-        if is_minigrid:
-            generator.finalize_minigrid_rewards()
-        elif is_crafter:
-            generator.finalize_crafter_learning_progress(apply_rewards=False)
-        elif is_bipedal:
-            generator.finalize_bipedal_learning_progress(apply_rewards=False)
-
         # C. Validation on Target Tasks (aligned with MAC: validate every iter after warmup)
         warmup_iters = _safe_int_cfg(
             getattr(cfg.generator_agent, "warmup_iterations", 0),
@@ -1239,7 +1230,7 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                       for stage in range(5)
                       for metric in ("Count", "Mean_LP", "Reward_Std")),
                 )
-                row_data.update({name: 0.0 for name in skipped_lp_columns})
+                row_data.update({name: float("nan") for name in skipped_lp_columns})
 
         pd.DataFrame([row_data], columns=csv_columns).to_csv(
             summary_csv_path,
