@@ -93,7 +93,9 @@ domains:
     lambda_ewc: 5 #20000.0
     validation_metric: "mse"
     reward:
-      # Crafter MAC replaces instantaneous WM difficulty with current-transition LP.
+      # Crafter-only signal: lp = pre - post; preloss = pre-update loss.
+      signal_mode: lp # lp | preloss
+      # Shared signal weight; split normalization and novelty weights are unchanged.
       learning_progress: 1.0
       ce: 6.0
       inv: 3.0

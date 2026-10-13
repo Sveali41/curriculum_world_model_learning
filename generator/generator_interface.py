@@ -350,6 +350,7 @@ class GeneratorInterface:
         self.max_elites = max(1, self.batch_size // 2)
         self.prev_data = None
         self.crafter_reward_cfg = self._get_crafter_reward_cfg()
+        self.crafter_reward_signal_mode = self._get_crafter_reward_signal_mode()
         self.bipedal_reward_cfg = self._get_bipedal_reward_cfg()
         self.minigrid_reward_cfg = minigrid_reward_cfg
         self.learning_progress_sample_fraction = float(
@@ -654,6 +655,15 @@ class GeneratorInterface:
             return {}
         reward_cfg = getattr(crafter_cfg, "reward", None)
         return reward_cfg if reward_cfg is not None else {}
+
+    def _get_crafter_reward_signal_mode(self):
+        mode = str(getattr(self.crafter_reward_cfg, "signal_mode", "lp")).lower()
+        if mode not in {"lp", "preloss"}:
+            raise ValueError(
+                "domains.crafter.reward.signal_mode must be 'lp' or 'preloss', "
+                f"got {mode!r}"
+            )
+        return mode
 
     def _get_bipedal_reward_cfg(self):
         if not self.is_bipedal:
@@ -1694,6 +1704,10 @@ class GeneratorInterface:
         )
         post, feedback, post_components = post_result if len(post_result) == 3 else (post_result[0], None, post_result[1])
         pre_changed_focal_loss, post_changed_focal_loss, learning_progress, paired = self._aggregate_crafter_learning_progress(pre, post)
+        signal_mode = getattr(self, "crafter_reward_signal_mode", "lp")
+        use_preloss = signal_mode == "preloss"
+        reward_signal = pre if use_preloss else pre - post
+        reward_signal_mask = np.isfinite(pre) if use_preloss else paired
         component_arrays = {}
         component_metrics = {}
         for group in ("layout", "inventory"):
@@ -1718,10 +1732,16 @@ class GeneratorInterface:
         inventory_before, inventory_after, inventory_paired = component_arrays["inventory"]
         layout_lp = np.zeros(self.batch_size, dtype=np.float32)
         inventory_lp = np.zeros(self.batch_size, dtype=np.float32)
-        layout_lp_mask = layout_paired & valid & environment_valid
-        inventory_lp_mask = inventory_paired & valid & environment_valid
-        layout_lp[layout_lp_mask] = layout_before[layout_lp_mask] - layout_after[layout_lp_mask]
-        inventory_lp[inventory_lp_mask] = inventory_before[inventory_lp_mask] - inventory_after[inventory_lp_mask]
+        # Legacy *_lp names below represent the selected reward signal; LP diagnostics
+        # continue to report actual pre - post differences in either mode.
+        layout_signal_mask = np.isfinite(layout_before) if use_preloss else layout_paired
+        inventory_signal_mask = np.isfinite(inventory_before) if use_preloss else inventory_paired
+        layout_lp_mask = layout_signal_mask & valid & environment_valid
+        inventory_lp_mask = inventory_signal_mask & valid & environment_valid
+        layout_signal = layout_before if use_preloss else layout_before - layout_after
+        inventory_signal = inventory_before if use_preloss else inventory_before - inventory_after
+        layout_lp[layout_lp_mask] = layout_signal[layout_lp_mask]
+        inventory_lp[inventory_lp_mask] = inventory_signal[inventory_lp_mask]
         layout_lp_scale = float("nan")
         inventory_lp_scale = float("nan")
         normalized_layout_lp = np.zeros(self.batch_size, dtype=np.float32)
@@ -1782,11 +1802,11 @@ class GeneratorInterface:
                     layout_reward += layout_lp_term
                     stage_reward += stage_lp_term
                 else:
-                    if valid[index] and paired[index]:
-                        layout_lp_term = weight * float(pre[index] - post[index])
+                    if valid[index] and reward_signal_mask[index]:
+                        layout_lp_term = weight * float(reward_signal[index])
                         layout_reward += layout_lp_term
                         reward_lp_values[index] = layout_lp_term
-                    if valid[index] and inventory_paired[index]:
+                    if valid[index] and inventory_signal_mask[index]:
                         stage_reward += weight * float(inventory_lp[index])
                 rewards.append(float(np.clip(layout_reward, -reward_clip, reward_clip)))
                 stage_rewards.append(float(np.clip(stage_reward, -reward_clip, reward_clip)))
@@ -1870,6 +1890,10 @@ class GeneratorInterface:
                 "pre_changed_focal_loss": float(pre[index]),
                 "post_changed_focal_loss": float(post[index]),
                 "learning_progress": float(pre[index] - post[index]) if paired[index] else float("nan"),
+                "reward_signal_mode": signal_mode,
+                "reward_signal": float(reward_signal[index]) if reward_signal_mask[index] else float("nan"),
+                "layout_reward_signal": float(layout_signal[index]) if layout_signal_mask[index] else float("nan"),
+                "inventory_reward_signal": float(inventory_signal[index]) if inventory_signal_mask[index] else float("nan"),
                 **{f"{group}_{field}": float(component_arrays[group][0 if field == "pre_changed_focal_loss" else 1][index])
                    for group in ("layout", "inventory") for field in ("pre_changed_focal_loss", "post_changed_focal_loss")},
                 **{f"{group}_learning_progress": float(component_arrays[group][0][index] - component_arrays[group][1][index])
@@ -1937,6 +1961,7 @@ class GeneratorInterface:
                 stage_signal_diagnostic, stage_post, stage_post_components
             )
         self.last_crafter_metrics = {
+            "Reward_Signal_Is_Preloss": int(use_preloss),
             "Pre_Changed_Focal_Loss": pre_changed_focal_loss,
             "Post_Changed_Focal_Loss": post_changed_focal_loss,
             "Learning_Progress": learning_progress,
