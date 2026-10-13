@@ -353,6 +353,7 @@ class GeneratorInterface:
         self.crafter_reward_signal_mode = self._get_crafter_reward_signal_mode()
         self.bipedal_reward_cfg = self._get_bipedal_reward_cfg()
         self.minigrid_reward_cfg = minigrid_reward_cfg
+        self.minigrid_reward_signal_mode = self._get_minigrid_reward_signal_mode()
         self.learning_progress_sample_fraction = float(
             getattr(hparams, "learning_progress_sample_fraction", 0.4)
         )
@@ -676,6 +677,15 @@ class GeneratorInterface:
             return {}
         reward_cfg = getattr(bipedal_cfg, "reward", None)
         return reward_cfg if reward_cfg is not None else {}
+
+    def _get_minigrid_reward_signal_mode(self):
+        mode = str(getattr(self.minigrid_reward_cfg, "signal_mode", "lp")).lower()
+        if mode not in {"lp", "preloss"}:
+            raise ValueError(
+                "domains.minigrid.reward.signal_mode must be 'lp' or 'preloss', "
+                f"got {mode!r}"
+            )
+        return mode
 
     def _get_minigrid_reward_cfg(self):
         if self.is_crafter or self.is_bipedal:
@@ -1378,7 +1388,7 @@ class GeneratorInterface:
         self.prev_data = (maps_tensor, feedback_tensor)
 
     def finalize_minigrid_rewards(self):
-        """Apply current-transition learning progress plus diversity to the pending PPO round."""
+        """Apply the selected current-transition signal plus diversity to the PPO round."""
         pending = self._pending_minigrid_round
         if not self.is_minigrid or pending is None:
             return
@@ -1394,6 +1404,10 @@ class GeneratorInterface:
             pending["history_maps"], post_error_maps, post_coverage_maps
         )
         learning_progress = pre_losses - post_losses
+        signal_mode = getattr(self, "minigrid_reward_signal_mode", "lp")
+        reward_signal = pre_losses if signal_mode == "preloss" else learning_progress
+        if signal_mode == "preloss" and not np.isfinite(reward_signal[valid]).all():
+            raise RuntimeError("MiniGrid preloss reward requires finite pre-update loss for every valid probe")
         # Reliability diagnostic: evaluate the same sampled probe on alternating
         # transitions. The full probe remains the actual PPO reward.
         lp_even = np.zeros(self.batch_size, dtype=np.float32)
@@ -1489,7 +1503,7 @@ class GeneratorInterface:
                 rewards.append(-5.0)
                 continue
             component = self._minigrid_reward_components(
-                learning_progress[index], combination_values[index],
+                reward_signal[index], combination_values[index],
                 random_feature_novelty=random_feature_values[index],
                 diversity_mode=diversity_mode,
                 learning_progress_weight=learning_progress_weight,
@@ -1497,6 +1511,8 @@ class GeneratorInterface:
                 path_length_score=path_length_scores[index],
                 path_length_weight=path_length_weight,
             )
+            # Keep the actual LP diagnostic separate from the selected reward input.
+            component["learning_progress"] = float(learning_progress[index])
             reward_components.append(component)
             rewards.append(float(component["total"]))
 
@@ -1528,6 +1544,8 @@ class GeneratorInterface:
                 "pre_changed_focal_loss": float(pre_losses[index]),
                 "post_changed_focal_loss": float(post_losses[index]),
                 "learning_progress": float(learning_progress[index]),
+                "reward_signal_mode": signal_mode,
+                "reward_signal": float(reward_signal[index]),
                 "lp_even": float(lp_even[index]),
                 "lp_odd": float(lp_odd[index]),
                 "split_valid": bool(split_valid[index]),
