@@ -222,6 +222,10 @@ domains:
     reward:
       # MiniGrid signal on the same 40% subset: lp = pre - post; preloss = pre.
       signal_mode: lp # lp | preloss
+      # true: past-five-round RMS scaling, then equal 0.5/0.5 contributions.
+      # First round uses current-batch RMS; epsilon=1e-8. Legacy weights below
+      # apply only when normalized=false. no_diversity still disables diversity.
+      normalized: false
       # Shared signal weight; layout diversity is unchanged.
       learning_progress: 1.0
       diversity_mode: "random_feature_knn" # "random_feature_knn"|"action_hamming"

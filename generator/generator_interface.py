@@ -354,6 +354,9 @@ class GeneratorInterface:
         self.bipedal_reward_cfg = self._get_bipedal_reward_cfg()
         self.minigrid_reward_cfg = minigrid_reward_cfg
         self.minigrid_reward_signal_mode = self._get_minigrid_reward_signal_mode()
+        self._minigrid_reward_scale_history = {
+            "signal": deque(maxlen=5), "diversity": deque(maxlen=5),
+        }
         self.learning_progress_sample_fraction = float(
             getattr(hparams, "learning_progress_sample_fraction", 0.4)
         )
@@ -1290,6 +1293,7 @@ class GeneratorInterface:
         diversity_weight=1.0,
         path_length_score=0.0,
         path_length_weight=0.0,
+        diversity_scale=1.0,
     ):
         learning_progress = float(learning_progress)
         combination_novelty = float(np.clip(combination_novelty, 0.0, 1.0))
@@ -1302,11 +1306,11 @@ class GeneratorInterface:
         if diversity_mode == "random_feature_knn":
             reward_combination_novelty = 0.0
             reward_random_feature_novelty = (
-                diversity_weight * random_feature_novelty
+                diversity_weight * random_feature_novelty / diversity_scale
             )
         else:
             reward_combination_novelty = (
-                diversity_weight * combination_novelty
+                diversity_weight * combination_novelty / diversity_scale
             )
             reward_random_feature_novelty = 0.0
         reward_path_length = path_length_weight * path_length_score
@@ -1481,11 +1485,34 @@ class GeneratorInterface:
         path_length_weight = float(
             getattr(self.minigrid_reward_cfg, "path_length", 0.0)
         )
-        if self.ablation_type == "no_diversity" or diversity_weight <= 0.0:
+        normalized = bool(getattr(self.minigrid_reward_cfg, "normalized", False))
+        diversity_disabled = self.ablation_type == "no_diversity" or (
+            not normalized and diversity_weight <= 0.0
+        )
+        if diversity_disabled:
             novelty_ranks = np.zeros(self.batch_size, dtype=np.float32)
             diversity_weight = 0.0
         else:
             novelty_ranks = self._tie_aware_percentile_rank(novelty_values, valid)
+
+        signal_scale = diversity_scale = 1.0
+        reward_signal_input = reward_signal
+        if normalized:
+            if not np.isfinite(reward_signal[valid]).all() or not np.isfinite(novelty_values[valid]).all():
+                raise RuntimeError("MiniGrid normalized reward requires finite signal and diversity for valid probes")
+            history = self._minigrid_reward_scale_history
+            # Match the existing diversity component's [0, 1] range before scaling.
+            current = {"signal": reward_signal[valid].astype(np.float64),
+                       "diversity": np.clip(novelty_values[valid], 0.0, 1.0).astype(np.float64)}
+            scales = {}
+            for group, values in current.items():
+                reference = np.concatenate(list(history[group])) if history[group] else values
+                rms = float(np.sqrt(np.mean(reference ** 2))) if reference.size else 0.0
+                scales[group] = rms + 1e-8
+            signal_scale, diversity_scale = scales["signal"], scales["diversity"]
+            reward_signal_input = reward_signal / signal_scale
+            learning_progress_weight = 0.5
+            diversity_weight = 0.0 if diversity_disabled else 0.5
 
         reward_components = []
         rewards = []
@@ -1503,13 +1530,14 @@ class GeneratorInterface:
                 rewards.append(-5.0)
                 continue
             component = self._minigrid_reward_components(
-                reward_signal[index], combination_values[index],
+                reward_signal_input[index], combination_values[index],
                 random_feature_novelty=random_feature_values[index],
                 diversity_mode=diversity_mode,
                 learning_progress_weight=learning_progress_weight,
                 diversity_weight=diversity_weight,
                 path_length_score=path_length_scores[index],
                 path_length_weight=path_length_weight,
+                diversity_scale=diversity_scale,
             )
             # Keep the actual LP diagnostic separate from the selected reward input.
             component["learning_progress"] = float(learning_progress[index])
@@ -1546,6 +1574,9 @@ class GeneratorInterface:
                 "learning_progress": float(learning_progress[index]),
                 "reward_signal_mode": signal_mode,
                 "reward_signal": float(reward_signal[index]),
+                "reward_normalized": normalized,
+                "reward_signal_scale": signal_scale,
+                "reward_diversity_scale": diversity_scale,
                 "lp_even": float(lp_even[index]),
                 "lp_odd": float(lp_odd[index]),
                 "split_valid": bool(split_valid[index]),
@@ -1553,6 +1584,7 @@ class GeneratorInterface:
                 "random_feature_novelty": float(np.asarray(pending["random_feature_novelties"])[index]),
                 "combination_novelty": float(np.asarray(pending["combination_novelties"])[index]),
                 "reward_learning_progress": float(reward_components[index]["reward_learning_progress"]),
+                "reward_combination_novelty": float(reward_components[index]["reward_combination_novelty"]),
                 "reward_random_feature_novelty": float(reward_components[index]["reward_random_feature_novelty"]),
                 "reward_total": float(reward_components[index]["total"]),
             }
@@ -1561,6 +1593,9 @@ class GeneratorInterface:
         # finalize_minigrid_rewards refreshes last_minigrid_metrics; restore
         # the explorer coverage fields before MAC writes its CSV row.
         self._attach_minigrid_explorer_coverage()
+        if normalized:
+            for group, values in current.items():
+                history[group].append(values.copy())
         self._pending_minigrid_round = None
 
     def _evaluate_bipedal_probe_losses(self, trajectories, valid):
