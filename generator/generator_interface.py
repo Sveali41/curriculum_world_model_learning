@@ -354,6 +354,7 @@ class GeneratorInterface:
         self.bipedal_reward_cfg = self._get_bipedal_reward_cfg()
         self.minigrid_reward_cfg = minigrid_reward_cfg
         self.minigrid_reward_signal_mode = self._get_minigrid_reward_signal_mode()
+        self.minigrid_reward_normalization_mode = self._get_minigrid_reward_normalization_mode()
         self._minigrid_reward_scale_history = {
             "signal": deque(maxlen=5), "diversity": deque(maxlen=5),
         }
@@ -686,6 +687,15 @@ class GeneratorInterface:
         if mode not in {"lp", "preloss"}:
             raise ValueError(
                 "domains.minigrid.reward.signal_mode must be 'lp' or 'preloss', "
+                f"got {mode!r}"
+            )
+        return mode
+
+    def _get_minigrid_reward_normalization_mode(self):
+        mode = str(getattr(self.minigrid_reward_cfg, "normalization_mode", "rms")).lower()
+        if mode not in {"rms", "centered_std"}:
+            raise ValueError(
+                "domains.minigrid.reward.normalization_mode must be 'rms' or 'centered_std', "
                 f"got {mode!r}"
             )
         return mode
@@ -1294,6 +1304,7 @@ class GeneratorInterface:
         path_length_score=0.0,
         path_length_weight=0.0,
         diversity_scale=1.0,
+        diversity_offset=0.0,
     ):
         learning_progress = float(learning_progress)
         combination_novelty = float(np.clip(combination_novelty, 0.0, 1.0))
@@ -1306,11 +1317,11 @@ class GeneratorInterface:
         if diversity_mode == "random_feature_knn":
             reward_combination_novelty = 0.0
             reward_random_feature_novelty = (
-                diversity_weight * random_feature_novelty / diversity_scale
+                diversity_weight * (random_feature_novelty - diversity_offset) / diversity_scale
             )
         else:
             reward_combination_novelty = (
-                diversity_weight * combination_novelty / diversity_scale
+                diversity_weight * (combination_novelty - diversity_offset) / diversity_scale
             )
             reward_random_feature_novelty = 0.0
         reward_path_length = path_length_weight * path_length_score
@@ -1486,6 +1497,7 @@ class GeneratorInterface:
             getattr(self.minigrid_reward_cfg, "path_length", 0.0)
         )
         normalized = bool(getattr(self.minigrid_reward_cfg, "normalized", False))
+        normalization_mode = getattr(self, "minigrid_reward_normalization_mode", "rms")
         diversity_disabled = self.ablation_type == "no_diversity" or (
             not normalized and diversity_weight <= 0.0
         )
@@ -1496,6 +1508,7 @@ class GeneratorInterface:
             novelty_ranks = self._tie_aware_percentile_rank(novelty_values, valid)
 
         signal_scale = diversity_scale = 1.0
+        signal_mean = diversity_mean = 0.0
         reward_signal_input = reward_signal
         if normalized:
             if not np.isfinite(reward_signal[valid]).all() or not np.isfinite(novelty_values[valid]).all():
@@ -1504,13 +1517,22 @@ class GeneratorInterface:
             # Match the existing diversity component's [0, 1] range before scaling.
             current = {"signal": reward_signal[valid].astype(np.float64),
                        "diversity": np.clip(novelty_values[valid], 0.0, 1.0).astype(np.float64)}
+            if normalization_mode == "centered_std":
+                signal_mean = float(current["signal"].mean()) if current["signal"].size else 0.0
+                diversity_mean = float(current["diversity"].mean()) if current["diversity"].size else 0.0
+                current["signal"] -= signal_mean
+                current["diversity"] -= diversity_mean
             scales = {}
             for group, values in current.items():
                 reference = np.concatenate(list(history[group])) if history[group] else values
                 rms = float(np.sqrt(np.mean(reference ** 2))) if reference.size else 0.0
-                scales[group] = rms + 1e-8
+                if normalization_mode == "centered_std":
+                    batch_rms = float(np.sqrt(np.mean(values ** 2))) if values.size else 0.0
+                    scales[group] = max(rms, batch_rms, 1e-8)
+                else:
+                    scales[group] = rms + 1e-8
             signal_scale, diversity_scale = scales["signal"], scales["diversity"]
-            reward_signal_input = reward_signal / signal_scale
+            reward_signal_input = (reward_signal - signal_mean) / signal_scale
             learning_progress_weight = 0.5
             diversity_weight = 0.0 if diversity_disabled else 0.5
 
@@ -1538,6 +1560,7 @@ class GeneratorInterface:
                 path_length_score=path_length_scores[index],
                 path_length_weight=path_length_weight,
                 diversity_scale=diversity_scale,
+                diversity_offset=diversity_mean,
             )
             # Keep the actual LP diagnostic separate from the selected reward input.
             component["learning_progress"] = float(learning_progress[index])
@@ -1575,6 +1598,9 @@ class GeneratorInterface:
                 "reward_signal_mode": signal_mode,
                 "reward_signal": float(reward_signal[index]),
                 "reward_normalized": normalized,
+                "reward_normalization_mode": normalization_mode if normalized else "none",
+                "reward_signal_mean": signal_mean,
+                "reward_diversity_mean": diversity_mean,
                 "reward_signal_scale": signal_scale,
                 "reward_diversity_scale": diversity_scale,
                 "lp_even": float(lp_even[index]),
