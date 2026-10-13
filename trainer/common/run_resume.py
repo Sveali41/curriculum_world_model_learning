@@ -66,6 +66,10 @@ def generator_state(interface, include_policy):
         "diversity_archive": interface.diversity.archive,
         "diversity_model": interface.diversity.state_dict(),
     }
+    if bool(getattr(interface.crafter_reward_cfg, "normalized", False)):
+        state["reward_scale_history"] = {
+            key: list(values) for key, values in interface._crafter_reward_scale_history.items()
+        }
     if include_policy:
         ppo = interface.ppo
         state["ppo"] = {
@@ -85,6 +89,13 @@ def generator_state(interface, include_policy):
 
 
 def restore_generator(interface, state, include_policy):
+    if bool(getattr(interface.crafter_reward_cfg, "normalized", False)):
+        if "reward_scale_history" not in state:
+            raise ValueError("Crafter normalized reward resume requires saved reward_scale_history; cannot discard normalization history")
+        if set(state["reward_scale_history"]) != {"layout", "inventory", "diversity"}:
+            raise ValueError("Crafter normalization history must contain separate layout/inventory/diversity groups; old combined-signal state is incompatible")
+        for key, values in state["reward_scale_history"].items():
+            interface._crafter_reward_scale_history[key] = deque(values, maxlen=5)
     interface.prev_data = state["prev_data"]
     if interface.prev_data is not None:
         interface.prev_data = tuple(

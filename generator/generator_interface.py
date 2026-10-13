@@ -351,6 +351,11 @@ class GeneratorInterface:
         self.prev_data = None
         self.crafter_reward_cfg = self._get_crafter_reward_cfg()
         self.crafter_reward_signal_mode = self._get_crafter_reward_signal_mode()
+        self.crafter_reward_normalization_mode = self._get_crafter_reward_normalization_mode()
+        self._crafter_reward_scale_history = {
+            "layout": deque(maxlen=5), "inventory": deque(maxlen=5),
+            "diversity": deque(maxlen=5),
+        }
         self.bipedal_reward_cfg = self._get_bipedal_reward_cfg()
         self.minigrid_reward_cfg = minigrid_reward_cfg
         self.minigrid_reward_signal_mode = self._get_minigrid_reward_signal_mode()
@@ -666,6 +671,15 @@ class GeneratorInterface:
         if mode not in {"lp", "preloss"}:
             raise ValueError(
                 "domains.crafter.reward.signal_mode must be 'lp' or 'preloss', "
+                f"got {mode!r}"
+            )
+        return mode
+
+    def _get_crafter_reward_normalization_mode(self):
+        mode = str(getattr(self.crafter_reward_cfg, "normalization_mode", "centered_std")).lower()
+        if mode not in {"rms", "centered_std"}:
+            raise ValueError(
+                "domains.crafter.reward.normalization_mode must be 'rms' or 'centered_std', "
                 f"got {mode!r}"
             )
         return mode
@@ -1294,6 +1308,20 @@ class GeneratorInterface:
         return float(np.corrcoef(rx, ry)[0, 1])
 
     @staticmethod
+    def _reward_normalization_stats(values, history, mode):
+        current = np.asarray(values, dtype=np.float64).copy()
+        mean = float(current.mean()) if mode == "centered_std" and current.size else 0.0
+        current -= mean
+        reference = np.concatenate(list(history)) if history else current
+        rms = float(np.sqrt(np.mean(reference ** 2))) if reference.size else 0.0
+        if mode == "centered_std":
+            batch_rms = float(np.sqrt(np.mean(current ** 2))) if current.size else 0.0
+            scale = max(rms, batch_rms, 1e-8)
+        else:
+            scale = rms + 1e-8
+        return mean, scale, current
+
+    @staticmethod
     def _minigrid_reward_components(
         learning_progress,
         combination_novelty,
@@ -1517,20 +1545,12 @@ class GeneratorInterface:
             # Match the existing diversity component's [0, 1] range before scaling.
             current = {"signal": reward_signal[valid].astype(np.float64),
                        "diversity": np.clip(novelty_values[valid], 0.0, 1.0).astype(np.float64)}
-            if normalization_mode == "centered_std":
-                signal_mean = float(current["signal"].mean()) if current["signal"].size else 0.0
-                diversity_mean = float(current["diversity"].mean()) if current["diversity"].size else 0.0
-                current["signal"] -= signal_mean
-                current["diversity"] -= diversity_mean
-            scales = {}
+            scales, means = {}, {}
             for group, values in current.items():
-                reference = np.concatenate(list(history[group])) if history[group] else values
-                rms = float(np.sqrt(np.mean(reference ** 2))) if reference.size else 0.0
-                if normalization_mode == "centered_std":
-                    batch_rms = float(np.sqrt(np.mean(values ** 2))) if values.size else 0.0
-                    scales[group] = max(rms, batch_rms, 1e-8)
-                else:
-                    scales[group] = rms + 1e-8
+                means[group], scales[group], current[group] = self._reward_normalization_stats(
+                    values, history[group], normalization_mode
+                )
+            signal_mean, diversity_mean = means["signal"], means["diversity"]
             signal_scale, diversity_scale = scales["signal"], scales["diversity"]
             reward_signal_input = (reward_signal - signal_mean) / signal_scale
             learning_progress_weight = 0.5
@@ -1773,6 +1793,7 @@ class GeneratorInterface:
         pending = self._pending_crafter_round
         if not self.is_crafter or pending is None:
             return
+        normalized_reward = apply_rewards and bool(getattr(self.crafter_reward_cfg, "normalized", False))
         valid = np.asarray(pending["valid"], dtype=bool)
         environment_valid = np.asarray(pending.get("environment_valid", valid), dtype=bool)
         pre = np.asarray(pending["pre_changed_focal_losses"], dtype=np.float32)
@@ -1806,6 +1827,7 @@ class GeneratorInterface:
         stage_rewards = []
         balanced_mode = (
             apply_rewards and getattr(self, "crafter_credit_mode", "joint") == "split_balanced_global"
+            and not normalized_reward
         )
         layout_before, layout_after, layout_paired = component_arrays["layout"]
         inventory_before, inventory_after, inventory_paired = component_arrays["inventory"]
@@ -1830,6 +1852,37 @@ class GeneratorInterface:
         stage_reward_layout_lp = np.zeros(self.batch_size, dtype=np.float32)
         stage_reward_inventory_lp = np.zeros(self.batch_size, dtype=np.float32)
         reward_lp_values = np.zeros(self.batch_size, dtype=np.float32)
+        reward_div_values = np.asarray(pending.get("auxiliary_rewards", np.zeros(self.batch_size)), dtype=np.float32).copy()
+        normalized_wm_signal = np.zeros(self.batch_size, dtype=np.float32)
+        wm_component_count = np.zeros(self.batch_size, dtype=np.int64)
+        normalization_mode = getattr(self, "crafter_reward_normalization_mode", "centered_std")
+        normalization_stats = {}
+        normalized_inputs = {}
+
+        if normalized_reward:
+            if len(novelty_parts) != self.batch_size:
+                raise ValueError("Crafter normalized reward requires raw diversity for each environment")
+            if not np.isfinite(novelty[environment_valid]).all():
+                raise ValueError("Crafter normalized reward requires finite diversity for valid environments")
+            masks = {"layout": layout_lp_mask,
+                     "inventory": inventory_lp_mask,
+                     "diversity": environment_valid}
+            raw = {"layout": layout_signal, "inventory": inventory_signal,
+                   "diversity": np.clip(novelty, 0.0, 1.0)}
+            outputs = {group: np.zeros(self.batch_size, dtype=np.float32) for group in raw}
+            for group in raw:
+                mask = masks[group]
+                mean, scale, normalized_inputs[group] = self._reward_normalization_stats(
+                    raw[group][mask], self._crafter_reward_scale_history[group], normalization_mode
+                )
+                outputs[group][mask] = (raw[group][mask] - mean) / scale
+                normalization_stats[group] = {"mean": mean, "scale": scale}
+            wm_component_count = masks["layout"].astype(np.int64) + masks["inventory"].astype(np.int64)
+            np.divide(outputs["layout"] + outputs["inventory"], wm_component_count,
+                      out=normalized_wm_signal, where=wm_component_count > 0)
+            reward_div_values = .5 * outputs["diversity"]
+            if getattr(self, "ablation_type", "none") == "no_diversity":
+                reward_div_values[:] = 0.0
 
         if balanced_mode:
             scale_history = getattr(self, "_crafter_lp_scale_history", None)
@@ -1865,9 +1918,16 @@ class GeneratorInterface:
             reward_clip = float(getattr(self.crafter_reward_cfg, "clip", 100.0))
             for index in range(self.batch_size):
                 base_reward = -5.0 if not environment_valid[index] else float(pending["auxiliary_rewards"][index])
+                if normalized_reward and environment_valid[index]:
+                    base_reward = float(reward_div_values[index])
                 layout_reward = base_reward
                 stage_reward = base_reward
-                if balanced_mode:
+                if normalized_reward:
+                    if environment_valid[index]:
+                        reward_lp_values[index] = .5 * normalized_wm_signal[index]
+                        layout_reward += reward_lp_values[index]
+                        stage_reward += reward_lp_values[index]
+                elif balanced_mode:
                     if valid[index]:
                         layout_reward_layout_lp[index] = weight * 1.5 * normalized_layout_lp[index]
                         layout_reward_inventory_lp[index] = (
@@ -1909,6 +1969,9 @@ class GeneratorInterface:
                 ):
                     if mask.any():
                         scale_history[group].append(values[mask].copy())
+            if normalized_reward:
+                for group, values in normalized_inputs.items():
+                    self._crafter_reward_scale_history[group].append(values.copy())
         else:
             diagnostic_rewards = np.asarray(pending.get("rewards", []), dtype=np.float32)
             stage_rewards = diagnostic_rewards.tolist()
@@ -1916,7 +1979,7 @@ class GeneratorInterface:
         auxiliary_rewards = np.asarray(
             pending.get("auxiliary_rewards", np.zeros(self.batch_size)), dtype=np.float32
         )
-        novelty_contribution = np.where(environment_valid, auxiliary_rewards, 0.0).astype(np.float32)
+        novelty_contribution = np.where(environment_valid, reward_div_values, 0.0).astype(np.float32)
         layout_lp_abs = np.abs(layout_reward_layout_lp)
         layout_inventory_lp_abs = np.abs(layout_reward_inventory_lp)
         stage_layout_lp_abs = np.abs(stage_reward_layout_lp)
@@ -1970,6 +2033,14 @@ class GeneratorInterface:
                 "post_changed_focal_loss": float(post[index]),
                 "learning_progress": float(pre[index] - post[index]) if paired[index] else float("nan"),
                 "reward_signal_mode": signal_mode,
+                "reward_normalized": normalized_reward,
+                "reward_normalization_mode": normalization_mode if normalized_reward else "none",
+                "reward_normalization_stats": normalization_stats,
+                "reward_wm_component_count": int(wm_component_count[index]) if normalized_reward else None,
+                "reward_wm_signal": float(normalized_wm_signal[index]) if normalized_reward and wm_component_count[index] > 0 else float("nan"),
+                **({f"reward_normalized_{group}_signal": float(outputs[group][index])
+                   if masks[group][index] else float("nan") for group in ("layout", "inventory")}
+                if normalized_reward else {}),
                 "reward_signal": float(reward_signal[index]) if reward_signal_mask[index] else float("nan"),
                 "layout_reward_signal": float(layout_signal[index]) if layout_signal_mask[index] else float("nan"),
                 "inventory_reward_signal": float(inventory_signal[index]) if inventory_signal_mask[index] else float("nan"),
@@ -1982,7 +2053,7 @@ class GeneratorInterface:
                    for group in ("layout", "inventory")},
                 **(novelty_parts[index] if novelty_parts else {}),
                 "reward_learning_progress": float(reward_lp_values[index]) if apply_rewards else 0.0,
-                "reward_novelty": float(auxiliary_rewards[index]) if environment_valid[index] else 0.0,
+                "reward_novelty": float(reward_div_values[index]) if environment_valid[index] else 0.0,
                 "layout_lp_scale": layout_lp_scale,
                 "inventory_lp_scale": inventory_lp_scale,
                 "normalized_layout_lp": float(normalized_layout_lp[index]) if balanced_mode else float("nan"),

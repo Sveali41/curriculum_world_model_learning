@@ -95,6 +95,10 @@ domains:
     reward:
       # Crafter-only signal: lp = pre - post; preloss = pre-update loss.
       signal_mode: lp # lp | preloss
+      # Optional shared reward: normalize layout/inventory separately, average
+      # available WM components, then combine 0.5 WM + 0.5 joint diversity.
+      normalized: false
+      normalization_mode: centered_std # centered_std | rms
       # Shared signal weight; split normalization and novelty weights are unchanged.
       learning_progress: 1.0
       ce: 6.0
