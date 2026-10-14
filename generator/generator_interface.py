@@ -258,6 +258,9 @@ class GeneratorInterface:
                 buffer_window_rounds=int(getattr(ppo_cfg, "buffer_window_rounds", 1)) if ppo_cfg is not None else 1,
                 update_every_rounds=int(getattr(ppo_cfg, "update_every_rounds", 1)) if ppo_cfg is not None else 1,
                 crafter_credit_mode=self.crafter_credit_mode,
+                crafter_reward_normalized=(self.is_crafter and bool(
+                    getattr(self._get_crafter_reward_cfg(), "normalized", False)
+                )),
                 warmup_iterations=int(getattr(hparams, "warmup_iterations", 10)),
                 initial_edit_ratio=float(hparams.max_edits_layout),
                 initial_inventory_edit_ratio=float(hparams.max_edits_inventory),

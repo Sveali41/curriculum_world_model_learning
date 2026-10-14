@@ -40,6 +40,7 @@ class GeneratorPPO:
         edit_action_group_sizes=None,
         crafter_credit_mode="joint",
         warmup_iterations=0,
+        crafter_reward_normalized=False,
 
     ):
         self.gamma = gamma
@@ -60,6 +61,7 @@ class GeneratorPPO:
                 "crafter_credit_mode must be 'joint', 'split', or 'split_balanced_global'"
             )
         self.crafter_credit_mode = crafter_credit_mode
+        self.crafter_reward_normalized = bool(crafter_reward_normalized)
         self.warmup_iterations = max(0, int(warmup_iterations))
         # self.ratio = ratio # removed
         self.is_bipedal = (self.env_type == "bipedalwalker")
@@ -524,10 +526,6 @@ class GeneratorPPO:
         if split_active:
             old_stage_logprob = torch.cat(self.buffer["stage_logprob"]).to(device)
             old_layout_logprob = old_logprob - old_stage_logprob
-            if len(raw_stage_rewards) > 1 and stage_reward_std > 1e-4:
-                stage_advantages = (raw_stage_rewards - raw_stage_rewards.mean()) / (stage_reward_std + 1e-8)
-            else:
-                stage_advantages = torch.zeros_like(raw_stage_rewards)
         old_value = torch.cat(self.buffer["value"]).to(device).reshape(-1)
         topk_mask = torch.cat(self.buffer["topk_mask"]).to(device)
         location_order = torch.cat(self.buffer["location_order"]).to(device)
@@ -540,6 +538,14 @@ class GeneratorPPO:
         advantage_std = advantages.std(unbiased=False).item() if len(advantages) > 1 else 0.0
         if len(advantages) > 1 and advantage_std > 1e-4:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        if split_active:
+            if self.crafter_reward_normalized:
+                # Both heads receive the same combination reward in this mode.
+                stage_advantages = advantages
+            elif len(raw_stage_rewards) > 1 and stage_reward_std > 1e-4:
+                stage_advantages = (raw_stage_rewards - raw_stage_rewards.mean()) / (stage_reward_std + 1e-8)
+            else:
+                stage_advantages = torch.zeros_like(raw_stage_rewards)
 
         parameter_before = self._parameter_snapshot()
         last_metrics = None
