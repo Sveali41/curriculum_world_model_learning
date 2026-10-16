@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import math
 import hydra
-from omegaconf import DictConfig, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 from pathlib import Path
 import glob
 import json
@@ -50,7 +50,7 @@ from modelBased.world_model.crafter_event_audit import (
 from modelBased.world_model import AttentionWM_training
 from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
 from modelBased.continue_learning.reservoir_buffer import ReservoirReplayBuffer
-from modelBased.common.artifacts import align_world_model_artifact_path
+from modelBased.common.artifacts import align_world_model_artifact_path, metadata_array
 from generator.generator_interface import GeneratorInterface
 from trainer.common.run_resume import (
     config_digest, generator_state, guard_fresh_results, load_state, replay_state, restore_generator,
@@ -879,6 +879,8 @@ def run_dr_baseline_experiment(cfg: DictConfig):
                     save_dict['g'] = new_batch['inv'].cpu().numpy() if torch.is_tensor(new_batch['inv']) else new_batch['inv']
                 if new_batch.get('inv_next') is not None:
                     save_dict['h'] = new_batch['inv_next'].cpu().numpy() if torch.is_tensor(new_batch['inv_next']) else new_batch['inv_next']
+                if domain_name == "minigrid" and bool(OmegaConf.select(cfg, "domains.minigrid.stochastic.enabled", default=False)):
+                    save_dict['metadata'] = metadata_array(cfg)
 
                 np.savez_compressed(temp_npz_path, **save_dict)
                 cfg.attention_model.data_dir = temp_npz_path

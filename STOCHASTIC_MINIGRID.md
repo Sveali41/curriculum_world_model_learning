@@ -2,15 +2,14 @@
 
 ## 与最新 MAC 整合
 
-`integration/stochastic-latest-mac` 以 `aamas-experiment-dev` 的 `ac0ae51` 为基础，
-补回 `stochastic_domain`（`03a5a74`）的外层配置和环境构造接线。
-`wm` 使用 `c338198a4b5011f7456b192eea1a5dd1cae25ecc`，已包含 stochastic
-MiniGrid/latent-v2 以及最新 Crafter inventory 变化错误反馈。
-保留当前 MAC 的奖励、PPO、采集预算和 replay 设置，不恢复旧分支的实验参数。
+当前 `aamas-experiment-dev` 已整合 stochastic MiniGrid/latent-v2、最新 MAC
+和 Crafter inventory 变化错误反馈。本次将旧的导航随机规则替换为全动作随机失效，
+保留当前 MAC 的奖励、PPO、采集预算和 replay 设置，不提供旧导航随机模式。
+底层实现位于 `wm` 子模块，具体版本由外层仓库的子模块提交指针记录。
 
 默认保持 deterministic。开启 stochastic MiniGrid 时使用
-`domain=minigrid domains.minigrid.stochastic.enabled=true`；导航失败概率仍由
-`domains.minigrid.stochastic.move_failure_prob` 控制，默认 0.2。
+`domain=minigrid domains.minigrid.stochastic.enabled=true`；所有动作的统一失败概率由
+`domains.minigrid.stochastic.action_failure_prob` 控制，默认 0.2。
 新实验需使用独立的模型、数据和结果目录，并重新采集对应的 stochastic target
 数据；旧 deterministic 数据不能作为 stochastic 训练或评估的替代品。
 
@@ -18,13 +17,13 @@ MiniGrid/latent-v2 以及最新 Crafter inventory 变化错误反馈。
 
 在现有 `CustomMiniGridEnv` 的固定地图、观测编码、奖励和动作接口不变的前提下，引入第一版 stochastic dynamics，用于后续 stochastic world-model 和策略鲁棒性实验。
 
-当前版本实现导航动作随机失效，并为 MiniGrid WM 增加通用的离散
+当前版本实现全部六个动作随机失效，并为 MiniGrid WM 增加通用的离散
 stochastic latent。统一开关会同时控制真实环境、数据、WM 训练和共享的
 PPO/MPC/MCTS imagined rollout。
 
 ## Stochastic 定义
 
-导航动作 `left`、`right`、`forward` 的执行规则为：
+全部动作 `left`、`right`、`forward`、`pickup`、`toggle`、`drop` 的执行规则为：
 
 \[
 P(a_{\mathrm{executed}}=a_{\mathrm{requested}})=1-p
@@ -36,7 +35,9 @@ P(a_{\mathrm{executed}}=\mathrm{NOOP})=p
 
 失败时使用环境内部的 `NOOP` outcome，不调用也不暴露 MiniGrid 原生 `done` action。该 outcome 不会改变 agent pose 或物体状态，但会消耗一个 timestep。
 
-`pickup`、`toggle` 和 `drop` 在当前版本中始终正常执行。
+失效时 reward 为 0，carrying、物体和门状态均保持不变，并按正常时间限制检查
+truncation。`action_failed` 只表示抽样阻止了动作；正常执行但条件不满足的交互
+仍标记为 `False`，例如空手 drop、无物品可 pickup、无正确钥匙解锁。
 
 ## 环境 API 修改
 
@@ -46,10 +47,13 @@ P(a_{\mathrm{executed}}=\mathrm{NOOP})=p
 
 ```python
 stochastic_enabled: bool = False
-move_failure_prob: float = 0.2
+action_failure_prob: float = 0.2
 ```
 
-`move_failure_prob` 必须属于 `[0, 1]`。每次 `step()` 都会在启用 stochastic 且动作属于导航动作时，用环境自己的 `self.np_random` 采样一次。
+`action_failure_prob` 必须为 `[0, 1]` 内的有限数值。启用 stochastic 时，每个合法
+动作执行前都用环境自己的 `self.np_random` 抽样一次，包括无效交互及概率边界；
+关闭时不抽样。旧的构造参数或配置字段 `move_failure_prob` 会明确报错，必须改为
+`action_failure_prob`，不会自动兼容或忽略。
 
 每一步的 `info` 都包含：
 
@@ -59,7 +63,7 @@ move_failure_prob: float = 0.2
     "executed_action": int,       # 实际执行的 native action；失败时为 -1 (internal NOOP)
     "action_failed": bool,
     "stochastic_enabled": bool,
-    "move_failure_prob": float,
+    "action_failure_prob": float,
 }
 ```
 
@@ -95,7 +99,7 @@ MiniGrid 环境中的随机起点、随机方向和动作失效统一使用 `sel
 ```yaml
 stochastic:
   enabled: false
-  move_failure_prob: 0.2
+  action_failure_prob: 0.2
 ```
 
 开启实验时设置：
@@ -105,7 +109,7 @@ domains:
   minigrid:
     stochastic:
       enabled: true
-      move_failure_prob: 0.2
+      action_failure_prob: 0.2
 ```
 
 `domains.minigrid.stochastic.enabled` 是唯一需要修改的用户开关。开启后，
@@ -128,6 +132,7 @@ domains:
 - trainer 生成 mini-task 的环境；
 - PPO 真实环境训练；
 - PPO 真实环境评估；
+- MPC/MCTS 真实环境评估；
 - pipeline 子进程的 domain/policy 配置传递。
 
 A*/Dijkstra 和 planner warm-start 仍保持原有确定性构造；使用共享 WM rollout
@@ -140,13 +145,21 @@ A*/Dijkstra 和 planner warm-start 仍保持原有确定性构造；使用共享
 ```json
 {
   "stochastic": {
-    "enabled": false,
-    "move_failure_prob": 0.2
+    "enabled": true,
+    "kernel": "all_actions_noop_v1",
+    "action_failure_prob": 0.2
   }
 }
 ```
 
-这样不同 stochastic transition kernel 的数据集不会被无提示地混用。
+开启 stochastic 时，kernel、enabled 和 action_failure_prob 必须严格匹配；
+缺失标识、旧导航随机数据和不同概率的数据均不能复用。关闭时只记录
+`{"enabled": false}`，旧 deterministic 数据在其他身份字段匹配时仍可使用。
+本次不重写旧数据。新实验需要独立的数据、checkpoint 和结果目录，从全新模型
+起点运行；旧导航随机 checkpoint 不作为新实验的默认恢复起点。
+
+MAC/DR 合并后的临时训练数据也保存该标识。stochastic WM 训练不会通过
+`allow_legacy_dataset` 绕过检查。
 
 ## 当前 WM outcome baseline
 
@@ -271,8 +284,9 @@ python -m unittest tests/test_minigrid_stochastic_latent_v2.py
 
 - 默认 deterministic 行为；
 - `p=0` 和 `p=1` 边界；
-- 三个导航动作的 no-op failure；
-- 交互动作保持确定性；
+- 六个动作在关闭、p=0、p=1 时的行为；
+- pickup/drop 和门开关、解锁的成功及失效状态；
+- 无效交互与随机失败的标签区别；
 - seed 可复现；
 - uniform/普通起点规则；
 - 非法概率校验；
@@ -283,7 +297,11 @@ WM latent 测试还覆盖旧 forward contract、v1 二分类 outcome、v2 prior/
 shape、latent sampling、标签监督和反向传播。
 
 另有 `tests/test_stochastic_mac_wiring.py` 验证外层 tuple-source 采集入口与 WM
-使用同一 domain switch，并检查原生 `action_failed` 标签。
+使用同一 domain switch；真实采集 48 条 transition，检查六动作及失败标签，
+并执行一次 latent-v2 前向／反向 smoke test。
+`tests/test_minigrid_stochastic_artifacts.py` 验证新旧 kernel 隔离和 deterministic
+数据兼容。测试使用临时目录，不改写原实验数据。
+配置接线测试还覆盖 MPC/MCTS 的真实环境和 pipeline 参数传递。
 
 ## 当前限制
 

@@ -112,7 +112,7 @@ domains:
     focal_gamma: 1.0
     stochastic:
       enabled: false
-      move_failure_prob: 0.2
+      action_failure_prob: 0.2
     # Use ordinary closed doors only; locked-door actions/maps are disabled.
     locked_doors: false
     # Real-environment acquisition policy shared by MAC and DR generated tasks.

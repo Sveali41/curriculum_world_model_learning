@@ -48,7 +48,7 @@ from modelBased.world_model import AttentionWM_training
 from modelBased.world_model.AttentionWM import AttentionWorldModel
 from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
 from modelBased.continue_learning.reservoir_buffer import ReservoirReplayBuffer
-from modelBased.common.artifacts import align_world_model_artifact_path
+from modelBased.common.artifacts import align_world_model_artifact_path, metadata_array
 from modelBased.exploration.minigrid_corpus import MiniGridCorpusWriter
 
 from generator.generator_interface import GeneratorInterface
@@ -1033,6 +1033,8 @@ def adversarial_ued_training(cfg: DictConfig):
                      save_dict['g'] = new_batch['inv'].cpu().numpy() if torch.is_tensor(new_batch['inv']) else new_batch['inv']
                 if new_batch.get('inv_next') is not None:
                      save_dict['h'] = new_batch['inv_next'].cpu().numpy() if torch.is_tensor(new_batch['inv_next']) else new_batch['inv_next']
+                if env_type == "minigrid" and bool(OmegaConf.select(cfg, "domains.minigrid.stochastic.enabled", default=False)):
+                    save_dict['metadata'] = metadata_array(cfg)
                 
                 np.savez_compressed(current_data_path, **save_dict)
                 cfg.attention_model.data_dir = str(current_data_path)
