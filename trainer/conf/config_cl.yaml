@@ -23,6 +23,9 @@ domains:
     start_idx: 1
     
   minigrid:
+    stochastic:
+      enabled: false
+      move_failure_prob: 0.2
     n_phases: 20
     task_prefix: "target_task"
     data_path: ${oc.env:TRAINER_PATH}/data/minigrid/target_tasks/

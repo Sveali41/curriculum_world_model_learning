@@ -65,6 +65,9 @@ domains:
     # Generator inventory stages are sampled from code-defined ranges.
     val_suffix: "_uniform.npz"
   minigrid:
+    stochastic:
+      enabled: false
+      move_failure_prob: 0.2
     rmax_like:
       backend: ppo
       checkpoint_path: ${oc.env:MODEL_FPATH}/Policy/dr_intrinsic_explorer_minigrid_spatial_position_v1_seed${seed}.pt

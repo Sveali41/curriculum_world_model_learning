@@ -110,6 +110,9 @@ domains:
     h: 8
     w: 8
     focal_gamma: 1.0
+    stochastic:
+      enabled: false
+      move_failure_prob: 0.2
     # Use ordinary closed doors only; locked-door actions/maps are disabled.
     locked_doors: false
     # Real-environment acquisition policy shared by MAC and DR generated tasks.
@@ -433,6 +436,14 @@ attention_model:
   # Replay is sampled uniformly from the reservoir; do not rebalance by
   # action/change buckets.
   transition_balanced_sampling: false
+  # Keep the real environment and WM controlled by the same domain switch.
+  stochastic_enabled: ${oc.select:domains.${domain}.stochastic.enabled,false}
+  stochastic_latent:
+    loss_weight: 1.0
+    num_factors: 1
+    num_classes: 2
+    kl_weight: 0.1
+    supervision_weight: 1.0
 
   # Validation metric
   validation_metric: ${domains.${domain}.validation_metric}
