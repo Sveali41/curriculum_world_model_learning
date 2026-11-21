@@ -128,6 +128,23 @@ python trainer/mac_wm_learning.py domain=<domain> seed=0
 ```
 *Ablations: append `ablation.type=no_history` or `ablation.type=no_diversity`.*
 
+For the Crafter prediction-error reward comparison, use
+[`config_crafter_preloss.yaml`](trainer/conf/config_crafter_preloss.yaml):
+
+```bash
+python -m trainer.mac_wm_learning --config-name=config_crafter_preloss seed=0
+```
+
+This retains the saved LP/preloss training settings (including training
+`focal_gamma=0`, EWC 20, and 50 WM updates after 10 warmup rounds), uses
+`preloss` without reward normalization, and evaluates uniform targets 1–20
+with 500 fixed samples per target and evaluation subset seed 0. Each training
+seed has separate data, results, and checkpoints. Override
+`crafter_preloss_run_dir` for an independent rerun. Existing checkpoints need
+only reevaluation on this target protocol, not retraining. Report single-update
+values or trailing-five-update averages consistently across methods; averaging
+is a result aggregation step, not a training configuration option.
+
 MAC uses `generator_agent.warmup_iterations` rounds for generator diversity
 warmup in Crafter, MiniGrid, and BipedalWalker, without collecting environment
 transitions or LP probes. WM training and replay begin after warmup, followed

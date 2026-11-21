@@ -1,0 +1,88 @@
+defaults:
+  - config_dr
+  - _self_
+
+domain: crafter
+seed: 0
+
+# Override for an independent rerun; each seed owns all mutable artifacts.
+crafter_preloss_run_dir: ${oc.env:TRAINER_ROOT,${oc.env:PROJECT_ROOT}}/outputs/runs/crafter_preloss_uniform20/seed${seed}
+paths:
+  outputs: ${crafter_preloss_run_dir}
+
+generator_agent:
+  agent_type: ppo
+  crafter_credit_mode: split_balanced_global
+  total_iterations: 60
+  warmup_iterations: 10
+  wm_train_frequency: 1
+  learning_progress_sample_fraction: 0.4
+
+domains:
+  crafter:
+    # Match the actual saved LP/preloss training configs, rather than the
+    # gamma-1 label on the historical launcher. Changed-focal metrics use
+    # gamma=1 independently of this training-loss setting.
+    focal_gamma: 0.0
+    lambda_ewc: 20
+    iter_transition_budget: 8000
+    generator_batch_size: 8
+    max_edits_layout: 0.3
+    max_edits_inventory: 0.0
+    replay_frac: 0.8
+    reward:
+      signal_mode: preloss
+      normalized: false
+      learning_progress: 1.0
+      div: 0.01
+      clip: 20.0
+    data_folder: ${paths.outputs}/data
+    mini_tasks_temp_root: ${paths.outputs}/temp/
+    # Same fixed 20-target protocol as full20_changed_focal.csv.
+    target_task_start_idx: 1
+    target_task_count: 20
+    target_task_suffix: _uniform.npz
+    val_start_idx: 1
+    val_n_phases: 20
+    val_suffix: _uniform.npz
+    target_validation_max_samples: 500
+    target_validation_seed: 0
+
+attention_model:
+  n_epochs: 10
+  batch_size: 64
+  seed: ${seed}
+  focal_gamma: ${domains.crafter.focal_gamma}
+  target_validation_seed: 0
+  crafter_event_confusion_enabled: true
+  crafter_transition_replay:
+    enabled: false
+    protected_slot_replay:
+      enabled: true
+  fisher_slot_stratified:
+    enabled: true
+    min_samples_per_observed_slot: 16
+  model_save_path: ${paths.outputs}/checkpoints/wm.ckpt
+  checkpoint_dir: ${paths.outputs}/checkpoints/lightning
+
+env:
+  collect:
+    data_type: random
+    data_folder: ${paths.outputs}/temp/
+    data_save_path: ${paths.outputs}/data/trainer.npz
+    env_visualize_save_path: ${paths.visualizations}/environments
+
+mac_results_dir: ${paths.results}
+mac_temp_data_dir: ${paths.outputs}/temp
+force_fresh_start: true
+resume_training: false
+save_iteration_state: true
+save_wm_update_checkpoints: true
+wm_train_seed_per_update: true
+
+crafter_inventory_event_audit:
+  enabled: true
+
+hydra:
+  run:
+    dir: ${paths.outputs}/hydra/${now:%Y-%m-%d_%H-%M-%S}
