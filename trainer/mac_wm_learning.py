@@ -447,7 +447,11 @@ def adversarial_ued_training(cfg: DictConfig):
         
     # Always construct the path so default and overridden cases share one code path.
     env_type = getattr(cfg.attention_model, "env_type", "minigrid")
-    resume_training = env_type == "crafter" and bool(getattr(cfg, "resume_training", False))
+    iteration_resume_supported = env_type == "crafter" or (
+        env_type == "minigrid" and cfg.generator_agent.agent_type == "random_lp"
+    )
+    resume_training = iteration_resume_supported and bool(getattr(cfg, "resume_training", False))
+    resume_kind = "minigrid_random_lp" if env_type == "minigrid" else "crafter_mac"
     if resume_training and bool(getattr(cfg, "force_fresh_start", False)):
         raise ValueError("resume_training=true requires force_fresh_start=false")
     transition_replay_cfg = getattr(cfg.attention_model, "crafter_transition_replay", None)
@@ -482,7 +486,7 @@ def adversarial_ued_training(cfg: DictConfig):
         f"{summary_csv_path.stem}.seed{int(seed)}.manifest.json"
     )
     map_diagnostics_path = summary_csv_path.with_suffix(".maps.jsonl")
-    resume_state_path = log_dir / f"crafter_mac_seed{seed}.resume.pt"
+    resume_state_path = log_dir / f"{resume_kind}_seed{seed}.resume.pt"
     stage_probe_csv_path = None
     stage_probe_csv_header = CRAFTER_STAGE_PROBE_CSV_HEADER
     if (env_type == "crafter" and str(getattr(cfg.generator_agent, "crafter_credit_mode", "joint"))
@@ -633,7 +637,7 @@ def adversarial_ued_training(cfg: DictConfig):
             "target_val_joint_accuracy", "target_val_position_accuracy", "target_val_direction_accuracy",
         ]
 
-    if env_type == "crafter" and not resume_training and bool(getattr(cfg, "save_iteration_state", True)):
+    if iteration_resume_supported and not resume_training and bool(getattr(cfg, "save_iteration_state", True)):
         guard_fresh_results(summary_csv_path, resume_state_path, seed)
     file_exists = (
         summary_csv_path.is_file()
@@ -786,7 +790,7 @@ def adversarial_ued_training(cfg: DictConfig):
     warmup_cleanup_done = False
     start_iteration = 0
     if resume_training:
-        state = load_state(resume_state_path, cfg, "crafter_mac", summary_csv_path, csv_header)
+        state = load_state(resume_state_path, cfg, resume_kind, summary_csv_path, csv_header)
         validate_sidecars(
             tuple(path for path in (stage_probe_csv_path, event_audit_csv_path,
                  episode_age_audit_csv_path, target_event_confusion_csv_path,
@@ -801,7 +805,7 @@ def adversarial_ued_training(cfg: DictConfig):
         warmup_cleanup_done = state["warmup_cleanup_done"]
         start_iteration = state["completed_iteration"]
         restore_rng(state["rng"])
-        print(f"[Resume] Crafter MAC completed iteration {start_iteration}; continuing at {start_iteration + 1}")
+        print(f"[Resume] {resume_kind} completed iteration {start_iteration}; continuing at {start_iteration + 1}")
 
     # === E. Validation set definition (fixed target tasks) ===
     if domain_cfg is not None and (
@@ -1121,7 +1125,7 @@ def adversarial_ued_training(cfg: DictConfig):
                 else:
                     wm_instance.load_state_dict(ckpt)
             except Exception as e:
-                if env_type == "crafter" and bool(getattr(cfg, "save_wm_update_checkpoints", False)):
+                if cfg.generator_agent.agent_type == "random_lp" or (env_type == "crafter" and bool(getattr(cfg, "save_wm_update_checkpoints", False))):
                     raise RuntimeError(f"Cannot snapshot MAC iteration {iteration + 1}; WM checkpoint reload failed: {ckpt_path}") from e
                 print(f"[Warning] Failed to reload model: {e}. Using potentially dirty instance.")
                 if isinstance(old_params, dict):
@@ -1657,9 +1661,9 @@ def adversarial_ued_training(cfg: DictConfig):
                     print(f"[Warning] Could not delete {f}: {e}")
             print(f"[Cleanup] Done.")
 
-        if env_type == "crafter" and bool(getattr(cfg, "save_iteration_state", True)):
+        if iteration_resume_supported and bool(getattr(cfg, "save_iteration_state", True)):
             save_state(resume_state_path, {
-                "version": 1, "kind": "crafter_mac", "config_digest": config_digest(cfg),
+                "version": 1, "kind": resume_kind, "config_digest": config_digest(cfg),
                 "completed_iteration": iteration + 1,
                 "cumulative_transitions": cumulative_transitions,
                 "warmup_cleanup_done": warmup_cleanup_done,

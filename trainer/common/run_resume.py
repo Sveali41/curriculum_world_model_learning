@@ -1,4 +1,4 @@
-"""Iteration-boundary state for future Crafter DR/MAC runs."""
+"""Iteration-boundary state for Crafter DR/MAC and MiniGrid random-LP runs."""
 
 import csv
 import hashlib
@@ -23,6 +23,11 @@ def config_digest(cfg):
     config["generator_agent"].pop("total_iterations", None)
     # MAC assigns this to each temporary iteration archive at runtime.
     config["attention_model"].pop("data_dir", None)
+    if config["generator_agent"].get("agent_type") == "random_lp":
+        # Collection rewrites these output filenames on every visit. Keep
+        # existing MAC/DR digests unchanged for their saved resume states.
+        for key in ("data_save_path", "visualize_filename", "env_visualize_filename"):
+            config["env"]["collect"].pop(key, None)
     encoded = json.dumps(config, sort_keys=True, default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
 
@@ -47,7 +52,10 @@ def restore_rng(state):
 
 
 def replay_state(buffer):
-    return {"buffer": buffer.buffer, "rng": buffer._rng.bit_generator.state}
+    state = {"buffer": buffer.buffer, "rng": buffer._rng.bit_generator.state}
+    if hasattr(buffer, "num_seen"):
+        state["reservoir"] = {"num_seen": buffer.num_seen, "rng": buffer.rng.bit_generator.state}
+    return state
 
 
 def restore_replay(buffer, state):
@@ -55,9 +63,23 @@ def restore_replay(buffer, state):
         raise ValueError("Replay state exceeds configured fisher_buffer_size")
     buffer.buffer = state["buffer"]
     buffer._rng.bit_generator.state = state["rng"]
+    if hasattr(buffer, "num_seen"):
+        reservoir = state["reservoir"]
+        buffer.num_seen = int(reservoir["num_seen"])
+        if buffer.num_seen < len(buffer.buffer):
+            raise ValueError("Reservoir num_seen is smaller than its saved buffer")
+        buffer.rng.bit_generator.state = reservoir["rng"]
 
 
 def generator_state(interface, include_policy):
+    if interface.is_minigrid and getattr(interface, "random_lp_pool", None) is not None:
+        return {
+            "random_lp": interface.random_lp_pool.state_dict(),
+            "map_archive": interface.map_archive,
+            "combination_archive": interface.combination_archive,
+            "diversity_archive": interface.diversity.archive if interface.diversity is not None else None,
+            "diversity_model": interface.diversity.state_dict() if interface.diversity is not None else None,
+        }
     state = {
         "prev_data": interface.prev_data,
         "elite_buffer": interface.elite_buffer,
@@ -70,7 +92,9 @@ def generator_state(interface, include_policy):
         state["reward_scale_history"] = {
             key: list(values) for key, values in interface._crafter_reward_scale_history.items()
         }
-    if include_policy:
+    if getattr(interface, "random_lp_pool", None) is not None:
+        state["random_lp"] = interface.random_lp_pool.state_dict()
+    elif include_policy:
         ppo = interface.ppo
         state["ppo"] = {
             "policy": ppo.policy.state_dict(),
@@ -89,6 +113,16 @@ def generator_state(interface, include_policy):
 
 
 def restore_generator(interface, state, include_policy):
+    if interface.is_minigrid and getattr(interface, "random_lp_pool", None) is not None:
+        interface.random_lp_pool.load_state_dict(state["random_lp"])
+        interface.map_archive = state["map_archive"]
+        interface.combination_archive = state["combination_archive"]
+        if (interface.diversity is None) != (state["diversity_model"] is None):
+            raise ValueError("MiniGrid diversity configuration differs from resume state")
+        if interface.diversity is not None:
+            interface.diversity.load_state_dict(state["diversity_model"])
+            interface.diversity.archive = state["diversity_archive"]
+        return
     if bool(getattr(interface.crafter_reward_cfg, "normalized", False)):
         if "reward_scale_history" not in state:
             raise ValueError("Crafter normalized reward resume requires saved reward_scale_history; cannot discard normalization history")
@@ -108,7 +142,11 @@ def restore_generator(interface, state, include_policy):
         interface._crafter_lp_scale_history[key] = deque(values, maxlen=5)
     interface.diversity.load_state_dict(state["diversity_model"])
     interface.diversity.archive = state["diversity_archive"]
-    if include_policy:
+    if getattr(interface, "random_lp_pool", None) is not None:
+        if "random_lp" not in state:
+            raise ValueError("Random LP resume requires the saved environment pool and sampling RNG")
+        interface.random_lp_pool.load_state_dict(state["random_lp"])
+    elif include_policy:
         ppo = interface.ppo
         saved = state["ppo"]
         ppo.policy.load_state_dict(saved["policy"])

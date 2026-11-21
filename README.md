@@ -148,6 +148,63 @@ left unavailable (NaN).
 Generator diagnostics are written beside the MAC CSV (`*.manifest.json` and
 `*.maps.jsonl`).
 
+**Random-edit + LP baseline (MiniGrid and Crafter)**
+
+```bash
+python -m trainer.mac_wm_learning --config-name config_random_lp domain=minigrid seed=0
+python -m trainer.mac_wm_learning --config-name config_random_lp_crafter seed=0
+```
+
+The [baseline configuration](trainer/conf/config_random_lp.yaml) inherits the
+current MAC protocol, replacing PPO with the existing random editor and an
+[LP environment pool](generator/random_lp.py). It is a PLR-inspired control,
+not a reproduction of original PLR. The first batch contains only new maps;
+later batches use `ceil(batch_size * new_fraction)` new maps, filling remaining
+slots from the pool without replacement (or with more new maps if needed).
+Defaults are capacity 32, new fraction 0.5, and uniform exploration mix 0.2.
+Replay probabilities mix uniform sampling with normalized `max(pre - post, 0)`;
+if all weights are zero, sampling is uniform. Scores use the latest visit only.
+FIFO eviction follows insertion order, not LP or last-visit time.
+
+Each visit recollects transitions from the stored layout, colors, states, and
+initial inventory. The full batch enters ordinary WM training and transition
+replay; its same 40% probe subsets measure pre/post LP. There are no separate
+candidate rollouts or per-candidate WM updates. Invalid trajectories do not
+enter the pool; revisited entries with invalid probes receive zero priority.
+Crafter probes with no changed events have undefined changed-only loss: retain
+these environments with zero LP priority and log `lp_valid=false` with null
+loss/LP fields, excluding them from LP means. Nonfinite losses on probes with
+changed events fail explicitly. Diversity is diagnostic only.
+No PPO warmup is used: the default 50 rounds match MAC's 50 WM updates
+after 10 warmup rounds. The [Crafter preset](trainer/conf/config_random_lp_crafter.yaml)
+matches the historical Crafter WM settings, including EWC `lambda=20` and
+slot-stratified Fisher sampling, but retains the current 40% in-rollout LP
+measurement rather than collecting separate probe rollouts. It uses 8,000
+training transitions per update (200k/400k at updates 25/50) and evaluates the
+20 frozen `_uniform.npz` targets at 500 transitions per target with subset seed 0.
+
+Artifacts are isolated under `outputs/runs/random_edit_lp/minigrid/seed<seed>/`
+or `outputs/runs/random_edit_lp/crafter_matched/seed<seed>/` for the Crafter preset.
+Use `random_lp_run_dir=/absolute/new/run` for an independent rerun. Map sidecars
+record environment IDs, new/replayed status, conditional sampling probability,
+score age, pre/post losses, and pool size. Iteration-boundary resume supports
+Crafter and MiniGrid with the random explorer. It saves WM, LP pool, replay
+(including reservoir admission count and RNG), diversity archives and global RNG
+state. Append `resume_training=true force_fresh_start=false` with the original
+run directory and configuration, increasing `generator_agent.total_iterations`
+to the cumulative stopping iteration. For example, ten consecutive jobs stopping
+at 5, 10, ..., 50 preserve fifty updates per seed. Each job must depend on its
+same-seed predecessor's successful completion. Missing or inconsistent state
+fails explicitly. MiniGrid's fresh environment RNG is currently entropy-seeded;
+exact cross-run comparisons additionally require controlling that RNG in the
+validation fixture. The production stochastic kernel is unchanged.
+Focused validation: `python -m unittest tests.test_random_lp -v` (pool selection,
+LP measurement wiring in both domains, generator-state restore and reservoir
+continuation). Validated with 13 focused tests and CPU smoke runs using two environments,
+64 transitions per round, and one WM epoch: two MiniGrid rounds, plus one
+Crafter round followed by resume to round two. These checks verify execution
+and restore behavior, not baseline performance or convergence.
+
 **2. DR baseline (domain randomization)**
 ```bash
 python trainer/dr_baseline_experiment.py domain=<domain> seed=0

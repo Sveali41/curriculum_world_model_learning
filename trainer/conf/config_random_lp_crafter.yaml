@@ -1,0 +1,21 @@
+defaults:
+  - config_random_lp
+  - _self_
+
+domain: crafter
+random_lp_run_dir: ${paths.outputs}/runs/random_edit_lp/crafter_matched/seed${seed}
+
+# Match the historical Crafter WM setup, but keep the current LP method:
+# score the same 40% subset of the training rollout before/after the update.
+domains:
+  crafter:
+    lambda_ewc: 20
+
+attention_model:
+  seed: ${seed}
+  fisher_slot_stratified:
+    enabled: true
+    min_samples_per_observed_slot: 16
+
+# Align the per-update training RNG with the historical MAC arm.
+wm_train_seed_per_update: true

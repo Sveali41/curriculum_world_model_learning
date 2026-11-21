@@ -1,0 +1,36 @@
+defaults:
+  - config_mac
+  - _self_
+
+# A task-matched random-edit + WM-LP baseline, not a reproduction of PLR.
+# Override this directory for independent reruns of the same seed.
+random_lp_run_dir: ${paths.outputs}/runs/random_edit_lp/${domain}/seed${seed}
+mac_results_dir: ${random_lp_run_dir}/results
+mac_temp_data_dir: ${random_lp_run_dir}/data
+paths:
+  visualizations: ${random_lp_run_dir}/visualizations
+  wandb: ${random_lp_run_dir}/wandb
+
+hydra:
+  run:
+    dir: ${random_lp_run_dir}/hydra/${now:%Y-%m-%d_%H-%M-%S}
+
+generator_agent:
+  agent_type: random_lp
+  # Match default MAC's 50 WM updates; random editing needs no PPO warmup.
+  warmup_iterations: 0
+  total_iterations: 50
+  wm_train_frequency: 1
+  random_lp:
+    capacity: 32
+    new_fraction: 0.5
+    uniform_mix: 0.2
+
+attention_model:
+  model_save_path: ${random_lp_run_dir}/checkpoints/attention_world_model.ckpt
+  checkpoint_dir: ${random_lp_run_dir}/checkpoints/lightning
+
+domains:
+  minigrid:
+    rmax_like:
+      checkpoint_path: ${random_lp_run_dir}/checkpoints/explorer.pt

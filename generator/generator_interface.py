@@ -12,6 +12,7 @@ from collections import deque
 
 from generator.generator_agent import GeneratorPPO
 from generator.random_generator_agent import RandomGeneratorAgent
+from generator.random_lp import RandomLPEnvironmentPool
 from generator.reward_system import DiversityModule, check_solvability
 from generator.crafter_env_designer import CrafterPCGSeeder, CRAFTER_ACTION_MAP, CRAFTER_OBJ_MAP
 from generator.bipedal_env_designer import BipedalPCGSeeder, ACTION_TABLE_BIPEDAL
@@ -105,6 +106,8 @@ class GeneratorInterface:
         self.crafter_timing = {"collection": 0.0, "lp_pre": 0.0, "lp_post": 0.0}
         self.cfg = cfg
         self.agent_type = agent_type
+        if agent_type not in {"ppo", "random", "random_lp"}:
+            raise ValueError(f"Unsupported generator agent_type: {agent_type!r}")
         self.ablation_type = getattr(getattr(cfg, "ablation", None), "type", "none")
         hparams = cfg.generator_agent
         self.batch_size = hparams.batch_size
@@ -132,6 +135,23 @@ class GeneratorInterface:
         }
         self.is_bipedal = (getattr(cfg.attention_model, "env_type", "") == "bipedalwalker")
         self.is_minigrid = not self.is_crafter and not self.is_bipedal
+        self.random_lp_pool = None
+        if agent_type == "random_lp":
+            if self.is_bipedal:
+                raise ValueError("random_lp currently supports MiniGrid and Crafter only")
+            if self.is_minigrid and (
+                bool(getattr(cfg, "resume_training", False)) or bool(getattr(cfg, "save_iteration_state", True))
+            ) and str(cfg.domains.minigrid.exploration_policy).lower() != "random":
+                raise ValueError("MiniGrid random_lp iteration state requires exploration_policy=random")
+            if int(hparams.warmup_iterations) != 0 or int(hparams.wm_train_frequency) != 1:
+                raise ValueError("random_lp requires warmup_iterations=0 and wm_train_frequency=1")
+            pool_cfg = getattr(hparams, "random_lp", None)
+            if pool_cfg is None:
+                raise ValueError("random_lp requires generator_agent.random_lp; use --config-name config_random_lp")
+            self.random_lp_pool = RandomLPEnvironmentPool(
+                pool_cfg.capacity, pool_cfg.new_fraction, pool_cfg.uniform_mix,
+                int(cfg.seed),
+            )
         minigrid_domain_cfg = getattr(getattr(cfg, "domains", None), "minigrid", None)
         self.minigrid_rmax_explorer = None
         self.minigrid_p2e_explorer = None
@@ -227,7 +247,7 @@ class GeneratorInterface:
                 for action_id in range(1, len(self.ACTION_TABLE))
             ]
 
-        if agent_type == 'random':
+        if agent_type in {'random', 'random_lp'}:
             self.ppo = RandomGeneratorAgent(
                 num_actions=len(self.ACTION_TABLE),
                 device=device,
@@ -363,6 +383,12 @@ class GeneratorInterface:
         self.minigrid_reward_cfg = minigrid_reward_cfg
         self.minigrid_reward_signal_mode = self._get_minigrid_reward_signal_mode()
         self.minigrid_reward_normalization_mode = self._get_minigrid_reward_normalization_mode()
+        if agent_type == "random_lp":
+            signal_mode = self.crafter_reward_signal_mode if self.is_crafter else self.minigrid_reward_signal_mode
+            if signal_mode != "lp" or self.skip_crafter_learning_progress:
+                raise ValueError("random_lp requires signal_mode=lp and LP evaluation enabled")
+            if bool(getattr(getattr(cfg, "crafter_stage_probe_diagnostic", None), "enabled", False)):
+                raise ValueError("random_lp does not support PPO stage signal diagnostics")
         self._minigrid_reward_scale_history = {
             "signal": deque(maxlen=5), "diversity": deque(maxlen=5),
         }
@@ -1384,6 +1410,8 @@ class GeneratorInterface:
                     self.wm.calc_minigrid_changed_focal_loss(trajectory)
                 )
             except Exception as exc:
+                if self.agent_type == "random_lp":
+                    raise RuntimeError(f"{phase} Random LP probe failed for env {index}") from exc
                 print(
                     f"[GeneratorInterface] {phase} loss evaluation failed for env "
                     f"{index}: {exc}"
@@ -1413,6 +1441,8 @@ class GeneratorInterface:
                         metrics["coverage_map"], dtype=np.float32
                     )
             except Exception as exc:
+                if self.agent_type == "random_lp":
+                    raise RuntimeError(f"Post-update Random LP probe failed for env {index}") from exc
                 print(
                     "[GeneratorInterface] Post-update probe evaluation failed for "
                     f"env {index}: {exc}"
@@ -1422,7 +1452,7 @@ class GeneratorInterface:
     def _set_minigrid_post_update_history(
         self, history_maps, error_maps, coverage_maps
     ):
-        if self.agent_type == "random":
+        if self.agent_type in {"random", "random_lp"}:
             return
         maps_tensor = torch.as_tensor(
             np.asarray(history_maps), dtype=torch.float32, device=self.device
@@ -1443,9 +1473,14 @@ class GeneratorInterface:
         pre_losses = np.asarray(pending["pre_changed_focal_losses"], dtype=np.float32)
         post_losses, post_error_maps, post_coverage_maps = (
             self._evaluate_minigrid_post_update_probes(
-                pending["probe_trajectories"], valid
+                pending["probe_trajectories"], valid,
+                include_spatial=self.agent_type != "random_lp",
             )
         )
+        if self.agent_type == "random_lp":
+            self._finalize_random_lp(pre_losses, post_losses, valid)
+            self._pending_minigrid_round = None
+            return
         self._set_minigrid_post_update_history(
             pending["history_maps"], post_error_maps, post_coverage_maps
         )
@@ -1795,6 +1830,22 @@ class GeneratorInterface:
         """Finalize identical sampled Crafter transitions after the WM update."""
         pending = self._pending_crafter_round
         if not self.is_crafter or pending is None:
+            return
+        if self.agent_type == "random_lp":
+            post = self._evaluate_crafter_changed_focal_losses(
+                pending["probe_trajectories"], pending["valid"], "Post-update",
+            )
+            # Changed-only loss is undefined when the sampled probe has no
+            # events. Keep that environment, but give it no positive LP weight.
+            scorable = [
+                item is not None and (item["layout_changed_count"] + item["inventory_changed_count"] > 0)
+                for item in pending["pre_components"]
+            ]
+            self._finalize_random_lp(
+                pending["pre_changed_focal_losses"], post, pending["valid"],
+                stage_tokens=pending["stage_tokens"], scorable=scorable,
+            )
+            self._pending_crafter_round = None
             return
         normalized_reward = apply_rewards and bool(getattr(self.crafter_reward_cfg, "normalized", False))
         valid = np.asarray(pending["valid"], dtype=bool)
@@ -2146,6 +2197,45 @@ class GeneratorInterface:
             **balanced_reward_metrics,
         }
         self._pending_crafter_round = None
+
+    def _finalize_random_lp(self, pre, post, valid, stage_tokens=None, scorable=None):
+        pre, post = np.asarray(pre), np.asarray(post)
+        valid = np.asarray(valid, dtype=bool)
+        paired = valid if scorable is None else valid & np.asarray(scorable, dtype=bool)
+        rows = self.random_lp_pool.update(pre, post, valid, scorable=paired)
+        metrics = {
+            "Pre_Changed_Focal_Loss": float(pre[paired].mean()) if paired.any() else float("nan"),
+            "Post_Changed_Focal_Loss": float(post[paired].mean()) if paired.any() else float("nan"),
+            "Learning_Progress": float((pre[paired] - post[paired]).mean()) if paired.any() else float("nan"),
+            "paired_probe_count": int(paired.sum()), "valid_probe_count": int(valid.sum()),
+            "Reward_Learning_Progress": 0.0, "Reward_LP_Mean": 0.0,
+            "Reward_Novelty_Mean": 0.0, "Final_Reward_Mean": 0.0,
+            "Final_Reward_Std": 0.0,
+        }
+        if self.is_minigrid:
+            metrics.update({
+                "Difficulty_Rank": float("nan"),
+                "Learning_Progress_Rank": float("nan"),
+                "LP_Split_Spearman": float("nan"),
+            })
+            self.last_minigrid_metrics.update(metrics)
+            self.last_minigrid_map_diagnostics = rows
+            self._attach_minigrid_explorer_coverage()
+        else:
+            tokens = np.asarray(stage_tokens)
+            metrics["Inventory_KEEP_Ratio"] = float(np.mean(tokens == 0))
+            for stage in range(5):
+                selected = tokens == stage + 1
+                stage_paired = selected & paired
+                metrics.update({
+                    f"Inventory_Stage_{stage}_Count": int(selected.sum()),
+                    f"Inventory_Stage_{stage}_Mean_LP": float((pre[stage_paired] - post[stage_paired]).mean()) if stage_paired.any() else float("nan"),
+                    f"Inventory_Stage_{stage}_Reward_Std": 0.0,
+                })
+            for row, token in zip(rows, stage_tokens):
+                row["stage_token"] = int(token)
+            self.last_crafter_metrics = metrics
+            self.last_crafter_map_diagnostics = rows
 
     def _normalize_base_map(self, grid):
         """
@@ -2685,6 +2775,33 @@ class GeneratorInterface:
         final_maps_obj, final_maps_color, final_maps_state, final_stats_batch = self._materialize_candidates(
             base_ids_np, actions_np, stats_actions_np, base_stats_np, mask
         )
+        if self.agent_type == "random_lp":
+            candidates = [
+                {
+                    "base": base_ids_np[i], "obj": final_maps_obj[i],
+                    "color": final_maps_color[i], "state": final_maps_state[i],
+                    "stats": final_stats_batch[i], "actions": actions_np[i],
+                    "stats_actions": stats_actions_np[i],
+                    "edit_mask": topk_action_mask[i].detach().cpu().numpy(),
+                    "immutable_mask": mask[i].detach().cpu().numpy(),
+                }
+                for i in range(self.batch_size)
+            ]
+            selected = self.random_lp_pool.mix(candidates, iteration)
+            base_ids_np = np.stack([item["base"] for item in selected])
+            final_maps_obj = np.stack([item["obj"] for item in selected])
+            final_maps_color = np.stack([item["color"] for item in selected])
+            final_maps_state = np.stack([item["state"] for item in selected])
+            final_stats_batch = np.stack([item["stats"] for item in selected])
+            actions_np = np.stack([item["actions"] for item in selected])
+            stats_actions_np = np.stack([item["stats_actions"] for item in selected])
+            stats_actions = torch.as_tensor(stats_actions_np, device=self.device)
+            topk_action_mask = torch.as_tensor(
+                np.stack([item["edit_mask"] for item in selected]), device=self.device,
+            )
+            mask = torch.as_tensor(
+                np.stack([item["immutable_mask"] for item in selected]), device=self.device,
+            )
         self._record_generated_minigrid_batch(
             final_maps_obj, final_maps_color, final_maps_state,
             final_stats_batch, iteration,
@@ -2838,26 +2955,27 @@ class GeneratorInterface:
             raw_scalar_losses.append(raw_loss_val)
             raw_ce_losses.append(t_loss_batch)
             raw_inv_losses.append(i_loss_batch)
-            self.ppo.save_buffer(
-                curr_map[i:i+1],
-                prev_data_i,
-                mask[i:i+1],
-                actions[i:i+1],
-                (
-                    stats_actions[i:i+1]
-                    if self.is_crafter or self.is_minigrid
-                    else torch.zeros((1, 32), device=self.device, dtype=torch.long)
-                ),
-                logp[i:i+1],
-                values[i:i+1],
-                reward,
-                topk_action_mask[i:i+1],
-                location_order[i:i+1],
-                topk_stats_action_mask[i:i+1],
-                **({"stage_logprob": self.ppo.last_stage_logprob[i:i+1]}
-                   if self.is_crafter and self.crafter_credit_mode in {"split", "split_balanced_global"}
-                   else {}),
-            )
+            if self.agent_type == "ppo":
+                self.ppo.save_buffer(
+                    curr_map[i:i+1],
+                    prev_data_i,
+                    mask[i:i+1],
+                    actions[i:i+1],
+                    (
+                        stats_actions[i:i+1]
+                        if self.is_crafter or self.is_minigrid
+                        else torch.zeros((1, 32), device=self.device, dtype=torch.long)
+                    ),
+                    logp[i:i+1],
+                    values[i:i+1],
+                    reward,
+                    topk_action_mask[i:i+1],
+                    location_order[i:i+1],
+                    topk_stats_action_mask[i:i+1],
+                    **({"stage_logprob": self.ppo.last_stage_logprob[i:i+1]}
+                       if self.is_crafter and self.crafter_credit_mode in {"split", "split_balanced_global"}
+                       else {}),
+                )
 
             if traj and 'obs' in traj:
                 valid_trajs.append(traj)
