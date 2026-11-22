@@ -145,6 +145,39 @@ only reevaluation on this target protocol, not retraining. Report single-update
 values or trailing-five-update averages consistently across methods; averaging
 is a result aggregation step, not a training configuration option.
 
+**Crafter architecture ablation: AC-AWM vs. CNN spatial backbone.**
+
+```bash
+bash trainer/run_crafter_backbone_seeds.sh
+```
+
+Run from the checkout with both the trainer and the nested WM changes present,
+using the usual Python training environment. The launcher runs seeds 0–4
+sequentially, writes separate logs/checkpoints per seed, and snapshots source,
+dependencies and target archive hashes. Pass a new output directory as the
+first argument if desired. To run one seed, use
+[the paired preset](trainer/conf/config_crafter_backbone_ablation.yaml):
+
+```bash
+python -m trainer.mac_wm_learning --config-name=config_crafter_backbone_ablation \
+  seed=0 crafter_backbone_run_dir=/absolute/run/seed0
+```
+
+To resume from an intact completed iteration, repeat the same command with
+`resume_training=true force_fresh_start=false`.
+
+Only AC-AWM drives the LP editor. Within a seed, the CNN arm uses the identical
+current archive and replay input for each WM update, the same data selection
+settings, and its own weights and EWC/Fisher state. Both use the same local
+view, action and inventory inputs, and prediction heads; only the spatial
+attention mixer is replaced by residual convolutional mixing. Both evaluate
+on targets 1–20 using the same 500-sample subsets (seed 0), with 10 warmup
+rounds and 50 WM updates. Compare `target_val_*` with
+`cnn_target_val_*` in the per-seed summary CSV using the same transition
+budgets. The run's timing includes the comparison arm; it is not an
+AC-AWM-only compute measurement. This tests spatial attention on
+MAC-collected data, not the effect of the agent-centric view itself.
+
 MAC uses `generator_agent.warmup_iterations` rounds for generator diversity
 warmup in Crafter, MiniGrid, and BipedalWalker, without collecting environment
 transitions or LP probes. WM training and replay begin after warmup, followed

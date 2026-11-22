@@ -1,0 +1,15 @@
+defaults:
+  - config_crafter_preloss
+  - _self_
+
+# Use the matched Crafter configuration, but the MAC reference uses LP.
+crafter_compare_cnn: true
+crafter_backbone_run_dir: ${oc.env:TRAINER_ROOT}/outputs/runs/crafter_backbone/seed${seed}
+paths:
+  outputs: ${crafter_backbone_run_dir}
+domains:
+  crafter:
+    reward:
+      signal_mode: lp
+
+save_wm_update_checkpoints: false

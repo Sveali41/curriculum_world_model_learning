@@ -57,6 +57,7 @@ from trainer.common.run_resume import (
     restore_replay, restore_rng, rng_state, save_state, validate_sidecars,
 )
 from trainer.common.wm_snapshots import save_wm_update_snapshot
+from trainer.common.crafter_backbone_ablation import CrafterCNNComparison, preserve_rng
 from trainer.common.paths import RESULTS_ROOT
 from trainer.common.utils import (
     MINIGRID_VAL_LOSS_FIELDS,
@@ -72,6 +73,11 @@ from modelBased.world_model.crafter_event_audit import (
     inventory_event_episode_age_rows, inventory_event_rows,
 )
 
+CRAFTER_CNN_TARGET_METRICS = (
+    "avg_val_loss_wm",
+    "layout_changed_focal_loss", "inventory_changed_focal_loss",
+    "layout_false_set_rate", "inventory_false_set_rate",
+)
 
 CRAFTER_INVENTORY_EVENT_AUDIT_HEADER = (
     "Seed", "Iter", "Source", "Event_ID", "Delta_Vector", "Count",
@@ -447,6 +453,16 @@ def adversarial_ued_training(cfg: DictConfig):
         
     # Always construct the path so default and overridden cases share one code path.
     env_type = getattr(cfg.attention_model, "env_type", "minigrid")
+    compare_cnn = bool(getattr(cfg, "crafter_compare_cnn", False))
+    if compare_cnn and (
+        env_type != "crafter" or cfg.generator_agent.agent_type != "ppo"
+        or cfg.attention_model.model_type.lower() != "attention"
+        or getattr(cfg.attention_model, "crafter_spatial_backbone", "attention") != "attention"
+        or cfg.attention_model.resume_optimizer
+        or Path(cfg.attention_model.model_save_path).name == "cnn_wm.ckpt"
+    ):
+        raise ValueError("Crafter CNN comparison requires Crafter PPO MAC with the attention "
+                         "backbone, a separate reference checkpoint, and resume_optimizer=false.")
     iteration_resume_supported = env_type == "crafter" or (
         env_type == "minigrid" and cfg.generator_agent.agent_type == "random_lp"
     )
@@ -637,6 +653,9 @@ def adversarial_ued_training(cfg: DictConfig):
             "target_val_joint_accuracy", "target_val_position_accuracy", "target_val_direction_accuracy",
         ]
 
+    if compare_cnn:
+        csv_header.extend(f"cnn_target_val_{name}" for name in CRAFTER_CNN_TARGET_METRICS)
+
     if iteration_resume_supported and not resume_training and bool(getattr(cfg, "save_iteration_state", True)):
         guard_fresh_results(summary_csv_path, resume_state_path, seed)
     file_exists = (
@@ -748,6 +767,8 @@ def adversarial_ued_training(cfg: DictConfig):
     else:
         print(f"[System] No existing checkpoint found at {ckpt_path}. Starting from scratch.")
 
+    cnn_comparison = CrafterCNNComparison(cfg, wm_instance, device) if compare_cnn else None
+
     total_iterations = cfg.generator_agent.total_iterations
     cumulative_transitions = 0
     corpus_writer = None
@@ -789,6 +810,9 @@ def adversarial_ued_training(cfg: DictConfig):
     wm_train_frequency = cfg.generator_agent.wm_train_frequency  
     warmup_cleanup_done = False
     start_iteration = 0
+    # Crafter collection rewrites temporary dataset/visualization names.
+    # Hash the paired protocol before the first rollout, as on resume.
+    paired_config_digest = config_digest(cfg) if compare_cnn else None
     if resume_training:
         state = load_state(resume_state_path, cfg, resume_kind, summary_csv_path, csv_header)
         validate_sidecars(
@@ -798,6 +822,8 @@ def adversarial_ued_training(cfg: DictConfig):
             (map_diagnostics_path,), seed, state["completed_iteration"],
         )
         wm_instance.load_state_dict(state["wm"])
+        if cnn_comparison is not None:
+            cnn_comparison.load_state_dict(state["cnn_comparison"])
         old_params, fisher = state["old_params"], state["fisher"]
         restore_replay(fisher_buffer, state["replay"])
         restore_generator(gen_interface, state["generator"], include_policy=True)
@@ -848,6 +874,12 @@ def adversarial_ued_training(cfg: DictConfig):
         target_files = []
         print(f"[Config] No fixed target task list configured for env_type='{env_type}'. Target validation will be skipped.")
 
+    if cnn_comparison is not None:
+        missing = [name for name in target_files if not (Path(target_data_dir) / name).is_file()]
+        if not target_files or missing:
+            raise FileNotFoundError(f"Paired Crafter evaluation requires all fixed targets in "
+                                    f"{target_data_dir}: missing {missing or 'target configuration'}")
+
     print(
         f">>> Starting UED Adversarial Training for {total_iterations} iterations..."
     )
@@ -863,6 +895,7 @@ def adversarial_ued_training(cfg: DictConfig):
         wm_train_seconds = 0.0
         target_val_seconds = 0.0
         train_res = {}
+        cnn_target_values = {name: [] for name in CRAFTER_CNN_TARGET_METRICS}
         current_inventory_event_rows = []
         current_episode_age_rollouts = []
 
@@ -1071,6 +1104,8 @@ def adversarial_ued_training(cfg: DictConfig):
                         p._hooks.clear()
 
             # `train_api` returns `(result_dict, fisher, net)`.
+            if cnn_comparison is not None:
+                training_rng = rng_state()
             train_res, fisher, _ = AttentionWM_training.train_api(
                 cfg,
                 wm_instance, 
@@ -1089,6 +1124,8 @@ def adversarial_ued_training(cfg: DictConfig):
             )
             # Update `old_params` for the next iteration.
             old_params = train_res.get("old_params")
+            if cnn_comparison is not None:
+                cnn_comparison.update(cfg, replay_data, training_rng)
 
             # Print explicit EWC-related metrics when W&B logging is disabled.
             ewc_term_val = train_res.get("ewc_term", train_res.get("train/ewc_term", None))
@@ -1274,6 +1311,24 @@ def adversarial_ued_training(cfg: DictConfig):
                     VALID_TIMES=1,
                     validation_sweep=validation_sweep,
                 )
+                if cnn_comparison is not None and train_res:
+                    with preserve_rng():
+                        cnn_result = validate_on_target_task(
+                            cfg, net=cnn_comparison.net, old_params=None,
+                            data_save_dir=str(target_data_dir), target_file=t_file,
+                            phase_name=f"Iter_{iteration}_cnn", VALID_TIMES=1,
+                            validation_sweep=validation_sweep,
+                        )
+                    if not res_dict or not cnn_result:
+                        raise RuntimeError(f"Missing paired Crafter validation result for {t_file}")
+                    if not np.isfinite(float(res_dict["avg_val_loss_wm"])):
+                        raise ValueError(f"Nonfinite AC-AWM prediction loss for {t_file}")
+                    for name, values in cnn_target_values.items():
+                        value = float(cnn_result.get(name, float("nan")))
+                        if np.isfinite(value):
+                            values.append(value)
+                        elif name == "avg_val_loss_wm":
+                            raise ValueError(f"Nonfinite CNN prediction loss for {t_file}")
                 
                 if res_dict:
                     if event_audit_enabled:
@@ -1543,6 +1598,10 @@ def adversarial_ued_training(cfg: DictConfig):
                                 "target_val_joint_accuracy": f"{target_val_crafter_focal['joint_accuracy']:.6f}",
                                 "target_val_position_accuracy": f"{target_val_crafter_focal['position_accuracy']:.6f}",
                                 "target_val_direction_accuracy": f"{target_val_crafter_focal['direction_accuracy']:.6f}",
+                                **{
+                                    f"cnn_target_val_{name}": f"{np.mean(values):.6f}" if values else ""
+                                    for name, values in cnn_target_values.items() if compare_cnn
+                                },
                                 "Gen_Mean_Reward": f"{gen_mean_reward:.4f}", "Gen_Loss": f"{gen_loss:.4f}",
                                 "Gen_Entropy": f"{gen_entropy:.4f}", "Gen_Div_Reward": f"{gen_div_reward_val:.4f}",
                                 "Pre_Changed_Focal_Loss": f"{getattr(gen_interface, 'last_crafter_metrics', {}).get('Pre_Changed_Focal_Loss', float('nan')):.6f}",
@@ -1663,7 +1722,8 @@ def adversarial_ued_training(cfg: DictConfig):
 
         if iteration_resume_supported and bool(getattr(cfg, "save_iteration_state", True)):
             save_state(resume_state_path, {
-                "version": 1, "kind": resume_kind, "config_digest": config_digest(cfg),
+                "version": 1, "kind": resume_kind,
+                "config_digest": paired_config_digest or config_digest(cfg),
                 "completed_iteration": iteration + 1,
                 "cumulative_transitions": cumulative_transitions,
                 "warmup_cleanup_done": warmup_cleanup_done,
@@ -1671,6 +1731,7 @@ def adversarial_ued_training(cfg: DictConfig):
                 "replay": replay_state(fisher_buffer),
                 "generator": generator_state(gen_interface, include_policy=True),
                 "rng": rng_state(),
+                **({"cnn_comparison": cnn_comparison.state_dict()} if cnn_comparison is not None else {}),
             })
 
     if corpus_writer is not None:
